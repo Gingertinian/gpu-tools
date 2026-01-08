@@ -1,0 +1,23 @@
+# RunPod SDK
+runpod>=1.6.0
+
+# HTTP requests
+requests>=2.31.0
+
+# Image processing
+Pillow>=10.0.0
+numpy>=1.24.0
+opencv-python>=4.8.0
+
+# Video processing (FFmpeg wrapper)
+# Note: FFmpeg must be installed in the container
+# moviepy>=1.0.3
+
+# Face detection (for Captioner)
+mediapipe>=0.10.3
+
+# Optional: Image hashing for Spoofer
+imagehash>=4.3.1
+
+# Optional: Numba for performance
+numba>=0.58.0

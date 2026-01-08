@@ -722,10 +722,17 @@ def process_batch_spoofer(
     Returns:
         Dict with results including pHash statistics
     """
+    import traceback
 
     def report_progress(progress: float, message: str = ""):
         if progress_callback:
             progress_callback(progress, message)
+
+    print(f"[DEBUG] process_batch_spoofer called with:")
+    print(f"[DEBUG]   input_path: {input_path}")
+    print(f"[DEBUG]   output_path: {output_path}")
+    print(f"[DEBUG]   copies: {copies}")
+    print(f"[DEBUG]   config keys: {list(config.keys())}")
 
     report_progress(0.05, "Loading image...")
 
@@ -804,76 +811,82 @@ def process_batch_spoofer(
 
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
         for i in range(copies):
-            # Progress
-            progress = 0.1 + (i / copies) * 0.8
-            report_progress(progress, f"Processing copy {i+1}/{copies}...")
+            try:
+                # Progress
+                progress = 0.1 + (i / copies) * 0.8
+                report_progress(progress, f"Processing copy {i+1}/{copies}...")
 
-            # Generate unique seed
-            seed = generate_unique_seed(input_path, i, base_time + i * 1000)
+                # Generate unique seed
+                seed = generate_unique_seed(input_path, i, base_time + i * 1000)
 
-            # Process with retry for pHash
-            max_retries = 5 if verify_phash else 1
-            best_result = None
-            best_distance = -1
+                # Process with retry for pHash
+                max_retries = 5 if verify_phash else 1
+                best_result = None
+                best_distance = -1
 
-            for retry in range(max_retries):
-                retry_seed = seed + retry * 10000
+                for retry in range(max_retries):
+                    retry_seed = seed + retry * 10000
 
-                result_img, distance, copy_dist, result_phash = process_single_copy(
-                    original_img,
-                    original_phash,
-                    params,
-                    i,
-                    retry_seed,
-                    existing_phashes if compare_copies else [],
-                    phash_min
-                )
+                    result_img, distance, copy_dist, result_phash = process_single_copy(
+                        original_img,
+                        original_phash,
+                        params,
+                        i,
+                        retry_seed,
+                        existing_phashes if compare_copies else [],
+                        phash_min
+                    )
 
-                # Check if meets threshold
-                meets_threshold = True
-                if verify_phash and distance > 0:
-                    meets_threshold = distance >= phash_min
-                    if compare_copies and copy_dist < 999:
-                        meets_threshold = meets_threshold and copy_dist >= phash_min
+                    # Check if meets threshold
+                    meets_threshold = True
+                    if verify_phash and distance > 0:
+                        meets_threshold = distance >= phash_min
+                        if compare_copies and copy_dist < 999:
+                            meets_threshold = meets_threshold and copy_dist >= phash_min
 
-                # Track best
-                if distance > best_distance:
-                    best_distance = distance
-                    best_result = (result_img, distance, copy_dist, result_phash)
+                    # Track best
+                    if distance > best_distance:
+                        best_distance = distance
+                        best_result = (result_img, distance, copy_dist, result_phash)
 
-                if meets_threshold:
-                    break
+                    if meets_threshold:
+                        break
 
-            # Use best result
-            if best_result:
-                result_img, distance, copy_dist, result_phash = best_result
+                # Use best result
+                if best_result:
+                    result_img, distance, copy_dist, result_phash = best_result
 
-                if result_phash is not None:
-                    existing_phashes.append(result_phash)
+                    if result_phash is not None:
+                        existing_phashes.append(result_phash)
 
-                if distance > 0:
-                    phash_distances.append(distance)
-                if copy_dist < 999:
-                    copy_distances.append(copy_dist)
+                    if distance > 0:
+                        phash_distances.append(distance)
+                    if copy_dist < 999:
+                        copy_distances.append(copy_dist)
 
-            # Generate filename
-            py_rng = random.Random(seed)
-            if params.get('random_names'):
-                filename = ''.join(py_rng.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=12)) + '.jpg'
-            else:
-                rand_id = py_rng.randint(1000, 9999)
-                base_name = os.path.splitext(os.path.basename(input_path))[0]
-                clean_name = "".join([c for c in base_name if c.isalnum() or c in (' ', '-', '_')]).strip()[:20]
-                filename = f"{clean_name}_v{i}_{rand_id}.jpg"
+                # Generate filename
+                py_rng = random.Random(seed)
+                if params.get('random_names'):
+                    filename = ''.join(py_rng.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=12)) + '.jpg'
+                else:
+                    rand_id = py_rng.randint(1000, 9999)
+                    base_name = os.path.splitext(os.path.basename(input_path))[0]
+                    clean_name = "".join([c for c in base_name if c.isalnum() or c in (' ', '-', '_')]).strip()[:20]
+                    filename = f"{clean_name}_v{i}_{rand_id}.jpg"
 
-            # Save to ZIP
-            img_buffer = io.BytesIO()
-            quality = int(params.get('quality', 90))
-            result_img.save(img_buffer, 'JPEG', quality=quality, optimize=True)
-            img_buffer.seek(0)
+                # Save to ZIP
+                img_buffer = io.BytesIO()
+                quality = int(params.get('quality', 90))
+                result_img.save(img_buffer, 'JPEG', quality=quality, optimize=True)
+                img_buffer.seek(0)
 
-            zf.writestr(filename, img_buffer.getvalue())
-            results.append(filename)
+                zf.writestr(filename, img_buffer.getvalue())
+                results.append(filename)
+
+            except Exception as e:
+                print(f"[ERROR] Exception during copy {i}: {str(e)}")
+                print(traceback.format_exc())
+                raise
 
     # Write ZIP to output
     zip_buffer.seek(0)

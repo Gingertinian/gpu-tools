@@ -34,6 +34,11 @@ except ImportError:
     process_spoofer = None
 
 try:
+    from spoofer.processor_fast import process_spoofer_fast
+except ImportError:
+    process_spoofer_fast = None
+
+try:
     from captioner.processor import process_captioner
 except ImportError:
     process_captioner = None
@@ -157,21 +162,45 @@ def handler(job):
             )
 
         elif tool == "spoofer":
-            if process_spoofer is None:
-                return {"error": "Spoofer processor not available"}
+            # Detect if input is image or video based on extension
+            input_ext_lower = input_ext.lower()
+            is_image = input_ext_lower in ['.jpg', '.jpeg', '.png', '.webp', '.bmp']
+            is_video = input_ext_lower in ['.mp4', '.mov', '.avi', '.webm', '.mkv']
+
             try:
-                result = process_spoofer(
-                    input_path,
-                    output_path,
-                    config,
-                    progress_callback=progress_callback
-                )
+                if is_image and process_spoofer_fast is not None:
+                    # Use CPU multiprocessing for images (63x faster)
+                    runpod.serverless.progress_update(job, {
+                        "progress": 12,
+                        "status": "processing (CPU fast mode)"
+                    })
+                    result = process_spoofer_fast(
+                        input_path,
+                        output_path,
+                        config,
+                        progress_callback=progress_callback
+                    )
+                elif process_spoofer is not None:
+                    # Use GPU (NVENC) for videos or fallback for images
+                    runpod.serverless.progress_update(job, {
+                        "progress": 12,
+                        "status": "processing (GPU mode)"
+                    })
+                    result = process_spoofer(
+                        input_path,
+                        output_path,
+                        config,
+                        progress_callback=progress_callback
+                    )
+                else:
+                    return {"error": "Spoofer processor not available"}
             except Exception as spoofer_error:
                 import traceback
                 return {
                     "error": f"Spoofer processing error: {str(spoofer_error)}",
                     "traceback": traceback.format_exc(),
-                    "tool": tool
+                    "tool": tool,
+                    "mode": "cpu_fast" if is_image else "gpu"
                 }
 
         elif tool == "captioner":

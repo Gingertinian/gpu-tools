@@ -159,12 +159,20 @@ def handler(job):
         elif tool == "spoofer":
             if process_spoofer is None:
                 return {"error": "Spoofer processor not available"}
-            result = process_spoofer(
-                input_path,
-                output_path,
-                config,
-                progress_callback=progress_callback
-            )
+            try:
+                result = process_spoofer(
+                    input_path,
+                    output_path,
+                    config,
+                    progress_callback=progress_callback
+                )
+            except Exception as spoofer_error:
+                import traceback
+                return {
+                    "error": f"Spoofer processing error: {str(spoofer_error)}",
+                    "traceback": traceback.format_exc(),
+                    "tool": tool
+                }
 
         elif tool == "captioner":
             if process_captioner is None:

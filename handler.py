@@ -51,11 +51,24 @@ def download_file(url: str, path: str) -> None:
 
 def upload_file(path: str, url: str) -> None:
     """Upload file to presigned URL"""
+    # Determine content type based on extension
+    ext = os.path.splitext(path)[1].lower()
+    content_types = {
+        '.zip': 'application/zip',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.png': 'image/png',
+        '.mp4': 'video/mp4',
+        '.mov': 'video/quicktime',
+        '.webm': 'video/webm',
+    }
+    content_type = content_types.get(ext, 'application/octet-stream')
+
     with open(path, 'rb') as f:
         response = requests.put(
             url,
             data=f,
-            headers={'Content-Type': 'application/octet-stream'},
+            headers={'Content-Type': content_type},
             timeout=600
         )
         response.raise_for_status()
@@ -108,6 +121,12 @@ def handler(job):
         # Determine file extension from URL or config
         input_ext = config.get("inputExtension", ".mp4")
         output_ext = config.get("outputExtension", ".mp4")
+
+        # For spoofer batch mode (copies > 1), output is always ZIP
+        if tool == "spoofer":
+            copies = config.get("options", {}).get("copies", 1)
+            if copies > 1:
+                output_ext = ".zip"
 
         input_path = os.path.join(temp_dir, f"input{input_ext}")
         output_path = os.path.join(temp_dir, f"output{output_ext}")

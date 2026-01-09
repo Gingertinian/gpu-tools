@@ -71,6 +71,74 @@ import re
 import random
 
 
+# ==================== CONFIG NORMALIZATION ====================
+
+def snake_to_camel(s: str) -> str:
+    """Convert snake_case to camelCase."""
+    components = s.split('_')
+    return components[0] + ''.join(x.title() for x in components[1:])
+
+
+def normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize config keys from snake_case to camelCase.
+    This allows the processor to work with both formats since
+    the backend may convert camelCase to snake_case before sending.
+
+    Also handles special cases like keeping certain keys intact.
+    """
+    if not config:
+        return {}
+
+    normalized = {}
+
+    # Map of snake_case -> camelCase for known keys
+    key_map = {
+        'caption_mode': 'captionMode',
+        'image_index': 'imageIndex',
+        'avoid_faces': 'avoidFaces',
+        'font_size': 'fontSize',
+        'title_font_size': 'titleFontSize',
+        'stroke_width': 'strokeWidth',
+        'text_color': 'textColor',
+        'show_background': 'showBackground',
+        'background_color': 'backgroundColor',
+        'background_opacity': 'backgroundOpacity',
+        'stroke_color': 'strokeColor',
+        'text_width_ratio': 'textWidthRatio',
+        'block_spacing': 'blockSpacing',
+        'line_spacing': 'lineSpacing',
+        'random_tilt': 'randomTilt',
+        'tilt_range_min': 'tiltRangeMin',
+        'tilt_range_max': 'tiltRangeMax',
+        'position_x': 'positionX',
+        'position_y': 'positionY',
+        'custom_x': 'customX',
+        'custom_y': 'customY',
+        'center_every_enabled': 'centerEveryEnabled',
+        'center_every_n': 'centerEveryN',
+        'font_family': 'fontFamily',
+        'font_weight': 'fontWeight',
+        'start_time': 'startTime',
+        'end_time': 'endTime',
+        'max_width': 'maxWidth',
+        'apply_position_for_all': 'applyPositionForAll',
+    }
+
+    for key, value in config.items():
+        # Check if it's a known snake_case key
+        if key in key_map:
+            normalized[key_map[key]] = value
+        elif '_' in key:
+            # Convert unknown snake_case to camelCase
+            normalized[snake_to_camel(key)] = value
+        else:
+            # Keep camelCase and other keys as-is
+            normalized[key] = value
+
+    return normalized
+
+
 # ==================== TEXT UTILITIES ====================
 
 def replace_quotes(text: str) -> str:
@@ -356,6 +424,9 @@ def process_captioner(
     Returns:
         Dict with processing results
     """
+    # Normalize config keys (snake_case -> camelCase)
+    # This handles the backend's camelCase-to-snake_case conversion
+    config = normalize_config(config)
 
     def report_progress(progress: float, message: str = ""):
         if progress_callback:
@@ -367,6 +438,13 @@ def process_captioner(
 
     # Get image index for batch mode (passed from workflow execution)
     image_index = config.get('imageIndex', 0)
+
+    # Debug logging for batch mode troubleshooting
+    caption_mode = config.get('captionMode', 'single')
+    captions = config.get('captions', [])
+    print(f"[Captioner] Mode: {caption_mode}, imageIndex: {image_index}, captions count: {len(captions)}")
+    if caption_mode == 'batch' and captions:
+        print(f"[Captioner] Using caption {image_index % len(captions)}: {captions[image_index % len(captions)][:50]}...")
 
     report_progress(0.05, "Analyzing file...")
 

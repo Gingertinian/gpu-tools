@@ -193,11 +193,11 @@ def get_face_safe_position(
     caption_ratio = caption_height / image_height
     caption_width_ratio = caption_width / image_width
 
-    # Define Y zones (positions as ratios)
+    # Define Y zones (positions as ratios, with safe margins from edges)
     y_zones = {
-        'top': 0.10,
-        'center': 0.50,
-        'bottom': 0.85,
+        'top': 0.15,     # 15% from top (safe margin)
+        'center': 0.50,  # True center
+        'bottom': 0.82,  # 18% from bottom (safe margin)
     }
 
     # Define X positions for each alignment
@@ -237,8 +237,8 @@ def get_face_safe_position(
 
         return False
 
-    # Try preferred position and alignment first
-    y_ratio = y_zones.get(preferred_position, 0.85)
+    # Try preferred position and alignment first (default to center)
+    y_ratio = y_zones.get(preferred_position, 0.50)
     if preferred_position == 'custom':
         y_ratio = config.get('customY', config.get('positionY', 0.5))
 
@@ -250,35 +250,42 @@ def get_face_safe_position(
         if not overlaps_face(y_ratio, alt_align):
             return preferred_position, y_ratio, alt_align
 
-    # Try different Y positions with all alignments
-    for y_pos in ['bottom', 'top', 'center']:
+    # Try different Y positions with all alignments (prioritize center first)
+    for y_pos in ['center', 'bottom', 'top']:
         y = y_zones[y_pos]
         for alignment in ['center', 'left', 'right']:
             if not overlaps_face(y, alignment):
                 return y_pos, y, alignment
 
-    # Scan for any safe spot
-    for y in [0.90, 0.85, 0.80, 0.75, 0.25, 0.20, 0.15, 0.10]:
+    # Scan for any safe spot (avoiding extreme edges for visibility)
+    # Use safer Y values: keep minimum 8% from top/bottom edges
+    for y in [0.80, 0.75, 0.70, 0.65, 0.35, 0.30, 0.25, 0.20]:
         for alignment in ['center', 'left', 'right']:
             if not overlaps_face(y, alignment):
                 return 'custom', y, alignment
 
-    # Fallback: put at very bottom, center
-    return 'bottom', 0.92, 'center'
+    # Last resort: try near edges but not at absolute edge
+    for y in [0.88, 0.12]:
+        for alignment in ['center', 'left', 'right']:
+            if not overlaps_face(y, alignment):
+                return 'custom', y, alignment
+
+    # Fallback: put at safe bottom position, center
+    return 'bottom', 0.88, 'center'
 
 
 def get_y_ratio_for_position(position: str, config: Dict[str, Any]) -> float:
-    """Get the Y ratio (0-1) for a named position."""
+    """Get the Y ratio (0-1) for a named position. Default is center."""
     if position == 'top':
-        return 0.10
+        return 0.15  # 15% from top (safe margin)
     elif position == 'center':
         return 0.50
     elif position == 'bottom':
-        return 0.85
+        return 0.82  # 18% from bottom (safe margin)
     elif position == 'custom':
         return config.get('customY', config.get('positionY', 0.5))
     else:
-        return 0.85
+        return 0.50  # Default to center
 
 
 # ==================== CAPTION FORMAT PARSING ====================
@@ -639,8 +646,8 @@ def create_caption_overlay(
     center_every_n = config.get('centerEveryN', 7)
     force_center = center_every_enabled and (image_index + 1) % center_every_n == 0
 
-    # Extract config with scaling
-    position = 'center' if force_center else config.get('position', 'bottom')
+    # Extract config with scaling (default position is now CENTER)
+    position = 'center' if force_center else config.get('position', 'center')
 
     # Scale font sizes
     base_font_size = config.get('fontSize', 47)
@@ -755,16 +762,18 @@ def create_caption_overlay(
         alignment = adjusted_alignment
 
     # Calculate Y position based on (possibly adjusted) position
+    # Using safe margins: 15% from top, 18% from bottom
     if position == 'top':
-        base_y = int(height * 0.1)
+        base_y = int(height * 0.15) - total_height // 2
     elif position == 'center':
         base_y = (height - total_height) // 2
     elif position == 'bottom':
-        base_y = int(height * 0.85) - total_height
+        base_y = int(height * 0.82) - total_height // 2
     elif position == 'custom':
         base_y = int(position_y * height) - total_height // 2
     else:
-        base_y = height - total_height - 40
+        # Default to center
+        base_y = (height - total_height) // 2
 
     # Calculate X based on alignment
     if alignment == 'left':
@@ -777,9 +786,12 @@ def create_caption_overlay(
         else:
             base_x = (width - max_content_width) // 2
 
-    # Clamp positions to be within bounds
-    base_x = max(10, min(base_x, width - max_content_width - 10))
-    base_y = max(10, min(base_y, height - total_height - 10))
+    # Clamp positions to be within safe margins (5% of image dimensions)
+    # This prevents captions from hiding in the edges
+    margin_x = max(20, int(width * 0.05))
+    margin_y = max(30, int(height * 0.05))
+    base_x = max(margin_x, min(base_x, width - max_content_width - margin_x))
+    base_y = max(margin_y, min(base_y, height - total_height - margin_y))
 
     # Draw background if enabled
     if bg_color:
@@ -994,7 +1006,7 @@ if __name__ == "__main__":
 
     test_config = {
         'text': 'Sample Caption Text',
-        'position': 'bottom',
+        'position': 'center',  # Default position is now center
         'fontSize': 48,
         'fontFamily': 'Arial',
         'color': '#FFFFFF',

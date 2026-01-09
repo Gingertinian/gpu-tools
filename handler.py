@@ -129,7 +129,8 @@ def handler(job):
 
         # For spoofer batch mode (copies > 1), output is always ZIP
         if tool == "spoofer":
-            copies = config.get("options", {}).get("copies", 1)
+            # Check both config.copies (from workflows) and config.options.copies (from tool view)
+            copies = config.get("copies") or config.get("options", {}).get("copies", 1)
             if copies > 1:
                 output_ext = ".zip"
 

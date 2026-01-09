@@ -937,7 +937,8 @@ def process_spoofer(
         return process_video(input_path, output_path, config, report_progress)
     else:
         # Check if batch mode
-        copies = config.get('options', {}).get('copies', 1)
+        # Check both config.copies (from workflows) and config.options.copies (from tool view)
+        copies = config.get('copies') or config.get('options', {}).get('copies', 1)
         if copies > 1:
             return process_batch_spoofer(input_path, output_path, config, copies, progress_callback)
         else:

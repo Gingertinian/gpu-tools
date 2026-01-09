@@ -399,15 +399,30 @@ def process_batch_fast(
             progress = 0.15 + (chunk_end / copies) * 0.75
             report(progress, f"Processed {chunk_end}/{copies} copies...")
 
-    report(0.9, "Writing ZIP file...")
+    report(0.9, "Writing output files...")
 
-    # Write results to ZIP
-    with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
-        filenames = []
+    # Check output mode: "directory" for pipeline mode, or ZIP for standalone
+    output_mode = config.get('outputMode', 'zip')
+    output_dir = config.get('outputDir', None)
+
+    filenames = []
+
+    if output_mode == 'directory' and output_dir:
+        # Pipeline mode: write individual files to directory
+        os.makedirs(output_dir, exist_ok=True)
         for idx, filename, jpg_bytes in results:
             if filename and jpg_bytes:
-                zf.writestr(filename, jpg_bytes)
-                filenames.append(filename)
+                file_path = os.path.join(output_dir, filename)
+                with open(file_path, 'wb') as f:
+                    f.write(jpg_bytes)
+                filenames.append(file_path)
+    else:
+        # Standalone mode: write ZIP file
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+            for idx, filename, jpg_bytes in results:
+                if filename and jpg_bytes:
+                    zf.writestr(filename, jpg_bytes)
+                    filenames.append(filename)
 
     elapsed = time.time() - start_time
     report(1.0, f"Complete in {elapsed:.1f}s")
@@ -417,7 +432,8 @@ def process_batch_fast(
         'files': filenames,
         'processing_time': elapsed,
         'time_per_copy': elapsed / max(1, len(filenames)),
-        'cpu_cores_used': num_workers
+        'cpu_cores_used': num_workers,
+        'output_mode': output_mode
     }
 
 

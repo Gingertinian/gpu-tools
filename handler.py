@@ -159,6 +159,223 @@ def is_video(ext: str) -> bool:
     return ext.lower() in ['.mp4', '.mov', '.avi', '.webm', '.mkv', '.m4v']
 
 
+# ==================== Pipeline Processor ====================
+
+def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipeline: list, progress_callback) -> dict:
+    """
+    Process a pipeline of tools sequentially without intermediate uploads.
+
+    Each tool's output becomes the next tool's input.
+    Only the final output is uploaded to R2.
+
+    Args:
+        job: RunPod job object for progress updates
+        temp_dir: Temporary directory for processing
+        input_path: Path to downloaded input file
+        output_url: Presigned URL for final upload
+        pipeline: List of {"tool": "...", "config": {...}} dicts
+        progress_callback: Callback for progress updates
+
+    Returns:
+        dict with status and results
+    """
+    import zipfile
+    from glob import glob
+
+    if not pipeline or len(pipeline) == 0:
+        return {"error": "Pipeline is empty"}
+
+    # Track current files being processed
+    # Start with the single input file
+    current_files = [input_path]
+    total_steps = len(pipeline)
+
+    for step_idx, step in enumerate(pipeline):
+        tool = step.get("tool", "").lower()
+        config = step.get("config", {})
+
+        step_progress_base = int((step_idx / total_steps) * 80) + 10
+
+        runpod.serverless.progress_update(job, {
+            "progress": step_progress_base,
+            "status": f"Step {step_idx + 1}/{total_steps}: {tool}"
+        })
+
+        # Create output directory for this step
+        step_output_dir = os.path.join(temp_dir, f"step_{step_idx}_{tool}")
+        os.makedirs(step_output_dir, exist_ok=True)
+
+        next_files = []
+
+        # Process each current file through this tool
+        for file_idx, current_file in enumerate(current_files):
+            input_ext = os.path.splitext(current_file)[1].lower()
+
+            # Determine output extension based on tool
+            if tool == "bg_remove":
+                output_ext = ".png"
+            elif tool in ["pic_to_video", "video_gen"]:
+                output_ext = ".mp4"
+            else:
+                output_ext = input_ext if input_ext else ".jpg"
+
+            # For spoofer with copies > 1, output is a directory of files
+            copies = config.get("copies") or config.get("options", {}).get("copies", 1)
+            is_batch_spoofer = tool == "spoofer" and copies > 1
+
+            if is_batch_spoofer:
+                # Spoofer batch mode: output to a subdirectory
+                spoofer_output_dir = os.path.join(step_output_dir, f"batch_{file_idx}")
+                os.makedirs(spoofer_output_dir, exist_ok=True)
+                output_path = spoofer_output_dir  # Pass directory, not file
+
+                # Modify config to output individual files, not ZIP
+                batch_config = {**config, "outputMode": "directory", "outputDir": spoofer_output_dir}
+            else:
+                output_path = os.path.join(step_output_dir, f"output_{file_idx}{output_ext}")
+                batch_config = config
+
+            # Create step-specific progress callback
+            def step_callback(progress: float, message: str = None):
+                file_progress = (file_idx + progress) / len(current_files)
+                overall = step_progress_base + int(file_progress * (80 / total_steps))
+                update = {"progress": min(overall, 90)}
+                if message:
+                    update["status"] = f"Step {step_idx + 1}: {tool} - {message}"
+                runpod.serverless.progress_update(job, update)
+
+            # Process based on tool type
+            try:
+                if tool == "spoofer":
+                    input_is_image = is_image(input_ext)
+                    if input_is_image and process_spoofer_fast is not None:
+                        result = process_spoofer_fast(current_file, output_path, batch_config, progress_callback=step_callback)
+                    elif process_spoofer is not None:
+                        result = process_spoofer(current_file, output_path, batch_config, progress_callback=step_callback)
+                    else:
+                        return {"error": "Spoofer processor not available"}
+
+                    # Collect output files
+                    if is_batch_spoofer:
+                        # Collect all files from the batch output directory
+                        for ext in ['*.jpg', '*.jpeg', '*.png', '*.webp']:
+                            next_files.extend(glob(os.path.join(spoofer_output_dir, ext)))
+                    else:
+                        if os.path.exists(output_path):
+                            next_files.append(output_path)
+
+                elif tool == "captioner":
+                    if process_captioner is None:
+                        return {"error": "Captioner processor not available"}
+
+                    # For captioner, pass the image index for batch caption matching
+                    captioner_config = {**batch_config, "imageIndex": file_idx}
+                    result = process_captioner(current_file, output_path, captioner_config, progress_callback=step_callback)
+                    if os.path.exists(output_path):
+                        next_files.append(output_path)
+
+                elif tool == "resize":
+                    if process_resize is None:
+                        return {"error": "Resize processor not available"}
+                    result = process_resize(current_file, output_path, batch_config, progress_callback=step_callback)
+                    if os.path.exists(output_path):
+                        next_files.append(output_path)
+
+                elif tool == "vignettes":
+                    if process_vignettes is None:
+                        return {"error": "Vignettes processor not available"}
+                    result = process_vignettes(current_file, output_path, batch_config, progress_callback=step_callback)
+                    if os.path.exists(output_path):
+                        next_files.append(output_path)
+
+                elif tool == "bg_remove":
+                    if process_bg_remove is None:
+                        return {"error": "BG Remove processor not available"}
+                    result = process_bg_remove(current_file, output_path, batch_config, progress_callback=step_callback)
+                    if os.path.exists(output_path):
+                        next_files.append(output_path)
+
+                elif tool == "upscale":
+                    if process_upscale is None:
+                        return {"error": "Upscale processor not available"}
+                    if is_video(input_ext) and process_upscale_video:
+                        result = process_upscale_video(current_file, output_path, batch_config, progress_callback=step_callback)
+                    else:
+                        result = process_upscale(current_file, output_path, batch_config, progress_callback=step_callback)
+                    if os.path.exists(output_path):
+                        next_files.append(output_path)
+
+                elif tool == "face_swap":
+                    if process_face_swap is None:
+                        return {"error": "Face Swap processor not available"}
+                    if is_video(input_ext) and process_face_swap_video:
+                        result = process_face_swap_video(current_file, output_path, batch_config, progress_callback=step_callback)
+                    else:
+                        result = process_face_swap(current_file, output_path, batch_config, progress_callback=step_callback)
+                    if os.path.exists(output_path):
+                        next_files.append(output_path)
+
+                elif tool == "pic_to_video":
+                    if process_pic_to_video is None:
+                        return {"error": "Pic to Video processor not available"}
+                    result = process_pic_to_video(current_file, output_path, batch_config, progress_callback=step_callback)
+                    if os.path.exists(output_path):
+                        next_files.append(output_path)
+
+                elif tool == "video_gen":
+                    if process_video_gen is None:
+                        return {"error": "Video Gen processor not available"}
+                    result = process_video_gen(current_file, output_path, batch_config, progress_callback=step_callback)
+                    if os.path.exists(output_path):
+                        next_files.append(output_path)
+
+                else:
+                    return {"error": f"Unknown tool in pipeline: {tool}"}
+
+            except Exception as e:
+                import traceback
+                return {
+                    "error": f"Pipeline step {step_idx + 1} ({tool}) failed: {str(e)}",
+                    "traceback": traceback.format_exc(),
+                    "step": step_idx,
+                    "tool": tool
+                }
+
+        # Update current files for next step
+        if not next_files:
+            return {"error": f"Pipeline step {step_idx + 1} ({tool}) produced no output files"}
+
+        current_files = next_files
+
+    # Create final ZIP with all output files
+    runpod.serverless.progress_update(job, {
+        "progress": 92,
+        "status": "Creating ZIP"
+    })
+
+    final_zip_path = os.path.join(temp_dir, "pipeline_output.zip")
+    with zipfile.ZipFile(final_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for idx, file_path in enumerate(current_files):
+            ext = os.path.splitext(file_path)[1]
+            arcname = f"output_{idx + 1:04d}{ext}"
+            zf.write(file_path, arcname)
+
+    # Upload final ZIP
+    runpod.serverless.progress_update(job, {
+        "progress": 95,
+        "status": "Uploading"
+    })
+    upload_file(final_zip_path, output_url)
+
+    return {
+        "status": "completed",
+        "mode": "pipeline",
+        "steps": len(pipeline),
+        "outputFiles": len(current_files),
+        "outputSize": os.path.getsize(final_zip_path)
+    }
+
+
 # ==================== Main Handler ====================
 
 def handler(job):
@@ -189,6 +406,43 @@ def handler(job):
         return {"error": "Missing 'inputUrl' parameter"}
     if not output_url:
         return {"error": "Missing 'outputUrl' parameter"}
+
+    # ==================== PIPELINE MODE ====================
+    # Process entire workflow in one job without intermediate uploads
+    if tool == "pipeline":
+        pipeline = job_input.get("pipeline", [])
+        if not pipeline:
+            return {"error": "Missing 'pipeline' parameter for pipeline mode"}
+
+        temp_dir = tempfile.mkdtemp(prefix=f"farmium_{job_id}_")
+        try:
+            # Download input
+            runpod.serverless.progress_update(job, {
+                "progress": 5,
+                "status": "downloading"
+            })
+            input_ext = get_file_extension(input_url, config)
+            input_path = os.path.join(temp_dir, f"input{input_ext}")
+            download_file(input_url, input_path)
+
+            # Process pipeline
+            progress_callback = create_progress_callback(job)
+            result = process_pipeline(job, temp_dir, input_path, output_url, pipeline, progress_callback)
+
+            return result
+
+        except Exception as e:
+            import traceback
+            return {
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+                "tool": "pipeline"
+            }
+        finally:
+            try:
+                shutil.rmtree(temp_dir)
+            except:
+                pass
 
     # Create temp directory for this job
     temp_dir = tempfile.mkdtemp(prefix=f"farmium_{job_id}_")

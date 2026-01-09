@@ -5,6 +5,8 @@ This handler processes GPU jobs for:
 - Vignettes: Video overlay effects
 - Spoofer: Image/video transformations for duplicate detection evasion
 - Captioner: Add text captions to images/videos
+- Resize: Resize/crop images/videos to target resolution
+- Pic to Video: Convert images to static videos
 
 Usage:
     Deploy to RunPod Serverless with network volume containing tools/ directory
@@ -42,6 +44,16 @@ try:
     from captioner.processor import process_captioner
 except ImportError:
     process_captioner = None
+
+try:
+    from resize.processor import process_resize
+except ImportError:
+    process_resize = None
+
+try:
+    from pic_to_video.processor import process_pic_to_video
+except ImportError:
+    process_pic_to_video = None
 
 
 def download_file(url: str, path: str) -> None:
@@ -213,6 +225,28 @@ def handler(job):
             if process_captioner is None:
                 return {"error": "Captioner processor not available"}
             result = process_captioner(
+                input_path,
+                output_path,
+                config,
+                progress_callback=progress_callback
+            )
+
+        elif tool == "resize":
+            if process_resize is None:
+                return {"error": "Resize processor not available"}
+            result = process_resize(
+                input_path,
+                output_path,
+                config,
+                progress_callback=progress_callback
+            )
+
+        elif tool == "pic_to_video":
+            if process_pic_to_video is None:
+                return {"error": "Pic to Video processor not available"}
+            # Output is always MP4 for this tool
+            output_path = os.path.join(temp_dir, "output.mp4")
+            result = process_pic_to_video(
                 input_path,
                 output_path,
                 config,

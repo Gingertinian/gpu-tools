@@ -124,8 +124,13 @@ def handler(job):
 
     try:
         # Determine file extension from URL or config
-        input_ext = config.get("inputExtension", ".mp4")
-        output_ext = config.get("outputExtension", ".mp4")
+        # Try to extract extension from URL if not provided in config
+        input_ext = config.get("inputExtension")
+        if not input_ext:
+            # Extract from URL (remove query params first)
+            url_path = input_url.split('?')[0]
+            input_ext = os.path.splitext(url_path)[1].lower() or ".mp4"
+        output_ext = config.get("outputExtension", input_ext)
 
         # For spoofer batch mode (copies > 1), output is always ZIP
         if tool == "spoofer":

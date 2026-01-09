@@ -22,7 +22,21 @@ import sys
 import requests
 import tempfile
 import shutil
+import zipfile
 from pathlib import Path
+
+# ==================== Constants ====================
+
+# Already-compressed file formats (ZIP_STORED = no compression, saves CPU)
+COMPRESSED_EXTENSIONS = {
+    '.jpg', '.jpeg', '.png', '.webp', '.gif',  # Images (already compressed)
+    '.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v',  # Videos (already compressed)
+    '.mp3', '.aac', '.ogg', '.flac',  # Audio (already compressed)
+    '.zip', '.gz', '.bz2', '.xz', '.7z',  # Archives
+}
+
+# Larger chunk size for faster downloads (1MB instead of 8KB)
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
 
 # Add tools directory to path
 WORKSPACE = os.environ.get('WORKSPACE', '/workspace')
@@ -94,13 +108,25 @@ except ImportError:
 
 # ==================== Helper Functions ====================
 
+def get_zip_compression(filepath: str) -> int:
+    """
+    Get optimal ZIP compression method for a file.
+    Returns ZIP_STORED for already-compressed formats (saves CPU).
+    Returns ZIP_DEFLATED for uncompressed formats.
+    """
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext in COMPRESSED_EXTENSIONS:
+        return zipfile.ZIP_STORED  # No compression - file already compressed
+    return zipfile.ZIP_DEFLATED  # Compress uncompressed files
+
+
 def download_file(url: str, path: str) -> None:
-    """Download file from presigned URL"""
+    """Download file from presigned URL with optimized chunk size"""
     response = requests.get(url, stream=True, timeout=300)
     response.raise_for_status()
 
     with open(path, 'wb') as f:
-        for chunk in response.iter_content(chunk_size=8192):
+        for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
             f.write(chunk)
 
 
@@ -354,11 +380,13 @@ def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipel
     })
 
     final_zip_path = os.path.join(temp_dir, "pipeline_output.zip")
-    with zipfile.ZipFile(final_zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(final_zip_path, 'w') as zf:
         for idx, file_path in enumerate(current_files):
             ext = os.path.splitext(file_path)[1]
             arcname = f"output_{idx + 1:04d}{ext}"
-            zf.write(file_path, arcname)
+            # Use smart compression: ZIP_STORED for already-compressed files
+            compression = get_zip_compression(file_path)
+            zf.write(file_path, arcname, compress_type=compression)
 
     # Upload final ZIP
     runpod.serverless.progress_update(job, {

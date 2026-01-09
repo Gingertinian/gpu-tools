@@ -481,7 +481,8 @@ def process_batch_fast(
             filenames.append(file_path)
     else:
         # Standalone mode: write ZIP file
-        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+        # Use ZIP_STORED for JPGs (already compressed) - saves CPU time
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_STORED) as zf:
             for idx, (filename, jpg_bytes) in successful_results:
                 zf.writestr(filename, jpg_bytes)
                 filenames.append(filename)

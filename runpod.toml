@@ -1,8 +1,7 @@
 # RunPod Project Configuration
 
-name = "farmium-gpu-tools"
-
 [project]
+name = "farmium-gpu-tools"
 # uuid                   - Unique identifier for the project. Automatically generated.
 #
 # volume_mount_path      - Default volume mount path in serverless environment. Changing this may affect data persistence.

@@ -26,6 +26,9 @@ RUN pip install --no-cache-dir --upgrade pip && \
 COPY handler.py /handler.py
 COPY tools/ /workspace/tools/
 
+# Copy TikTok fonts for Captioner
+COPY fonts/ /app/fonts/
+
 # Set environment variables
 ENV WORKSPACE=/workspace
 ENV PYTHONUNBUFFERED=1

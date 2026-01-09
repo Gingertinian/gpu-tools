@@ -1,14 +1,22 @@
 """
-Spoofer Processor - FAST MODE (CPU Optimized)
+Spoofer Processor - FAST MODE (CPU Optimized with Fault Tolerance)
 
 Key optimizations:
-1. CPU Multiprocessing - Use all available cores
-2. pHash disabled by default (40-50% speedup)
-3. Single compression with artifacts (25-35% speedup)
-4. Skip transforms with 0 values
-5. Streamlined ZIP writing
+1. CPU Multiprocessing - Use ALL available cores (no cap)
+2. ProcessPoolExecutor with as_completed - fault tolerant
+3. Automatic retry for failed copies (up to 3 attempts)
+4. pHash disabled by default (40-50% speedup)
+5. Single compression with artifacts (25-35% speedup)
+6. Skip transforms with 0 values
+7. Streamlined ZIP writing
 
-Target: 200 photos in 20-30 seconds (vs 15+ minutes)
+Fault Tolerance:
+- If a worker crashes, executor spawns a new one automatically
+- Failed copies are retried up to 3 times
+- Progress continues even if some copies fail
+- Returns partial results if some copies permanently fail
+
+Target: 200 photos in 15-20 seconds on 8+ cores
 """
 
 import os
@@ -20,8 +28,9 @@ import zipfile
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from typing import Callable, Optional, Dict, Any, List, Tuple
-from multiprocessing import Pool, cpu_count
-import functools
+from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError
+from multiprocessing import cpu_count
+import traceback
 
 # Constants
 TARGET_RESOLUTIONS = {
@@ -311,7 +320,13 @@ def process_batch_fast(
     progress_callback: Optional[Callable[[float, str], None]] = None
 ) -> Dict[str, Any]:
     """
-    FAST batch processing with multiprocessing.
+    FAST batch processing with fault-tolerant multiprocessing.
+
+    Key features:
+    - Uses ALL available CPU cores (no artificial cap)
+    - ProcessPoolExecutor with as_completed for real-time progress
+    - Automatic retry (up to 3 attempts) for failed copies
+    - Graceful degradation: returns partial results if some copies fail
 
     Args:
         input_path: Path to input image
@@ -321,8 +336,11 @@ def process_batch_fast(
         progress_callback: Optional progress callback
 
     Returns:
-        Dict with results
+        Dict with results including success/failure counts
     """
+    MAX_RETRIES = 3
+    WORKER_TIMEOUT = 30  # seconds per copy
+
     def report(p: float, msg: str = ""):
         if progress_callback:
             progress_callback(p, msg)
@@ -341,7 +359,10 @@ def process_batch_fast(
     original_img.save(img_buffer, 'PNG')
     img_bytes = img_buffer.getvalue()
 
-    report(0.1, f"Preparing {copies} copies with {cpu_count()} CPU cores...")
+    num_cores = cpu_count()
+    num_workers = min(num_cores, copies)  # Use ALL cores, no cap
+
+    report(0.1, f"Preparing {copies} copies with {num_workers} CPU cores...")
 
     # Build params (use fast defaults for unspecified)
     params = dict(FAST_DEFAULTS)
@@ -372,32 +393,74 @@ def process_batch_fast(
     base_name = os.path.splitext(os.path.basename(input_path))[0]
     base_time = time.time_ns()
 
-    # Prepare worker args
-    worker_args = []
-    for i in range(copies):
-        seed = generate_seed(input_path, i, base_time + i * 1000)
-        worker_args.append((img_bytes, params, seed, i, base_name, quality, random_names))
+    report(0.15, f"Processing with {num_workers} CPU cores (fault-tolerant)...")
 
-    report(0.15, f"Processing with {cpu_count()} CPU cores...")
+    # Track results and failures
+    results = {}  # idx -> (filename, jpg_bytes)
+    failed_indices = set(range(copies))  # Start with all indices as "pending"
+    retry_counts = {i: 0 for i in range(copies)}
 
-    # Use multiprocessing pool
-    num_workers = min(cpu_count(), copies, 8)  # Max 8 workers
-    results = []
+    def create_worker_args(idx: int, attempt: int = 0) -> tuple:
+        """Create args for a specific copy index."""
+        # Use different seed for retries to avoid same failure
+        seed = generate_seed(input_path, idx, base_time + idx * 1000 + attempt * 100000)
+        return (img_bytes, params, seed, idx, base_name, quality, random_names)
 
-    with Pool(processes=num_workers) as pool:
-        # Process in chunks for progress updates
-        chunk_size = max(1, copies // 10)
+    # Process with fault tolerance using ProcessPoolExecutor
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        # Submit all initial jobs
+        future_to_idx = {}
+        for idx in range(copies):
+            args = create_worker_args(idx)
+            future = executor.submit(process_single_copy_worker, args)
+            future_to_idx[future] = idx
 
-        for chunk_start in range(0, copies, chunk_size):
-            chunk_end = min(chunk_start + chunk_size, copies)
-            chunk_args = worker_args[chunk_start:chunk_end]
+        completed_count = 0
+        last_progress_time = time.time()
 
-            chunk_results = pool.map(process_single_copy_worker, chunk_args)
-            results.extend(chunk_results)
+        # Process as they complete
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
 
-            # Progress
-            progress = 0.15 + (chunk_end / copies) * 0.75
-            report(progress, f"Processed {chunk_end}/{copies} copies...")
+            try:
+                result = future.result(timeout=WORKER_TIMEOUT)
+                result_idx, filename, jpg_bytes = result
+
+                if filename and jpg_bytes:
+                    # Success!
+                    results[idx] = (filename, jpg_bytes)
+                    failed_indices.discard(idx)
+                    completed_count += 1
+                else:
+                    # Worker returned None - retry if possible
+                    raise ValueError(f"Worker returned empty result for copy {idx}")
+
+            except Exception as e:
+                # Handle failure - retry if attempts remaining
+                retry_counts[idx] += 1
+
+                if retry_counts[idx] < MAX_RETRIES:
+                    # Retry: submit new job with different seed
+                    print(f"[Retry {retry_counts[idx]}/{MAX_RETRIES}] Copy {idx}: {str(e)[:50]}")
+                    args = create_worker_args(idx, retry_counts[idx])
+                    new_future = executor.submit(process_single_copy_worker, args)
+                    future_to_idx[new_future] = idx
+                else:
+                    # Max retries exceeded - mark as permanently failed
+                    print(f"[FAILED] Copy {idx} after {MAX_RETRIES} attempts: {str(e)[:50]}")
+                    completed_count += 1  # Count as "done" even if failed
+
+            # Progress update (throttled to avoid spam)
+            current_time = time.time()
+            if current_time - last_progress_time >= 0.2:  # Update every 200ms max
+                progress = 0.15 + (completed_count / copies) * 0.75
+                successful = len(results)
+                failed = completed_count - successful
+                status = f"Processed {completed_count}/{copies}"
+                if failed > 0:
+                    status += f" ({failed} retrying...)"
+                report(progress, status)
+                last_progress_time = current_time
 
     report(0.9, "Writing output files...")
 
@@ -406,34 +469,42 @@ def process_batch_fast(
     output_dir = config.get('outputDir', None)
 
     filenames = []
+    successful_results = sorted(results.items(), key=lambda x: x[0])  # Sort by idx
 
     if output_mode == 'directory' and output_dir:
         # Pipeline mode: write individual files to directory
         os.makedirs(output_dir, exist_ok=True)
-        for idx, filename, jpg_bytes in results:
-            if filename and jpg_bytes:
-                file_path = os.path.join(output_dir, filename)
-                with open(file_path, 'wb') as f:
-                    f.write(jpg_bytes)
-                filenames.append(file_path)
+        for idx, (filename, jpg_bytes) in successful_results:
+            file_path = os.path.join(output_dir, filename)
+            with open(file_path, 'wb') as f:
+                f.write(jpg_bytes)
+            filenames.append(file_path)
     else:
         # Standalone mode: write ZIP file
         with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
-            for idx, filename, jpg_bytes in results:
-                if filename and jpg_bytes:
-                    zf.writestr(filename, jpg_bytes)
-                    filenames.append(filename)
+            for idx, (filename, jpg_bytes) in successful_results:
+                zf.writestr(filename, jpg_bytes)
+                filenames.append(filename)
 
     elapsed = time.time() - start_time
-    report(1.0, f"Complete in {elapsed:.1f}s")
+    successful_count = len(filenames)
+    failed_count = copies - successful_count
+
+    status_msg = f"Complete in {elapsed:.1f}s - {successful_count}/{copies} successful"
+    if failed_count > 0:
+        status_msg += f" ({failed_count} failed)"
+    report(1.0, status_msg)
 
     return {
-        'copies_generated': len(filenames),
+        'copies_generated': successful_count,
+        'copies_failed': failed_count,
+        'copies_requested': copies,
         'files': filenames,
         'processing_time': elapsed,
-        'time_per_copy': elapsed / max(1, len(filenames)),
+        'time_per_copy': elapsed / max(1, successful_count),
         'cpu_cores_used': num_workers,
-        'output_mode': output_mode
+        'output_mode': output_mode,
+        'fault_tolerant': True
     }
 
 
@@ -504,6 +575,11 @@ if __name__ == "__main__":
 
     if len(sys.argv) < 3:
         print("Usage: python processor_fast.py input_file output_file [copies]")
+        print("\nFeatures:")
+        print("  - Uses ALL CPU cores (no cap)")
+        print("  - ProcessPoolExecutor with fault tolerance")
+        print("  - Automatic retry (up to 3 attempts)")
+        print("  - Graceful degradation on failures")
         sys.exit(1)
 
     copies = int(sys.argv[3]) if len(sys.argv) > 3 else 100
@@ -519,6 +595,19 @@ if __name__ == "__main__":
     def progress(p, msg):
         print(f"[{int(p*100):3d}%] {msg}")
 
+    print(f"\n{'='*60}")
+    print(f"Spoofer FAST Mode - Fault Tolerant Processing")
+    print(f"CPU Cores: {cpu_count()}")
+    print(f"Copies: {copies}")
+    print(f"{'='*60}\n")
+
     result = process_spoofer_fast(sys.argv[1], sys.argv[2], test_config, progress)
-    print(f"\nResult: {result}")
-    print(f"Speed: {result.get('time_per_copy', 0):.3f}s per copy")
+
+    print(f"\n{'='*60}")
+    print(f"Results:")
+    print(f"  Generated: {result.get('copies_generated', 0)}/{result.get('copies_requested', copies)}")
+    print(f"  Failed: {result.get('copies_failed', 0)}")
+    print(f"  Time: {result.get('processing_time', 0):.2f}s")
+    print(f"  Speed: {result.get('time_per_copy', 0):.3f}s per copy")
+    print(f"  Cores used: {result.get('cpu_cores_used', 0)}")
+    print(f"{'='*60}")

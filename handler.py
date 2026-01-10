@@ -130,8 +130,12 @@ def download_file(url: str, path: str) -> None:
             f.write(chunk)
 
 
-def upload_file(path: str, url: str) -> None:
-    """Upload file to presigned URL"""
+def upload_file(path: str, url: str, max_retries: int = 3) -> dict:
+    """
+    Upload file to presigned URL with retry logic and verification.
+    Returns dict with upload status and details.
+    Raises exception on failure after all retries.
+    """
     ext = os.path.splitext(path)[1].lower()
     content_types = {
         '.zip': 'application/zip',
@@ -145,14 +149,43 @@ def upload_file(path: str, url: str) -> None:
     }
     content_type = content_types.get(ext, 'application/octet-stream')
 
-    with open(path, 'rb') as f:
-        response = requests.put(
-            url,
-            data=f,
-            headers={'Content-Type': content_type},
-            timeout=600
-        )
-        response.raise_for_status()
+    # Verify file exists and has content
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Output file not found: {path}")
+
+    file_size = os.path.getsize(path)
+    if file_size == 0:
+        raise ValueError(f"Output file is empty: {path}")
+
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            with open(path, 'rb') as f:
+                response = requests.put(
+                    url,
+                    data=f,
+                    headers={'Content-Type': content_type},
+                    timeout=600
+                )
+                response.raise_for_status()
+
+            # Upload succeeded
+            return {
+                "uploaded": True,
+                "size": file_size,
+                "contentType": content_type,
+                "attempts": attempt + 1
+            }
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                # Exponential backoff: 1s, 2s, 4s
+                wait_time = (2 ** attempt)
+                import time
+                time.sleep(wait_time)
+
+    # All retries failed
+    raise RuntimeError(f"Upload failed after {max_retries} attempts: {last_error}")
 
 
 def create_progress_callback(job):
@@ -388,19 +421,29 @@ def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipel
             compression = get_zip_compression(file_path)
             zf.write(file_path, arcname, compress_type=compression)
 
-    # Upload final ZIP
+    # Upload final ZIP with error handling
     runpod.serverless.progress_update(job, {
         "progress": 95,
         "status": "Uploading"
     })
-    upload_file(final_zip_path, output_url)
+
+    try:
+        upload_result = upload_file(final_zip_path, output_url)
+    except Exception as e:
+        return {
+            "error": f"Failed to upload pipeline output: {str(e)}",
+            "mode": "pipeline",
+            "steps": len(pipeline),
+            "outputFiles": len(current_files)
+        }
 
     return {
         "status": "completed",
         "mode": "pipeline",
         "steps": len(pipeline),
         "outputFiles": len(current_files),
-        "outputSize": os.path.getsize(final_zip_path)
+        "outputSize": os.path.getsize(final_zip_path),
+        "uploadAttempts": upload_result.get("attempts", 1)
     }
 
 
@@ -646,18 +689,31 @@ def handler(job):
         if not os.path.exists(output_path):
             return {"error": "Processing failed - no output file created"}
 
-        # Upload result
+        output_size = os.path.getsize(output_path)
+        if output_size == 0:
+            return {"error": "Processing failed - output file is empty"}
+
+        # Upload result with error handling
         runpod.serverless.progress_update(job, {
             "progress": 95,
             "status": "uploading"
         })
-        upload_file(output_path, output_url)
+
+        try:
+            upload_result = upload_file(output_path, output_url)
+        except Exception as e:
+            return {
+                "error": f"Failed to upload output: {str(e)}",
+                "tool": tool,
+                "outputSize": output_size
+            }
 
         # Success
         return {
             "status": "completed",
             "tool": tool,
-            "outputSize": os.path.getsize(output_path),
+            "outputSize": output_size,
+            "uploadAttempts": upload_result.get("attempts", 1),
             **result
         }
 

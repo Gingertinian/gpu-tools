@@ -220,20 +220,53 @@ def is_video(ext: str) -> bool:
 
 # ==================== Pipeline Processor ====================
 
-def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipeline: list, progress_callback) -> dict:
+def upload_files_parallel(files: list, urls: list, max_workers: int = 10) -> list:
+    """
+    Upload multiple files in parallel to their respective presigned URLs.
+    Returns list of {"index": i, "success": bool, "size": int, "error": str?}
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    results = [None] * len(files)
+
+    def upload_one(idx: int, file_path: str, url: str):
+        try:
+            result = upload_file(file_path, url)
+            return {"index": idx, "success": True, "size": result.get("size", 0)}
+        except Exception as e:
+            return {"index": idx, "success": False, "error": str(e)}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for i, (f, u) in enumerate(zip(files, urls)):
+            futures.append(executor.submit(upload_one, i, f, u))
+
+        for future in as_completed(futures):
+            result = future.result()
+            results[result["index"]] = result
+
+    return results
+
+
+def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipeline: list, progress_callback, output_urls: list = None) -> dict:
     """
     Process a pipeline of tools sequentially without intermediate uploads.
 
     Each tool's output becomes the next tool's input.
-    Only the final output is uploaded to R2.
+
+    If output_urls is provided (array of presigned URLs), uploads each file directly
+    to its corresponding URL - much faster than ZIP + re-upload flow.
+
+    If output_url is provided (single URL), creates ZIP and uploads (legacy mode).
 
     Args:
         job: RunPod job object for progress updates
         temp_dir: Temporary directory for processing
         input_path: Path to downloaded input file
-        output_url: Presigned URL for final upload
+        output_url: Presigned URL for final ZIP upload (legacy mode)
         pipeline: List of {"tool": "...", "config": {...}} dicts
         progress_callback: Callback for progress updates
+        output_urls: Array of presigned URLs for direct individual uploads (optional)
 
     Returns:
         dict with status and results
@@ -406,7 +439,51 @@ def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipel
 
         current_files = next_files
 
-    # Create final ZIP with all output files
+    # ==================== DIRECT UPLOAD MODE ====================
+    # If output_urls array is provided, upload each file directly (FAST)
+    if output_urls and len(output_urls) >= len(current_files):
+        runpod.serverless.progress_update(job, {
+            "progress": 92,
+            "status": "Uploading files directly"
+        })
+
+        # Upload files in parallel (10 concurrent uploads)
+        upload_results = upload_files_parallel(
+            current_files[:len(output_urls)],
+            output_urls[:len(current_files)],
+            max_workers=10
+        )
+
+        # Check for failures
+        failed = [r for r in upload_results if not r.get("success")]
+        if failed:
+            return {
+                "error": f"Failed to upload {len(failed)} files: {failed[0].get('error', 'unknown')}",
+                "mode": "pipeline_direct",
+                "steps": len(pipeline),
+                "outputFiles": len(current_files),
+                "uploadedFiles": len(current_files) - len(failed),
+                "failedUploads": len(failed)
+            }
+
+        total_size = sum(r.get("size", 0) for r in upload_results)
+
+        runpod.serverless.progress_update(job, {
+            "progress": 100,
+            "status": "Completed"
+        })
+
+        return {
+            "status": "completed",
+            "mode": "pipeline_direct",
+            "steps": len(pipeline),
+            "outputFiles": len(current_files),
+            "uploadedFiles": len(current_files),
+            "totalSize": total_size
+        }
+
+    # ==================== LEGACY ZIP MODE ====================
+    # Fallback: Create ZIP and upload (for backwards compatibility)
     runpod.serverless.progress_update(job, {
         "progress": 92,
         "status": "Creating ZIP"
@@ -485,6 +562,9 @@ def handler(job):
         if not pipeline:
             return {"error": "Missing 'pipeline' parameter for pipeline mode"}
 
+        # Direct upload mode: array of presigned URLs for individual files (FAST)
+        output_urls = job_input.get("outputUrls", [])
+
         temp_dir = tempfile.mkdtemp(prefix=f"farmium_{job_id}_")
         try:
             # Download input
@@ -498,7 +578,10 @@ def handler(job):
 
             # Process pipeline
             progress_callback = create_progress_callback(job)
-            result = process_pipeline(job, temp_dir, input_path, output_url, pipeline, progress_callback)
+            result = process_pipeline(
+                job, temp_dir, input_path, output_url, pipeline, progress_callback,
+                output_urls=output_urls if output_urls else None
+            )
 
             return result
 

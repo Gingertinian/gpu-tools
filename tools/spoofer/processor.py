@@ -8,6 +8,7 @@ Based on original Spoofer.py with all transforms:
 - 4 Visual transforms (★★☆☆☆ Visual variation)
 - Full video processing with FFmpeg + NVENC
 - Batch processing with ZIP output
+- PARALLEL VIDEO PROCESSING: Multiple NVENC sessions for datacenter GPUs
 """
 
 import os
@@ -20,9 +21,10 @@ import zipfile
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from typing import Callable, Optional, Dict, Any, List, Tuple
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import subprocess
 from collections import deque
+import multiprocessing
 
 # Optional pHash support
 try:
@@ -37,6 +39,290 @@ TARGET_RESOLUTIONS = {
     'high': (1080, 1920),
     'low': (720, 1280)
 }
+
+# Video extensions
+VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.webm', '.mkv', '.m4v'}
+
+# NVENC session limits by GPU type
+# Consumer GPUs (GeForce): Limited to 3-5 sessions
+# Datacenter GPUs (A-series, Quadro): Unlimited sessions
+NVENC_SESSION_LIMITS = {
+    'consumer': 3,      # RTX 3090, 4090, 4080, etc.
+    'datacenter': 10,   # A5000, A6000, A100, etc. (conservative limit)
+    'default': 2,       # Fallback
+}
+
+
+def get_gpu_info() -> Dict[str, Any]:
+    """
+    Detect GPU type and determine NVENC session limit.
+    Returns dict with gpu_name, gpu_type ('consumer' or 'datacenter'), and nvenc_sessions.
+    """
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            gpu_name = result.stdout.strip().split('\n')[0]
+
+            # Determine GPU type
+            datacenter_keywords = ['A100', 'A6000', 'A5000', 'A4000', 'A4500', 'A40', 'A30', 'A10',
+                                   'V100', 'T4', 'Quadro', 'Tesla', 'H100', 'L40']
+            is_datacenter = any(kw in gpu_name for kw in datacenter_keywords)
+
+            gpu_type = 'datacenter' if is_datacenter else 'consumer'
+            nvenc_sessions = NVENC_SESSION_LIMITS[gpu_type]
+
+            return {
+                'gpu_name': gpu_name,
+                'gpu_type': gpu_type,
+                'nvenc_sessions': nvenc_sessions
+            }
+    except Exception as e:
+        print(f"[GPU Detection] Error: {e}")
+
+    return {
+        'gpu_name': 'Unknown',
+        'gpu_type': 'default',
+        'nvenc_sessions': NVENC_SESSION_LIMITS['default']
+    }
+
+
+def extract_videos_from_zip(zip_path: str, extract_dir: str) -> List[str]:
+    """
+    Extract video files from a ZIP archive.
+    Returns list of paths to extracted video files.
+    """
+    video_paths = []
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        for name in zf.namelist():
+            ext = os.path.splitext(name)[1].lower()
+            if ext in VIDEO_EXTENSIONS:
+                # Extract to temp dir
+                extracted_path = zf.extract(name, extract_dir)
+                video_paths.append(extracted_path)
+    return video_paths
+
+
+def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
+    """
+    Worker function for parallel video processing.
+    Designed to be called from ProcessPoolExecutor.
+
+    Args tuple: (input_path, output_path, config, video_index)
+    Returns: dict with status, output_path, and any errors
+    """
+    input_path, output_path, config, video_index = args
+
+    try:
+        # Import here to avoid pickling issues
+        import random
+        import math
+        import subprocess
+        import json
+
+        py_rng = random.Random(int(time.time() * 1000) + video_index)
+
+        # Get video info
+        try:
+            probe_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json',
+                        '-show_streams', '-show_format', input_path]
+            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+            video_info = json.loads(probe_result.stdout)
+            video_stream = next((s for s in video_info.get('streams', [])
+                               if s.get('codec_type') == 'video'), {})
+            original_width = int(video_stream.get('width', 1920))
+            original_height = int(video_stream.get('height', 1080))
+            duration = float(video_info.get('format', {}).get('duration', 0))
+        except Exception:
+            original_width, original_height, duration = 1920, 1080, 0
+
+        # Build filter chain (same as process_video)
+        filters = []
+        spatial = config.get('spatial', {})
+        tonal = config.get('tonal', {})
+        visual = config.get('visual', {})
+        video_cfg = config.get('video', {})
+
+        # Spatial filters
+        if spatial.get('crop', 0) > 0:
+            crop_pct = spatial['crop'] / 100
+            crop_w = int(original_width * (1 - crop_pct * 2))
+            crop_h = int(original_height * (1 - crop_pct * 2))
+            filters.append(f"crop={crop_w}:{crop_h}")
+
+        if spatial.get('rotation', 0) > 0:
+            angle = py_rng.uniform(-spatial['rotation'], spatial['rotation']) * math.pi / 180
+            filters.append(f"rotate={angle}:fillcolor=black")
+
+        # Tonal filters
+        eq_params = []
+        if tonal.get('brightness', 0) > 0:
+            b = py_rng.uniform(-tonal['brightness'], tonal['brightness']) * 0.4
+            eq_params.append(f"brightness={b:.3f}")
+        if tonal.get('contrast', 0) > 0:
+            c = 1 + py_rng.uniform(-tonal['contrast'], tonal['contrast'])
+            eq_params.append(f"contrast={c:.3f}")
+        if tonal.get('saturation', 0) > 0:
+            s = 1 + py_rng.uniform(-tonal['saturation'], tonal['saturation'])
+            eq_params.append(f"saturation={s:.3f}")
+        if tonal.get('gamma', 0) > 0:
+            g = 1 + py_rng.uniform(-tonal['gamma'], tonal['gamma'])
+            eq_params.append(f"gamma={g:.3f}")
+
+        if eq_params:
+            filters.append(f"eq={':'.join(eq_params)}")
+
+        # Visual filters
+        if visual.get('noise', 0) > 0:
+            filters.append(f"noise=alls={visual['noise']*2}:allf=t")
+
+        if tonal.get('vignette', 0) > 0:
+            filters.append(f"vignette=PI/{3 + (1 - tonal['vignette']/100) * 4}")
+
+        # Speed variation
+        if video_cfg.get('speedVariation', 0) > 0:
+            speed = 1 + py_rng.uniform(-video_cfg['speedVariation']/100, video_cfg['speedVariation']/100)
+            speed = max(0.9, min(1.1, speed))
+            filters.append(f"setpts={1/speed}*PTS")
+
+        # FPS
+        fps = 30
+        if video_cfg.get('fpsVar', 0) > 0:
+            fps = 30 + py_rng.uniform(-video_cfg['fpsVar'], video_cfg['fpsVar'])
+
+        # Build FFmpeg command
+        filter_str = ','.join(filters) if filters else None
+        cmd = ['ffmpeg', '-y', '-i', input_path]
+
+        if filter_str:
+            cmd.extend(['-vf', filter_str])
+
+        # NVENC settings
+        bitrate = int(5000 * video_cfg.get('bitrate', 90) / 100)
+        cmd.extend([
+            '-c:v', 'h264_nvenc',
+            '-preset', 'p2',
+            '-rc', 'vbr',
+            '-cq', '23',
+            '-b:v', f'{bitrate}k',
+            '-maxrate', f'{int(bitrate * 1.5)}k',
+            '-bufsize', f'{bitrate * 2}k',
+            '-rc-lookahead', '8',
+        ])
+
+        # Audio
+        keep_audio = video_cfg.get('keepAudio', True)
+        if keep_audio:
+            cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
+        else:
+            cmd.append('-an')
+
+        cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
+
+        # Run FFmpeg
+        process = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+
+        if process.returncode != 0:
+            return {
+                'status': 'failed',
+                'index': video_index,
+                'error': process.stderr[-500:] if process.stderr else 'Unknown error'
+            }
+
+        return {
+            'status': 'completed',
+            'index': video_index,
+            'output_path': output_path,
+            'duration': duration
+        }
+
+    except Exception as e:
+        return {
+            'status': 'failed',
+            'index': video_index,
+            'error': str(e)
+        }
+
+
+def process_videos_parallel(
+    video_paths: List[str],
+    output_dir: str,
+    config: Dict[str, Any],
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+    max_parallel: int = None
+) -> Dict[str, Any]:
+    """
+    Process multiple videos in parallel using multiple NVENC sessions.
+
+    Args:
+        video_paths: List of input video paths
+        output_dir: Directory for output videos
+        config: Processing configuration
+        progress_callback: Optional progress callback
+        max_parallel: Max parallel processes (auto-detected if None)
+
+    Returns:
+        Dict with results including processed count and any errors
+    """
+    if not video_paths:
+        return {'error': 'No videos to process'}
+
+    # Auto-detect parallel limit based on GPU
+    if max_parallel is None:
+        gpu_info = get_gpu_info()
+        max_parallel = gpu_info['nvenc_sessions']
+        print(f"[Parallel Video] GPU: {gpu_info['gpu_name']}, Type: {gpu_info['gpu_type']}, "
+              f"Max parallel: {max_parallel}")
+
+    # Prepare work items
+    work_items = []
+    for i, video_path in enumerate(video_paths):
+        basename = os.path.basename(video_path)
+        name, ext = os.path.splitext(basename)
+        output_path = os.path.join(output_dir, f"{name}_spoofed{ext}")
+        work_items.append((video_path, output_path, config, i))
+
+    total = len(work_items)
+    completed = 0
+    failed = 0
+    results = []
+
+    def report_progress(msg=""):
+        if progress_callback:
+            progress = completed / total
+            progress_callback(progress, msg)
+
+    report_progress(f"Processing {total} videos with {max_parallel} parallel sessions...")
+
+    # Process in parallel using ProcessPoolExecutor
+    # Use 'spawn' context to avoid CUDA issues with fork
+    with ProcessPoolExecutor(max_workers=max_parallel,
+                            mp_context=multiprocessing.get_context('spawn')) as executor:
+        future_to_item = {executor.submit(process_single_video_worker, item): item
+                        for item in work_items}
+
+        for future in as_completed(future_to_item):
+            result = future.result()
+            results.append(result)
+
+            if result['status'] == 'completed':
+                completed += 1
+            else:
+                failed += 1
+                print(f"[Parallel Video] Failed video {result['index']}: {result.get('error', 'unknown')}")
+
+            report_progress(f"Completed {completed}/{total} videos ({failed} failed)")
+
+    return {
+        'status': 'completed',
+        'total': total,
+        'completed': completed,
+        'failed': failed,
+        'results': results,
+        'parallel_sessions': max_parallel
+    }
 
 # Photo defaults (from original)
 PHOTO_DEFAULTS = {
@@ -921,7 +1207,12 @@ def process_spoofer(
     """
     Process a single image or video with spoofer transforms.
     For batch processing, use process_batch_spoofer.
+
+    NEW: If input is a ZIP with multiple videos, processes them in parallel
+    using multiple NVENC sessions (optimized for datacenter GPUs like A5000/A6000).
     """
+    import tempfile
+    import shutil
 
     def report_progress(progress: float, message: str = ""):
         if progress_callback:
@@ -929,9 +1220,73 @@ def process_spoofer(
 
     # Detect file type
     ext = os.path.splitext(input_path)[1].lower()
-    is_video = ext in ['.mp4', '.mov', '.avi', '.webm', '.mkv']
+    is_video = ext in VIDEO_EXTENSIONS
+    is_zip = ext == '.zip'
 
     report_progress(0.05, "Analyzing file...")
+
+    # NEW: Check if input is a ZIP with videos (batch video mode)
+    if is_zip:
+        report_progress(0.08, "Checking ZIP contents...")
+
+        # Create temp directory for extraction
+        temp_dir = tempfile.mkdtemp(prefix="spoofer_batch_")
+
+        try:
+            # Extract videos from ZIP
+            video_paths = extract_videos_from_zip(input_path, temp_dir)
+
+            if video_paths:
+                # PARALLEL VIDEO PROCESSING MODE
+                report_progress(0.1, f"Found {len(video_paths)} videos, starting parallel processing...")
+
+                # Create output directory
+                output_dir = os.path.join(temp_dir, "output")
+                os.makedirs(output_dir, exist_ok=True)
+
+                # Process videos in parallel
+                result = process_videos_parallel(
+                    video_paths,
+                    output_dir,
+                    config,
+                    progress_callback=progress_callback
+                )
+
+                if result.get('error'):
+                    return result
+
+                # Create output ZIP with processed videos
+                report_progress(0.95, "Creating output ZIP...")
+
+                with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_STORED) as zf:
+                    for r in result.get('results', []):
+                        if r.get('status') == 'completed' and r.get('output_path'):
+                            if os.path.exists(r['output_path']):
+                                arcname = os.path.basename(r['output_path'])
+                                zf.write(r['output_path'], arcname)
+
+                report_progress(1.0, "Complete")
+
+                return {
+                    'status': 'completed',
+                    'mode': 'parallel_video_batch',
+                    'videos_processed': result.get('completed', 0),
+                    'videos_failed': result.get('failed', 0),
+                    'parallel_sessions': result.get('parallel_sessions', 1),
+                    'output_size': os.path.getsize(output_path) if os.path.exists(output_path) else 0
+                }
+            else:
+                # ZIP contains images, not videos - fall through to batch image mode
+                # Extract all images and process them
+                report_progress(0.1, "ZIP contains images, processing as batch...")
+
+        except Exception as e:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
+        finally:
+            # Cleanup temp dir if we processed videos
+            if 'video_paths' in dir() and video_paths:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
     if is_video:
         return process_video(input_path, output_path, config, report_progress)

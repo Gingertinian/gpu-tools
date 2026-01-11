@@ -24,16 +24,67 @@ Config structure:
     "endTime": seconds | null (full duration),
     "maxWidth": pixels | null (auto)
 }
+
+PARALLEL VIDEO PROCESSING: Supports processing multiple videos in parallel
+using multiple NVENC sessions (optimized for datacenter GPUs like A5000/A6000).
 """
 
 import os
 import subprocess
 import tempfile
+import zipfile
+import multiprocessing
 from typing import Callable, Optional, Dict, Any, List, Tuple
 from PIL import Image, ImageDraw, ImageFont
 import json
 import textwrap
 import numpy as np
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
+# Video extensions
+VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.webm', '.mkv', '.m4v'}
+
+# NVENC session limits by GPU type
+NVENC_SESSION_LIMITS = {
+    'consumer': 3,
+    'datacenter': 10,
+    'default': 2,
+}
+
+
+def get_gpu_info() -> Dict[str, Any]:
+    """Detect GPU type and determine NVENC session limit."""
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            gpu_name = result.stdout.strip().split('\n')[0]
+            datacenter_keywords = ['A100', 'A6000', 'A5000', 'A4000', 'A4500', 'A40', 'A30', 'A10',
+                                   'V100', 'T4', 'Quadro', 'Tesla', 'H100', 'L40']
+            is_datacenter = any(kw in gpu_name for kw in datacenter_keywords)
+            gpu_type = 'datacenter' if is_datacenter else 'consumer'
+            return {
+                'gpu_name': gpu_name,
+                'gpu_type': gpu_type,
+                'nvenc_sessions': NVENC_SESSION_LIMITS[gpu_type]
+            }
+    except Exception as e:
+        print(f"[GPU Detection] Error: {e}")
+    return {'gpu_name': 'Unknown', 'gpu_type': 'default', 'nvenc_sessions': NVENC_SESSION_LIMITS['default']}
+
+
+def extract_videos_from_zip(zip_path: str, extract_dir: str) -> List[str]:
+    """Extract video files from a ZIP archive."""
+    video_paths = []
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        for name in zf.namelist():
+            ext = os.path.splitext(name)[1].lower()
+            if ext in VIDEO_EXTENSIONS:
+                extracted_path = zf.extract(name, extract_dir)
+                video_paths.append(extracted_path)
+    return video_paths
 
 # MediaPipe for face detection
 try:
@@ -406,6 +457,127 @@ def get_caption_for_index(config: Dict[str, Any], index: int) -> str:
         return config.get('text', '')
 
 
+def process_single_video_caption_worker(args: Tuple) -> Dict[str, Any]:
+    """
+    Worker function for parallel video captioning.
+    Designed to be called from ProcessPoolExecutor.
+    """
+    input_path, output_path, config, video_index = args
+    import subprocess
+    import json
+
+    try:
+        # Get video info
+        video_info_result = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', input_path],
+            capture_output=True, text=True
+        )
+        video_info = json.loads(video_info_result.stdout) if video_info_result.returncode == 0 else {}
+        video_stream = next((s for s in video_info.get('streams', []) if s.get('codec_type') == 'video'), {})
+        width = int(video_stream.get('width', 1920))
+        height = int(video_stream.get('height', 1080))
+        duration = float(video_info.get('format', {}).get('duration', 0))
+
+        # Build caption filter (simplified for parallel processing)
+        text = config.get('text', '')
+        position = config.get('position', 'bottom')
+        font_size = config.get('fontSize', 48)
+        color = config.get('textColor', config.get('color', '#FFFFFF'))
+        stroke_color = config.get('strokeColor', '#000000')
+        stroke_width = config.get('strokeWidth', 2)
+
+        # Position calculations
+        if position == 'top':
+            y_expr = '20'
+        elif position == 'center':
+            y_expr = '(h-text_h)/2'
+        elif position == 'bottom':
+            y_expr = 'h-text_h-20'
+        else:
+            y_expr = 'h-text_h-20'
+
+        # Escape text for FFmpeg
+        text_escaped = text.replace('\\', '\\\\').replace("'", "\\'").replace(':', '\\:').replace('%', '%%')
+
+        # Build drawtext filter
+        drawtext = f"drawtext=text='{text_escaped}':fontsize={font_size}:fontcolor={color}:x=(w-text_w)/2:y={y_expr}"
+        if stroke_color and stroke_width > 0:
+            drawtext += f":borderw={stroke_width}:bordercolor={stroke_color}"
+
+        # FFmpeg command
+        cmd = [
+            'ffmpeg', '-y', '-i', input_path,
+            '-vf', drawtext,
+            '-c:v', 'h264_nvenc', '-preset', 'p2',
+            '-b:v', '5000k', '-maxrate', '7500k',
+            '-c:a', 'aac', '-b:a', '128k',
+            output_path
+        ]
+
+        process = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+
+        if process.returncode != 0:
+            return {'status': 'failed', 'index': video_index, 'error': process.stderr[-500:]}
+
+        return {'status': 'completed', 'index': video_index, 'output_path': output_path, 'duration': duration}
+
+    except Exception as e:
+        return {'status': 'failed', 'index': video_index, 'error': str(e)}
+
+
+def process_videos_parallel_caption(
+    video_paths: List[str],
+    output_dir: str,
+    config: Dict[str, Any],
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+    max_parallel: int = None
+) -> Dict[str, Any]:
+    """Process multiple videos with captions in parallel using multiple NVENC sessions."""
+    if not video_paths:
+        return {'error': 'No videos to process'}
+
+    if max_parallel is None:
+        gpu_info = get_gpu_info()
+        max_parallel = gpu_info['nvenc_sessions']
+        print(f"[Parallel Caption] GPU: {gpu_info['gpu_name']}, Max parallel: {max_parallel}")
+
+    work_items = []
+    for i, video_path in enumerate(video_paths):
+        basename = os.path.basename(video_path)
+        name, ext = os.path.splitext(basename)
+        output_path = os.path.join(output_dir, f"{name}_captioned{ext}")
+        work_items.append((video_path, output_path, config, i))
+
+    total = len(work_items)
+    completed = 0
+    failed = 0
+    results = []
+
+    def report_progress(msg=""):
+        if progress_callback:
+            progress_callback(completed / total, msg)
+
+    report_progress(f"Processing {total} videos with {max_parallel} parallel sessions...")
+
+    with ProcessPoolExecutor(max_workers=max_parallel,
+                            mp_context=multiprocessing.get_context('spawn')) as executor:
+        future_to_item = {executor.submit(process_single_video_caption_worker, item): item for item in work_items}
+
+        for future in as_completed(future_to_item):
+            result = future.result()
+            results.append(result)
+            if result['status'] == 'completed':
+                completed += 1
+            else:
+                failed += 1
+            report_progress(f"Completed {completed}/{total} videos ({failed} failed)")
+
+    return {
+        'status': 'completed', 'total': total, 'completed': completed,
+        'failed': failed, 'results': results, 'parallel_sessions': max_parallel
+    }
+
+
 def process_captioner(
     input_path: str,
     output_path: str,
@@ -414,6 +586,9 @@ def process_captioner(
 ) -> Dict[str, Any]:
     """
     Process image or video with text captions.
+
+    NEW: If input is a ZIP with multiple videos, processes them in parallel
+    using multiple NVENC sessions (optimized for datacenter GPUs like A5000/A6000).
 
     Args:
         input_path: Path to input file
@@ -424,8 +599,9 @@ def process_captioner(
     Returns:
         Dict with processing results
     """
+    import shutil
+
     # Normalize config keys (snake_case -> camelCase)
-    # This handles the backend's camelCase-to-snake_case conversion
     config = normalize_config(config)
 
     def report_progress(progress: float, message: str = ""):
@@ -434,7 +610,8 @@ def process_captioner(
 
     # Detect file type
     ext = os.path.splitext(input_path)[1].lower()
-    is_video = ext in ['.mp4', '.mov', '.avi', '.webm', '.mkv']
+    is_video = ext in VIDEO_EXTENSIONS
+    is_zip = ext == '.zip'
 
     # Get image index for batch mode (passed from workflow execution)
     image_index = config.get('imageIndex', 0)
@@ -447,6 +624,53 @@ def process_captioner(
         print(f"[Captioner] Using caption {image_index % len(captions)}: {captions[image_index % len(captions)][:50]}...")
 
     report_progress(0.05, "Analyzing file...")
+
+    # NEW: Check if input is a ZIP with videos (batch video mode)
+    if is_zip:
+        report_progress(0.08, "Checking ZIP contents...")
+        temp_dir = tempfile.mkdtemp(prefix="captioner_batch_")
+
+        try:
+            video_paths = extract_videos_from_zip(input_path, temp_dir)
+
+            if video_paths:
+                report_progress(0.1, f"Found {len(video_paths)} videos, starting parallel processing...")
+
+                output_dir = os.path.join(temp_dir, "output")
+                os.makedirs(output_dir, exist_ok=True)
+
+                result = process_videos_parallel_caption(
+                    video_paths, output_dir, config, progress_callback=progress_callback
+                )
+
+                if result.get('error'):
+                    return result
+
+                report_progress(0.95, "Creating output ZIP...")
+
+                with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_STORED) as zf:
+                    for r in result.get('results', []):
+                        if r.get('status') == 'completed' and r.get('output_path'):
+                            if os.path.exists(r['output_path']):
+                                zf.write(r['output_path'], os.path.basename(r['output_path']))
+
+                report_progress(1.0, "Complete")
+
+                return {
+                    'status': 'completed',
+                    'mode': 'parallel_video_batch',
+                    'videos_processed': result.get('completed', 0),
+                    'videos_failed': result.get('failed', 0),
+                    'parallel_sessions': result.get('parallel_sessions', 1),
+                    'output_size': os.path.getsize(output_path) if os.path.exists(output_path) else 0
+                }
+
+        except Exception as e:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
+        finally:
+            if 'video_paths' in dir() and video_paths:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
     if is_video:
         return process_video_caption(input_path, output_path, config, report_progress)

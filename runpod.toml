@@ -22,11 +22,15 @@ name = "farmium-gpu-tools"
 uuid = "e6c332e1"
 base_image = "runpod/base:0.6.1-cuda11.8.0"
 gpu_types = [
-    "NVIDIA GeForce RTX 3090",  # 24GB - $0.31/hr - Best cost for NVENC
-    "NVIDIA GeForce RTX 4090",  # 24GB - $0.44/hr
-    "NVIDIA GeForce RTX 3080",  # 10GB - $0.20/hr - Cheapest option
+    # DATACENTER GPUs - UNLIMITED NVENC sessions (best for batch video processing)
+    "NVIDIA RTX A5000",         # 24GB - $0.38/hr - 10+ parallel videos per worker
+    "NVIDIA RTX A6000",         # 48GB - $0.79/hr - 15+ parallel videos per worker
+    "NVIDIA RTX A4000",         # 16GB - $0.29/hr - 10+ parallel videos per worker
+    # CONSUMER GPUs - Limited to 3 NVENC sessions
+    "NVIDIA GeForce RTX 3090",  # 24GB - $0.31/hr - 3 parallel videos per worker
+    "NVIDIA GeForce RTX 4090",  # 24GB - $0.44/hr - 3 parallel videos per worker
 ]
-gpu_count = 1  # DO NOT INCREASE - FFmpeg NVENC only uses 1 GPU
+gpu_count = 1  # Single GPU (parallel processing uses multiple NVENC sessions on same GPU)
 volume_mount_path = "/runpod-volume"
 ports = "4040/http, 7270/http, 22/tcp" # FileBrowser, FastAPI, SSH
 container_disk_size_gb = 100

@@ -218,6 +218,278 @@ def is_video(ext: str) -> bool:
     return ext.lower() in ['.mp4', '.mov', '.avi', '.webm', '.mkv', '.m4v']
 
 
+# ==================== Batch Mode Processor ====================
+
+def get_gpu_info() -> dict:
+    """Detect GPU type and determine NVENC session limit."""
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            gpu_name = result.stdout.strip().split('\n')[0]
+            datacenter_keywords = ['A100', 'A6000', 'A5000', 'A4000', 'A4500', 'A40', 'A30', 'A10',
+                                   'V100', 'T4', 'Quadro', 'Tesla', 'H100', 'L40']
+            is_datacenter = any(kw in gpu_name for kw in datacenter_keywords)
+            gpu_type = 'datacenter' if is_datacenter else 'consumer'
+            nvenc_sessions = 10 if is_datacenter else 3
+            return {'gpu_name': gpu_name, 'gpu_type': gpu_type, 'nvenc_sessions': nvenc_sessions}
+    except Exception as e:
+        print(f"[GPU Detection] Error: {e}")
+    return {'gpu_name': 'Unknown', 'gpu_type': 'default', 'nvenc_sessions': 2}
+
+
+def download_files_parallel(urls: list, paths: list, max_workers: int = 10) -> list:
+    """Download multiple files in parallel. Returns list of results."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    results = [None] * len(urls)
+
+    def download_one(idx: int, url: str, path: str):
+        try:
+            download_file(url, path)
+            return {"index": idx, "success": True, "path": path}
+        except Exception as e:
+            return {"index": idx, "success": False, "error": str(e)}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(download_one, i, u, p) for i, (u, p) in enumerate(zip(urls, paths))]
+        for future in as_completed(futures):
+            result = future.result()
+            results[result["index"]] = result
+
+    return results
+
+
+def process_single_file_for_batch(args: tuple) -> dict:
+    """
+    Worker function for batch processing.
+    Processes a single file with the specified tool.
+    """
+    input_path, output_path, tool, config, file_index = args
+
+    try:
+        input_ext = os.path.splitext(input_path)[1].lower()
+
+        # Process based on tool type
+        if tool == "spoofer":
+            if process_spoofer is not None:
+                result = process_spoofer(input_path, output_path, config)
+            else:
+                return {"index": file_index, "status": "failed", "error": "Spoofer not available"}
+
+        elif tool == "captioner":
+            if process_captioner is not None:
+                # Pass file index for batch caption matching
+                captioner_config = {**config, "imageIndex": file_index}
+                result = process_captioner(input_path, output_path, captioner_config)
+            else:
+                return {"index": file_index, "status": "failed", "error": "Captioner not available"}
+
+        elif tool == "vignettes":
+            if process_vignettes is not None:
+                result = process_vignettes(input_path, output_path, config)
+            else:
+                return {"index": file_index, "status": "failed", "error": "Vignettes not available"}
+
+        elif tool == "resize":
+            if process_resize is not None:
+                result = process_resize(input_path, output_path, config)
+            else:
+                return {"index": file_index, "status": "failed", "error": "Resize not available"}
+
+        else:
+            return {"index": file_index, "status": "failed", "error": f"Unknown tool: {tool}"}
+
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return {"index": file_index, "status": "completed", "output_path": output_path, "result": result}
+        else:
+            return {"index": file_index, "status": "failed", "error": "Output file not created"}
+
+    except Exception as e:
+        return {"index": file_index, "status": "failed", "error": str(e)}
+
+
+def process_batch_mode(job, job_input: dict) -> dict:
+    """
+    Process multiple files in parallel using multiple NVENC sessions.
+
+    Input format:
+    {
+        "tool": "batch",
+        "processor": "spoofer" | "captioner" | "vignettes" | "resize",
+        "inputUrls": ["url1", "url2", ...],
+        "outputUrls": ["url1", "url2", ...],
+        "config": { tool-specific configuration }
+    }
+
+    Returns:
+    {
+        "status": "completed",
+        "mode": "batch_parallel",
+        "total": N,
+        "completed": X,
+        "failed": Y,
+        "results": [...]
+    }
+    """
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    processor = job_input.get("processor", "").lower()
+    input_urls = job_input.get("inputUrls", [])
+    output_urls = job_input.get("outputUrls", [])
+    config = job_input.get("batchConfig", job_input.get("config", {}))
+    job_id = job["id"]
+
+    # Validate
+    if not processor:
+        return {"error": "Missing 'processor' parameter for batch mode"}
+    if not input_urls or not output_urls:
+        return {"error": "Missing 'inputUrls' or 'outputUrls' for batch mode"}
+    if len(input_urls) != len(output_urls):
+        return {"error": "inputUrls and outputUrls must have same length"}
+
+    total_files = len(input_urls)
+
+    # Detect GPU capabilities
+    gpu_info = get_gpu_info()
+    max_parallel = gpu_info['nvenc_sessions']
+    print(f"[Batch Mode] GPU: {gpu_info['gpu_name']}, Type: {gpu_info['gpu_type']}, Max parallel: {max_parallel}")
+
+    runpod.serverless.progress_update(job, {
+        "progress": 5,
+        "status": f"Batch mode: {total_files} files, {max_parallel} parallel"
+    })
+
+    temp_dir = tempfile.mkdtemp(prefix=f"farmium_batch_{job_id}_")
+
+    try:
+        # 1. Download all input files in parallel
+        runpod.serverless.progress_update(job, {
+            "progress": 10,
+            "status": f"Downloading {total_files} files..."
+        })
+
+        input_paths = []
+        output_paths = []
+        for i, url in enumerate(input_urls):
+            ext = get_file_extension(url, config)
+            input_paths.append(os.path.join(temp_dir, f"input_{i}{ext}"))
+
+            # Determine output extension
+            if processor in ["spoofer", "captioner", "vignettes", "resize"]:
+                output_ext = ext if ext in ['.mp4', '.mov', '.avi', '.webm', '.mkv'] else '.jpg'
+            else:
+                output_ext = ext
+            output_paths.append(os.path.join(temp_dir, f"output_{i}{output_ext}"))
+
+        download_results = download_files_parallel(input_urls, input_paths, max_workers=10)
+        failed_downloads = [r for r in download_results if not r.get("success")]
+        if failed_downloads:
+            print(f"[Batch Mode] {len(failed_downloads)} downloads failed")
+
+        # 2. Process all files in parallel
+        runpod.serverless.progress_update(job, {
+            "progress": 30,
+            "status": f"Processing {total_files} files with {max_parallel} parallel sessions..."
+        })
+
+        # Prepare work items
+        work_items = []
+        for i in range(total_files):
+            if download_results[i].get("success"):
+                work_items.append((input_paths[i], output_paths[i], processor, config, i))
+
+        completed = 0
+        failed = 0
+        results = [None] * total_files
+
+        # Mark failed downloads
+        for r in download_results:
+            if not r.get("success"):
+                results[r["index"]] = {"index": r["index"], "status": "failed", "error": f"Download failed: {r.get('error')}"}
+                failed += 1
+
+        # Process in parallel using ProcessPoolExecutor
+        if work_items:
+            # Use spawn context to avoid CUDA issues
+            ctx = multiprocessing.get_context('spawn')
+            with ProcessPoolExecutor(max_workers=max_parallel, mp_context=ctx) as executor:
+                future_to_idx = {executor.submit(process_single_file_for_batch, item): item[4] for item in work_items}
+
+                for future in as_completed(future_to_idx):
+                    result = future.result()
+                    idx = result["index"]
+                    results[idx] = result
+
+                    if result["status"] == "completed":
+                        completed += 1
+                    else:
+                        failed += 1
+
+                    # Update progress
+                    progress = 30 + int(((completed + failed) / total_files) * 50)
+                    runpod.serverless.progress_update(job, {
+                        "progress": progress,
+                        "status": f"Processed {completed + failed}/{total_files} files ({failed} failed)"
+                    })
+
+        # 3. Upload all output files in parallel
+        runpod.serverless.progress_update(job, {
+            "progress": 85,
+            "status": f"Uploading {completed} processed files..."
+        })
+
+        files_to_upload = []
+        urls_to_upload = []
+        for i, result in enumerate(results):
+            if result and result.get("status") == "completed" and result.get("output_path"):
+                if os.path.exists(result["output_path"]):
+                    files_to_upload.append(result["output_path"])
+                    urls_to_upload.append(output_urls[i])
+
+        if files_to_upload:
+            upload_results = upload_files_parallel(files_to_upload, urls_to_upload, max_workers=10)
+            upload_failed = [r for r in upload_results if not r.get("success")]
+            if upload_failed:
+                print(f"[Batch Mode] {len(upload_failed)} uploads failed")
+                failed += len(upload_failed)
+                completed -= len(upload_failed)
+
+        runpod.serverless.progress_update(job, {
+            "progress": 100,
+            "status": "Completed"
+        })
+
+        return {
+            "status": "completed",
+            "mode": "batch_parallel",
+            "gpu": gpu_info['gpu_name'],
+            "gpu_type": gpu_info['gpu_type'],
+            "parallel_sessions": max_parallel,
+            "total": total_files,
+            "completed": completed,
+            "failed": failed,
+            "results": results
+        }
+
+    except Exception as e:
+        import traceback
+        return {
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "mode": "batch_parallel"
+        }
+
+    finally:
+        try:
+            shutil.rmtree(temp_dir)
+        except:
+            pass
+
+
 # ==================== Pipeline Processor ====================
 
 def upload_files_parallel(files: list, urls: list, max_workers: int = 10) -> list:
@@ -550,6 +822,13 @@ def handler(job):
     # Validate inputs
     if not tool:
         return {"error": "Missing 'tool' parameter"}
+
+    # ==================== BATCH MODE ====================
+    # Process multiple files in parallel using multiple NVENC sessions
+    # Optimized for datacenter GPUs (A5000, A6000) with unlimited NVENC sessions
+    if tool == "batch":
+        return process_batch_mode(job, job_input)
+
     if not input_url:
         return {"error": "Missing 'inputUrl' parameter"}
     if not output_url:

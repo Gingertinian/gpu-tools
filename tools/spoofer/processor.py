@@ -1505,13 +1505,16 @@ def process_video(
 
     cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
 
-    # Run FFmpeg
+    # Run FFmpeg and capture all stderr for error reporting
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+    stderr_lines = []  # Collect all stderr for error reporting
 
     while True:
         line = process.stderr.readline()
         if not line and process.poll() is not None:
             break
+        stderr_lines.append(line)  # Save every line
         if 'time=' in line and duration > 0:
             try:
                 time_str = line.split('time=')[1].split()[0]
@@ -1523,8 +1526,9 @@ def process_video(
                 pass
 
     if process.returncode != 0:
-        stderr = process.stderr.read()
-        raise RuntimeError(f"FFmpeg failed: {stderr}")
+        # Use collected stderr (last 20 lines for relevant error info)
+        stderr_output = ''.join(stderr_lines[-20:]) if stderr_lines else 'No stderr captured'
+        raise RuntimeError(f"FFmpeg failed (code {process.returncode}): {stderr_output}")
 
     report_progress(1.0, "Complete")
 

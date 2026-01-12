@@ -14,7 +14,8 @@ opencv-python>=4.8.0
 # moviepy>=1.0.3
 
 # Face detection (for Captioner)
-mediapipe>=0.10.3
+# Pin to 0.10.9 - newer versions have API changes (mp.solutions removed)
+mediapipe==0.10.9
 
 # Optional: Image hashing for Spoofer
 imagehash>=4.3.1

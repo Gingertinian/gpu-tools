@@ -89,7 +89,13 @@ def extract_videos_from_zip(zip_path: str, extract_dir: str) -> List[str]:
 # MediaPipe for face detection
 try:
     import mediapipe as mp
-    MEDIAPIPE_AVAILABLE = True
+    # Verify mp.solutions exists (newer versions may have changed API)
+    if hasattr(mp, 'solutions') and hasattr(mp.solutions, 'face_detection'):
+        MEDIAPIPE_AVAILABLE = True
+    else:
+        print("[Captioner] MediaPipe installed but mp.solutions.face_detection not available")
+        MEDIAPIPE_AVAILABLE = False
+        mp = None
 except ImportError:
     MEDIAPIPE_AVAILABLE = False
     mp = None

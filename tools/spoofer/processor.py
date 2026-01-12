@@ -1472,63 +1472,88 @@ def process_video(
     if video_cfg.get('fpsVar', 0) > 0:
         fps = 30 + py_rng.uniform(-video_cfg['fpsVar'], video_cfg['fpsVar'])
 
-    report_progress(0.2, "Encoding with NVENC (fast)...")
-
-    # Build FFmpeg command - FAST preset for speed
+    # Build base FFmpeg command
     filter_str = ','.join(filters) if filters else None
-
-    cmd = ['ffmpeg', '-y', '-i', input_path]
-
-    if filter_str:
-        cmd.extend(['-vf', filter_str])
-
-    # NVENC with fast preset (p2)
     bitrate = int(5000 * video_cfg.get('bitrate', 90) / 100)
-
-    cmd.extend([
-        '-c:v', 'h264_nvenc',
-        '-preset', 'p2',  # Fastest preset
-        '-rc', 'vbr',
-        '-cq', '23',
-        '-b:v', f'{bitrate}k',
-        '-maxrate', f'{int(bitrate * 1.5)}k',
-        '-bufsize', f'{bitrate * 2}k',
-        '-rc-lookahead', '8',  # Reduced for speed
-    ])
-
-    # Audio
     keep_audio = video_cfg.get('keepAudio', True)
-    if keep_audio:
-        cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
-    else:
-        cmd.append('-an')
 
-    cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
+    def build_ffmpeg_cmd(use_nvenc: bool) -> list:
+        """Build FFmpeg command with either NVENC or CPU encoding."""
+        cmd = ['ffmpeg', '-y', '-i', input_path]
+        if filter_str:
+            cmd.extend(['-vf', filter_str])
 
-    # Run FFmpeg and capture all stderr for error reporting
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        if use_nvenc:
+            # NVENC with fast preset (p2)
+            cmd.extend([
+                '-c:v', 'h264_nvenc',
+                '-preset', 'p2',  # Fastest preset
+                '-rc', 'vbr',
+                '-cq', '23',
+                '-b:v', f'{bitrate}k',
+                '-maxrate', f'{int(bitrate * 1.5)}k',
+                '-bufsize', f'{bitrate * 2}k',
+                '-rc-lookahead', '8',
+            ])
+        else:
+            # CPU encoding fallback (libx264)
+            cmd.extend([
+                '-c:v', 'libx264',
+                '-preset', 'fast',
+                '-crf', '23',
+                '-b:v', f'{bitrate}k',
+                '-maxrate', f'{int(bitrate * 1.5)}k',
+                '-bufsize', f'{bitrate * 2}k',
+            ])
 
-    stderr_lines = []  # Collect all stderr for error reporting
+        # Audio
+        if keep_audio:
+            cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
+        else:
+            cmd.append('-an')
 
-    while True:
-        line = process.stderr.readline()
-        if not line and process.poll() is not None:
-            break
-        stderr_lines.append(line)  # Save every line
-        if 'time=' in line and duration > 0:
-            try:
-                time_str = line.split('time=')[1].split()[0]
-                h, m, s = time_str.split(':')
-                current_time = int(h) * 3600 + int(m) * 60 + float(s)
-                progress = min(0.2 + (current_time / duration) * 0.75, 0.95)
-                report_progress(progress, f"Encoding... {int(current_time)}s / {int(duration)}s")
-            except:
-                pass
+        cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
+        return cmd
 
-    if process.returncode != 0:
-        # Use collected stderr (last 20 lines for relevant error info)
-        stderr_output = ''.join(stderr_lines[-20:]) if stderr_lines else 'No stderr captured'
-        raise RuntimeError(f"FFmpeg failed (code {process.returncode}): {stderr_output}")
+    def run_ffmpeg(cmd: list, encoder_name: str) -> tuple:
+        """Run FFmpeg and return (success, stderr_output)."""
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        stderr_lines = []
+
+        while True:
+            line = process.stderr.readline()
+            if not line and process.poll() is not None:
+                break
+            stderr_lines.append(line)
+            if 'time=' in line and duration > 0:
+                try:
+                    time_str = line.split('time=')[1].split()[0]
+                    h, m, s = time_str.split(':')
+                    current_time = int(h) * 3600 + int(m) * 60 + float(s)
+                    progress = min(0.2 + (current_time / duration) * 0.75, 0.95)
+                    report_progress(progress, f"Encoding ({encoder_name})... {int(current_time)}s / {int(duration)}s")
+                except:
+                    pass
+
+        stderr_output = ''.join(stderr_lines[-30:]) if stderr_lines else 'No stderr captured'
+        return process.returncode == 0, stderr_output, process.returncode
+
+    # Try NVENC first, fallback to CPU if it fails
+    report_progress(0.2, "Encoding with NVENC (fast)...")
+    nvenc_cmd = build_ffmpeg_cmd(use_nvenc=True)
+    success, stderr_output, returncode = run_ffmpeg(nvenc_cmd, "NVENC")
+
+    if not success:
+        # NVENC failed - try CPU encoding as fallback
+        print(f"[WARN] NVENC failed (code {returncode}), falling back to CPU encoding...")
+        print(f"[WARN] NVENC stderr: {stderr_output[:500]}")
+        report_progress(0.25, "NVENC failed, falling back to CPU encoding...")
+
+        cpu_cmd = build_ffmpeg_cmd(use_nvenc=False)
+        success, stderr_output, returncode = run_ffmpeg(cpu_cmd, "CPU")
+
+        if not success:
+            raise RuntimeError(f"FFmpeg failed with both NVENC and CPU (code {returncode}): {stderr_output}")
 
     report_progress(1.0, "Complete")
 

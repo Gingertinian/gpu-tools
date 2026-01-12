@@ -621,8 +621,8 @@ def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipel
 
                     # Collect output files
                     if is_batch_spoofer:
-                        # Collect all files from the batch output directory
-                        for ext in ['*.jpg', '*.jpeg', '*.png', '*.webp']:
+                        # Collect all files from the batch output directory (images and videos)
+                        for ext in ['*.jpg', '*.jpeg', '*.png', '*.webp', '*.mp4', '*.mov', '*.avi', '*.webm']:
                             next_files.extend(glob(os.path.join(spoofer_output_dir, ext)))
                     else:
                         if os.path.exists(output_path):

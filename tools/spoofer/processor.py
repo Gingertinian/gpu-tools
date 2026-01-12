@@ -1401,6 +1401,12 @@ def process_video(
 ) -> Dict[str, Any]:
     """Process video with FFmpeg + NVENC (fast preset)."""
 
+    # Ensure output path has video extension (FFmpeg needs it to determine format)
+    output_ext = os.path.splitext(output_path)[1].lower()
+    if output_ext not in ['.mp4', '.mov', '.avi', '.mkv', '.webm']:
+        output_path = output_path + '.mp4'
+        print(f"[DEBUG] Added .mp4 extension to output: {output_path}")
+
     report_progress(0.1, "Analyzing video...")
 
     # Get video info

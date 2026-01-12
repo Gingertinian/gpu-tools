@@ -1477,34 +1477,40 @@ def process_video(
     bitrate = int(5000 * video_cfg.get('bitrate', 90) / 100)
     keep_audio = video_cfg.get('keepAudio', True)
 
-    def build_ffmpeg_cmd(use_nvenc: bool) -> list:
-        """Build FFmpeg command with either NVENC or CPU encoding."""
-        cmd = ['ffmpeg', '-y', '-i', input_path]
-        if filter_str:
-            cmd.extend(['-vf', filter_str])
+    def build_ffmpeg_cmd(use_hwaccel: bool) -> list:
+        """Build FFmpeg command with GPU encoding (NVENC).
 
-        if use_nvenc:
-            # NVENC with fast preset (p2)
-            cmd.extend([
-                '-c:v', 'h264_nvenc',
-                '-preset', 'p2',  # Fastest preset
-                '-rc', 'vbr',
-                '-cq', '23',
-                '-b:v', f'{bitrate}k',
-                '-maxrate', f'{int(bitrate * 1.5)}k',
-                '-bufsize', f'{bitrate * 2}k',
-                '-rc-lookahead', '8',
-            ])
-        else:
-            # CPU encoding fallback (libx264)
-            cmd.extend([
-                '-c:v', 'libx264',
-                '-preset', 'fast',
-                '-crf', '23',
-                '-b:v', f'{bitrate}k',
-                '-maxrate', f'{int(bitrate * 1.5)}k',
-                '-bufsize', f'{bitrate * 2}k',
-            ])
+        Args:
+            use_hwaccel: If True, use CUDA hardware acceleration for decoding too.
+                         If False, decode on CPU but still encode on GPU (NVENC).
+        """
+        cmd = ['ffmpeg', '-y']
+
+        # Hardware acceleration for decoding (if supported)
+        if use_hwaccel:
+            cmd.extend(['-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda'])
+
+        cmd.extend(['-i', input_path])
+
+        # Video filters - need to handle hwaccel format
+        if filter_str:
+            if use_hwaccel:
+                # Upload to GPU, apply filters, keep on GPU for encoding
+                cmd.extend(['-vf', f'hwdownload,format=nv12,{filter_str},hwupload_cuda'])
+            else:
+                cmd.extend(['-vf', filter_str])
+
+        # Always use NVENC for encoding (GPU is more scalable)
+        cmd.extend([
+            '-c:v', 'h264_nvenc',
+            '-preset', 'p2',  # Fastest preset
+            '-rc', 'vbr',
+            '-cq', '23',
+            '-b:v', f'{bitrate}k',
+            '-maxrate', f'{int(bitrate * 1.5)}k',
+            '-bufsize', f'{bitrate * 2}k',
+            '-rc-lookahead', '8',
+        ])
 
         # Audio
         if keep_audio:
@@ -1515,8 +1521,9 @@ def process_video(
         cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
         return cmd
 
-    def run_ffmpeg(cmd: list, encoder_name: str) -> tuple:
-        """Run FFmpeg and return (success, stderr_output)."""
+    def run_ffmpeg(cmd: list, mode_name: str) -> tuple:
+        """Run FFmpeg and return (success, stderr_output, returncode)."""
+        print(f"[DEBUG] FFmpeg command ({mode_name}): {' '.join(cmd)}")
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         stderr_lines = []
 
@@ -1531,29 +1538,29 @@ def process_video(
                     h, m, s = time_str.split(':')
                     current_time = int(h) * 3600 + int(m) * 60 + float(s)
                     progress = min(0.2 + (current_time / duration) * 0.75, 0.95)
-                    report_progress(progress, f"Encoding ({encoder_name})... {int(current_time)}s / {int(duration)}s")
+                    report_progress(progress, f"Encoding ({mode_name})... {int(current_time)}s / {int(duration)}s")
                 except:
                     pass
 
         stderr_output = ''.join(stderr_lines[-30:]) if stderr_lines else 'No stderr captured'
         return process.returncode == 0, stderr_output, process.returncode
 
-    # Try NVENC first, fallback to CPU if it fails
-    report_progress(0.2, "Encoding with NVENC (fast)...")
-    nvenc_cmd = build_ffmpeg_cmd(use_nvenc=True)
-    success, stderr_output, returncode = run_ffmpeg(nvenc_cmd, "NVENC")
+    # Try full GPU mode first (hwaccel decode + NVENC encode)
+    report_progress(0.2, "Encoding with full GPU acceleration...")
+    gpu_cmd = build_ffmpeg_cmd(use_hwaccel=True)
+    success, stderr_output, returncode = run_ffmpeg(gpu_cmd, "Full GPU")
 
     if not success:
-        # NVENC failed - try CPU encoding as fallback
-        print(f"[WARN] NVENC failed (code {returncode}), falling back to CPU encoding...")
-        print(f"[WARN] NVENC stderr: {stderr_output[:500]}")
-        report_progress(0.25, "NVENC failed, falling back to CPU encoding...")
+        # Full GPU failed - try CPU decode + GPU encode (handles unsupported input codecs)
+        print(f"[WARN] Full GPU mode failed (code {returncode}), trying CPU decode + GPU encode...")
+        print(f"[WARN] Stderr: {stderr_output[:500]}")
+        report_progress(0.25, "Using CPU decode + GPU encode...")
 
-        cpu_cmd = build_ffmpeg_cmd(use_nvenc=False)
-        success, stderr_output, returncode = run_ffmpeg(cpu_cmd, "CPU")
+        hybrid_cmd = build_ffmpeg_cmd(use_hwaccel=False)
+        success, stderr_output, returncode = run_ffmpeg(hybrid_cmd, "CPU decode + NVENC")
 
         if not success:
-            raise RuntimeError(f"FFmpeg failed with both NVENC and CPU (code {returncode}): {stderr_output}")
+            raise RuntimeError(f"FFmpeg failed (code {returncode}): {stderr_output}")
 
     report_progress(1.0, "Complete")
 

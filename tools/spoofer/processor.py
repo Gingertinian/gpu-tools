@@ -1507,19 +1507,45 @@ def process_video(
         stderr_output = ''.join(stderr_lines[-30:]) if stderr_lines else 'No stderr captured'
         return process.returncode == 0, stderr_output, process.returncode
 
-    # Build FFmpeg command: CPU decode + filters + NVENC encode
-    # This is the most reliable approach - filters work on CPU frames, NVENC handles encoding
-    report_progress(0.2, "Encoding with GPU (NVENC)...")
+    # Check if input has audio stream
+    has_audio = False
+    try:
+        import json
+        audio_probe = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', '-select_streams', 'a', input_path],
+            capture_output=True, text=True
+        )
+        audio_info = json.loads(audio_probe.stdout)
+        has_audio = len(audio_info.get('streams', [])) > 0
+        print(f"[DEBUG] Input has audio: {has_audio}")
+    except Exception as e:
+        print(f"[DEBUG] Audio detection failed: {e}")
+        has_audio = False
 
-    cmd = ['ffmpeg', '-y', '-i', input_path]
+    def build_ffmpeg_cmd(encoder: str, encoder_opts: list) -> list:
+        """Build FFmpeg command with specified encoder."""
+        cmd = ['ffmpeg', '-y', '-i', input_path]
 
-    # Apply filters (CPU-based, most compatible)
-    if filter_str:
-        cmd.extend(['-vf', filter_str])
+        # Apply filters (CPU-based, most compatible)
+        if filter_str:
+            cmd.extend(['-vf', filter_str])
 
-    # NVENC encoding (GPU-accelerated)
-    cmd.extend([
-        '-c:v', 'h264_nvenc',
+        # Video encoder
+        cmd.extend(['-c:v', encoder])
+        cmd.extend(encoder_opts)
+
+        # Audio handling - be cautious with TikTok videos
+        if keep_audio and has_audio:
+            # Try to copy audio first, fallback to re-encode if issues
+            cmd.extend(['-c:a', 'aac', '-b:a', '128k', '-strict', 'experimental'])
+        else:
+            cmd.append('-an')
+
+        cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
+        return cmd
+
+    # NVENC encoder options
+    nvenc_opts = [
         '-preset', 'p2',
         '-rc', 'vbr',
         '-cq', '23',
@@ -1527,20 +1553,58 @@ def process_video(
         '-maxrate', f'{int(bitrate * 1.5)}k',
         '-bufsize', f'{bitrate * 2}k',
         '-rc-lookahead', '8',
-    ])
+    ]
 
-    # Audio
-    if keep_audio:
-        cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
-    else:
-        cmd.append('-an')
+    # libx264 (CPU) encoder options - fallback
+    libx264_opts = [
+        '-preset', 'fast',
+        '-crf', '23',
+        '-b:v', f'{bitrate}k',
+        '-maxrate', f'{int(bitrate * 1.5)}k',
+        '-bufsize', f'{bitrate * 2}k',
+        '-pix_fmt', 'yuv420p',
+    ]
 
-    cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
-
+    # Try NVENC first (GPU-accelerated)
+    report_progress(0.2, "Encoding with GPU (NVENC)...")
+    cmd = build_ffmpeg_cmd('h264_nvenc', nvenc_opts)
     success, stderr_output, returncode = run_ffmpeg(cmd, "NVENC")
 
     if not success:
-        raise RuntimeError(f"FFmpeg failed (code {returncode}): {stderr_output}")
+        print(f"[DEBUG] NVENC failed (code {returncode}), trying CPU fallback...")
+        print(f"[DEBUG] NVENC stderr: {stderr_output}")
+
+        # Fallback to CPU encoding (libx264)
+        report_progress(0.25, "GPU failed, encoding with CPU (libx264)...")
+        cmd = build_ffmpeg_cmd('libx264', libx264_opts)
+        success, stderr_output, returncode = run_ffmpeg(cmd, "libx264")
+
+        if not success:
+            print(f"[DEBUG] libx264 also failed (code {returncode})")
+            print(f"[DEBUG] libx264 stderr: {stderr_output}")
+
+            # Last resort: try without audio
+            if keep_audio and has_audio:
+                report_progress(0.3, "Trying without audio...")
+                cmd = build_ffmpeg_cmd('libx264', libx264_opts)
+                # Remove audio options and add -an
+                cmd = [c for c in cmd if c not in ['-c:a', 'aac', '-b:a', '128k', '-strict', 'experimental']]
+                # Find and remove the audio codec arguments
+                for i in range(len(cmd) - 1, -1, -1):
+                    if cmd[i] == '-c:a' or cmd[i] == '-b:a':
+                        cmd.pop(i)
+                        if i < len(cmd):
+                            cmd.pop(i)
+                # Add -an if not present
+                if '-an' not in cmd:
+                    insert_idx = cmd.index('-r') if '-r' in cmd else -1
+                    if insert_idx > 0:
+                        cmd.insert(insert_idx, '-an')
+
+                success, stderr_output, returncode = run_ffmpeg(cmd, "libx264-no-audio")
+
+            if not success:
+                raise RuntimeError(f"FFmpeg failed with all encoders (code {returncode}): {stderr_output}")
 
     report_progress(1.0, "Complete")
 

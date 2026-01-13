@@ -442,15 +442,37 @@ def process_batch_mode(job, job_input: dict) -> dict:
                 results[r["index"]] = {"index": r["index"], "status": "failed", "error": f"Download failed: {r.get('error')}"}
                 failed += 1
 
-        # Process in parallel using ProcessPoolExecutor
+        # Detect if processing videos (use ThreadPoolExecutor for videos since FFmpeg is subprocess)
+        VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.webm', '.mkv', '.m4v'}
+        has_videos = any(os.path.splitext(input_paths[i])[1].lower() in VIDEO_EXTENSIONS
+                        for i in range(total_files) if download_results[i].get("success"))
+
+        # Process in parallel
         if work_items:
-            # Use spawn context to avoid CUDA issues
-            ctx = multiprocessing.get_context('spawn')
-            with ProcessPoolExecutor(max_workers=max_parallel, mp_context=ctx) as executor:
+            if has_videos:
+                # Use ThreadPoolExecutor for videos (FFmpeg is the subprocess that does the work)
+                print(f"[Batch Mode] Using ThreadPoolExecutor for {len(work_items)} videos")
+                from concurrent.futures import ThreadPoolExecutor
+                ExecutorClass = ThreadPoolExecutor
+                executor_kwargs = {"max_workers": min(max_parallel, len(work_items))}
+            else:
+                # Use ProcessPoolExecutor for images (CPU-bound PIL operations)
+                print(f"[Batch Mode] Using ProcessPoolExecutor for {len(work_items)} images")
+                ctx = multiprocessing.get_context('spawn')
+                ExecutorClass = ProcessPoolExecutor
+                executor_kwargs = {"max_workers": max_parallel, "mp_context": ctx}
+
+            with ExecutorClass(**executor_kwargs) as executor:
                 future_to_idx = {executor.submit(process_single_file_for_batch, item): item[4] for item in work_items}
 
                 for future in as_completed(future_to_idx):
-                    result = future.result()
+                    try:
+                        result = future.result(timeout=600)  # 10 min timeout per file
+                    except Exception as e:
+                        # Handle timeout or other errors
+                        idx = future_to_idx[future]
+                        result = {"index": idx, "status": "failed", "error": str(e)}
+
                     idx = result["index"]
                     results[idx] = result
 

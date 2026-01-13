@@ -21,10 +21,17 @@ import zipfile
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from typing import Callable, Optional, Dict, Any, List, Tuple
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
 from collections import deque
-import multiprocessing
+import threading
+
+# Import gpu_utils for FFmpeg command building (optional - graceful fallback)
+try:
+    from tools.gpu_utils import build_ffmpeg_command, get_optimal_nvenc_params
+    GPU_UTILS_AVAILABLE = True
+except ImportError:
+    GPU_UTILS_AVAILABLE = False
 
 # Optional pHash support
 try:
@@ -120,7 +127,7 @@ def extract_videos_from_zip(zip_path: str, extract_dir: str) -> List[str]:
 def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
     """
     Worker function for parallel video processing.
-    Designed to be called from ProcessPoolExecutor.
+    Designed to be called from ThreadPoolExecutor (FFmpeg subprocess does the GPU work).
     Includes CPU fallback if NVENC fails.
     Supports multi-GPU workers via gpu_id parameter.
 
@@ -135,12 +142,7 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
         gpu_id = 0  # Default to first GPU
 
     try:
-        # Import here to avoid pickling issues
-        import random
-        import math
-        import subprocess
         import json
-        import os
 
         # Use nanosecond timestamp + pid + index for unique seed (prevents collisions)
         seed = int(time.time_ns()) ^ (os.getpid() << 16) ^ (video_index * 997)
@@ -160,7 +162,7 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
         except Exception:
             original_width, original_height, duration = 1920, 1080, 0
 
-        # Build filter chain (same as process_video)
+        # Build filter chain
         filters = []
         spatial = config.get('spatial', {})
         tonal = config.get('tonal', {})
@@ -219,49 +221,75 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
         bitrate = int(5000 * video_cfg.get('bitrate', 90) / 100)
         keep_audio = video_cfg.get('keepAudio', True)
 
-        def build_ffmpeg_cmd(use_nvenc: bool = True, target_gpu: int = 0) -> list:
-            """Build FFmpeg command with NVENC (multi-GPU support) or CPU encoding."""
-            cmd = ['ffmpeg', '-y', '-i', input_path]
-            if filter_str:
-                cmd.extend(['-vf', filter_str])
+        # Use gpu_utils module if available for FFmpeg command building
+        if GPU_UTILS_AVAILABLE:
+            # Use the gpu_utils module for standardized FFmpeg command building
+            nvenc_cmd = build_ffmpeg_command(
+                input_path=input_path,
+                output_path=output_path,
+                filter_str=filter_str,
+                gpu_id=gpu_id,
+                bitrate=bitrate,
+                fps=fps,
+                keep_audio=keep_audio,
+                use_nvenc=True
+            )
+            cpu_cmd = build_ffmpeg_command(
+                input_path=input_path,
+                output_path=output_path,
+                filter_str=filter_str,
+                gpu_id=0,
+                bitrate=bitrate,
+                fps=fps,
+                keep_audio=keep_audio,
+                use_nvenc=False
+            )
+        else:
+            # Fallback to local FFmpeg command building
+            def _build_ffmpeg_cmd(use_nvenc: bool = True, target_gpu: int = 0) -> list:
+                """Build FFmpeg command with NVENC (multi-GPU support) or CPU encoding."""
+                cmd = ['ffmpeg', '-y', '-i', input_path]
+                if filter_str:
+                    cmd.extend(['-vf', filter_str])
 
-            if use_nvenc:
-                cmd.extend([
-                    '-c:v', 'h264_nvenc',
-                    '-gpu', str(target_gpu),  # Multi-GPU: select specific GPU
-                    '-preset', 'p2',
-                    '-rc', 'vbr',
-                    '-cq', '23',
-                    '-b:v', f'{bitrate}k',
-                    '-maxrate', f'{int(bitrate * 1.5)}k',
-                    '-bufsize', f'{bitrate * 2}k',
-                    '-rc-lookahead', '8',
-                ])
-            else:
-                # CPU fallback with libx264
-                cmd.extend([
-                    '-c:v', 'libx264',
-                    '-preset', 'fast',
-                    '-crf', '23',
-                ])
+                if use_nvenc:
+                    cmd.extend([
+                        '-c:v', 'h264_nvenc',
+                        '-gpu', str(target_gpu),  # Multi-GPU: select specific GPU for NVENC
+                        '-preset', 'p2',
+                        '-rc', 'vbr',
+                        '-cq', '23',
+                        '-b:v', f'{bitrate}k',
+                        '-maxrate', f'{int(bitrate * 1.5)}k',
+                        '-bufsize', f'{bitrate * 2}k',
+                        '-rc-lookahead', '8',
+                    ])
+                else:
+                    # CPU fallback with libx264
+                    cmd.extend([
+                        '-c:v', 'libx264',
+                        '-preset', 'fast',
+                        '-crf', '23',
+                    ])
 
-            if keep_audio:
-                cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
-            else:
-                cmd.append('-an')
+                if keep_audio:
+                    cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
+                else:
+                    cmd.append('-an')
 
-            cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
-            return cmd
+                cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
+                return cmd
 
-        # Try NVENC first (with GPU selection), then CPU fallback
+            nvenc_cmd = _build_ffmpeg_cmd(use_nvenc=True, target_gpu=gpu_id)
+            cpu_cmd = _build_ffmpeg_cmd(use_nvenc=False, target_gpu=0)
+
+        # Try NVENC first (with GPU selection via -gpu X flag), then CPU fallback
         print(f"[Spoofer Worker {video_index}] Using GPU {gpu_id} for NVENC encoding")
-        nvenc_cmd = build_ffmpeg_cmd(use_nvenc=True, target_gpu=gpu_id)
         process = subprocess.run(nvenc_cmd, capture_output=True, text=True, timeout=900)
 
         if process.returncode != 0:
             # NVENC failed, try CPU fallback
             print(f"[Spoofer Worker {video_index}] NVENC on GPU {gpu_id} failed, trying CPU fallback")
-            cpu_cmd = build_ffmpeg_cmd(use_nvenc=False, target_gpu=0)
             process = subprocess.run(cpu_cmd, capture_output=True, text=True, timeout=1800)
 
             if process.returncode != 0:
@@ -292,6 +320,41 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
         }
 
 
+class NVENCSessionTracker:
+    """
+    Thread-safe tracker for active NVENC sessions per GPU.
+    Helps balance load across multiple GPUs and respect session limits.
+    """
+
+    def __init__(self, gpu_count: int, sessions_per_gpu: int):
+        self.gpu_count = gpu_count
+        self.sessions_per_gpu = sessions_per_gpu
+        self.active_sessions = {i: 0 for i in range(gpu_count)}
+        self._lock = threading.Lock()
+
+    def acquire_gpu(self) -> int:
+        """
+        Get the GPU with the least active sessions.
+        Returns GPU ID (0-indexed).
+        """
+        with self._lock:
+            # Find GPU with minimum active sessions
+            min_gpu = min(self.active_sessions, key=self.active_sessions.get)
+            self.active_sessions[min_gpu] += 1
+            return min_gpu
+
+    def release_gpu(self, gpu_id: int):
+        """Release a session from the specified GPU."""
+        with self._lock:
+            if gpu_id in self.active_sessions and self.active_sessions[gpu_id] > 0:
+                self.active_sessions[gpu_id] -= 1
+
+    def get_stats(self) -> Dict[int, int]:
+        """Get current session counts per GPU."""
+        with self._lock:
+            return dict(self.active_sessions)
+
+
 def process_videos_parallel(
     video_paths: List[str],
     output_dir: str,
@@ -302,12 +365,17 @@ def process_videos_parallel(
     """
     Process multiple videos in parallel using multiple NVENC sessions.
 
+    Uses ThreadPoolExecutor instead of ProcessPoolExecutor because:
+    - FFmpeg runs as subprocess and does the actual GPU work
+    - Avoids overhead of spawning Python processes
+    - ThreadPoolExecutor is lighter weight for I/O-bound work
+
     Args:
         video_paths: List of input video paths
         output_dir: Directory for output videos
         config: Processing configuration
         progress_callback: Optional progress callback
-        max_parallel: Max parallel processes (auto-detected if None)
+        max_parallel: Max parallel threads (auto-detected if None)
 
     Returns:
         Dict with results including processed count and any errors
@@ -318,52 +386,75 @@ def process_videos_parallel(
     # Auto-detect parallel limit based on GPU
     gpu_info = get_gpu_info()
     gpu_count = gpu_info['gpu_count']
+    sessions_per_gpu = NVENC_SESSION_LIMITS.get(gpu_info['gpu_type'], NVENC_SESSION_LIMITS['default'])
 
     if max_parallel is None:
         max_parallel = gpu_info['nvenc_sessions']
 
     print(f"[Parallel Video] GPU: {gpu_info['gpu_name']}, Type: {gpu_info['gpu_type']}, "
-          f"GPUs: {gpu_count}, Max parallel: {max_parallel}")
+          f"GPUs: {gpu_count}, Sessions/GPU: {sessions_per_gpu}, Max parallel: {max_parallel}")
 
-    # Prepare work items with GPU assignment (round-robin across GPUs)
+    # Initialize NVENC session tracker for load balancing across GPUs
+    session_tracker = NVENCSessionTracker(gpu_count, sessions_per_gpu)
+
+    # Prepare work items (GPU assignment will be done dynamically)
     work_items = []
     for i, video_path in enumerate(video_paths):
         basename = os.path.basename(video_path)
         name, ext = os.path.splitext(basename)
         output_path = os.path.join(output_dir, f"{name}_spoofed{ext}")
-        gpu_id = i % gpu_count  # Distribute across GPUs
-        work_items.append((video_path, output_path, config, i, gpu_id))
+        # GPU ID will be assigned dynamically via session tracker
+        work_items.append((video_path, output_path, config, i))
 
     total = len(work_items)
     completed = 0
     failed = 0
     results = []
+    results_lock = threading.Lock()
 
     def report_progress(msg=""):
         if progress_callback:
-            progress = completed / total
+            with results_lock:
+                progress = completed / total if total > 0 else 0
             progress_callback(progress, msg)
 
     report_progress(f"Processing {total} videos with {max_parallel} parallel sessions across {gpu_count} GPU(s)...")
 
-    # Process in parallel using ProcessPoolExecutor
-    # Use 'spawn' context to avoid CUDA issues with fork
-    with ProcessPoolExecutor(max_workers=max_parallel,
-                            mp_context=multiprocessing.get_context('spawn')) as executor:
-        future_to_item = {executor.submit(process_single_video_worker, item): item
+    def worker_with_gpu_tracking(work_item: Tuple) -> Dict[str, Any]:
+        """Wrapper that acquires/releases GPU from session tracker."""
+        video_path, output_path, cfg, video_index = work_item
+
+        # Dynamically acquire GPU with least load
+        gpu_id = session_tracker.acquire_gpu()
+        try:
+            # Add GPU ID to work item tuple
+            full_work_item = (video_path, output_path, cfg, video_index, gpu_id)
+            return process_single_video_worker(full_work_item)
+        finally:
+            # Always release the GPU session
+            session_tracker.release_gpu(gpu_id)
+
+    # Process in parallel using ThreadPoolExecutor
+    # ThreadPoolExecutor is ideal here because FFmpeg subprocess does the actual GPU work
+    with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+        future_to_item = {executor.submit(worker_with_gpu_tracking, item): item
                         for item in work_items}
 
         for future in as_completed(future_to_item):
             result = future.result()
-            results.append(result)
 
-            if result['status'] == 'completed':
-                completed += 1
-            else:
-                failed += 1
-                print(f"[Parallel Video] Failed video {result['index']}: {result.get('error', 'unknown')}")
+            with results_lock:
+                results.append(result)
 
-            report_progress(f"Completed {completed}/{total} videos ({failed} failed)")
+                if result['status'] == 'completed':
+                    completed += 1
+                else:
+                    failed += 1
+                    print(f"[Parallel Video] Failed video {result['index']}: {result.get('error', 'unknown')}")
+
+            # Log GPU session stats periodically
+            stats = session_tracker.get_stats()
+            report_progress(f"Completed {completed}/{total} videos ({failed} failed) | GPU sessions: {stats}")
 
     return {
         'status': 'completed',
@@ -403,6 +494,222 @@ PHOTO_DEFAULTS = {
     'flip': 1,
     'force_916': 1,
 }
+
+
+def process_single_image_worker(args: Tuple) -> Dict[str, Any]:
+    """
+    Worker function for parallel image processing.
+    Designed to be called from ThreadPoolExecutor (PIL operations are CPU-bound).
+
+    Args tuple: (input_path, output_path, params, image_index, seed)
+    Returns: dict with status, output_path, and any errors
+    """
+    input_path, output_path, params, image_index, seed = args
+
+    try:
+        # Load image
+        img = Image.open(input_path)
+        img = ImageOps.exif_transpose(img)
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+
+        # Initialize RNGs with unique seed
+        py_rng = random.Random(seed)
+        rng = np.random.default_rng(seed)
+
+        # Randomize params for this copy
+        varied_params = randomize_params(params, py_rng, variation=0.3)
+
+        # Apply transforms (imported from this module - defined below)
+        result_img = apply_transforms(img.copy(), varied_params, py_rng, rng)
+
+        # Save result
+        quality = int(params.get('quality', 90))
+        output_ext = os.path.splitext(output_path)[1].lower()
+
+        if output_ext in ['.jpg', '.jpeg']:
+            result_img.save(output_path, 'JPEG', quality=quality, optimize=True)
+        elif output_ext == '.png':
+            result_img.save(output_path, 'PNG', optimize=True)
+        else:
+            # Default to JPEG
+            output_path = os.path.splitext(output_path)[0] + '.jpg'
+            result_img.save(output_path, 'JPEG', quality=quality, optimize=True)
+
+        # Calculate pHash distance if available
+        phash_distance = 0
+        if PHASH_AVAILABLE:
+            try:
+                original_hash = imagehash.phash(img)
+                result_hash = imagehash.phash(result_img)
+                phash_distance = original_hash - result_hash
+            except Exception:
+                pass
+
+        return {
+            'status': 'completed',
+            'index': image_index,
+            'output_path': output_path,
+            'phash_distance': phash_distance,
+            'original_size': img.size,
+            'output_size': result_img.size
+        }
+
+    except Exception as e:
+        return {
+            'status': 'failed',
+            'index': image_index,
+            'error': str(e)
+        }
+
+
+def process_images_parallel(
+    image_paths: List[str],
+    output_dir: str,
+    config: Dict[str, Any],
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+    max_parallel: int = None
+) -> Dict[str, Any]:
+    """
+    Process multiple images in parallel using ThreadPoolExecutor.
+
+    Images are CPU-bound (PIL operations), so ThreadPoolExecutor is ideal.
+    Uses multiple threads to maximize CPU utilization.
+
+    Args:
+        image_paths: List of input image paths
+        output_dir: Directory for output images
+        config: Processing configuration
+        progress_callback: Optional progress callback
+        max_parallel: Max parallel threads (defaults to CPU count)
+
+    Returns:
+        Dict with results including processed count and any errors
+    """
+    if not image_paths:
+        return {'error': 'No images to process'}
+
+    # Default to CPU count for image processing (CPU-bound operations)
+    if max_parallel is None:
+        max_parallel = min(os.cpu_count() or 4, len(image_paths), 16)
+
+    print(f"[Parallel Image] Processing {len(image_paths)} images with {max_parallel} threads")
+
+    # Flatten config to params
+    params = {}
+    spatial = config.get('spatial', {})
+    tonal = config.get('tonal', {})
+    visual = config.get('visual', {})
+    compression = config.get('compression', {})
+    options = config.get('options', {})
+
+    params.update({
+        'crop': spatial.get('crop', PHOTO_DEFAULTS['crop']),
+        'micro_resize': spatial.get('microResize', PHOTO_DEFAULTS['micro_resize']),
+        'rotation': spatial.get('rotation', PHOTO_DEFAULTS['rotation']),
+        'subpixel': spatial.get('subpixel', PHOTO_DEFAULTS['subpixel']),
+        'warp': spatial.get('warp', PHOTO_DEFAULTS['warp']),
+        'barrel': spatial.get('barrel', PHOTO_DEFAULTS['barrel']),
+        'block_shift': spatial.get('blockShift', PHOTO_DEFAULTS['block_shift']),
+        'scale': spatial.get('scale', PHOTO_DEFAULTS['scale']),
+        'micro_rescale': spatial.get('microRescale', PHOTO_DEFAULTS['micro_rescale']),
+        'brightness': tonal.get('brightness', PHOTO_DEFAULTS['brightness']),
+        'gamma': tonal.get('gamma', PHOTO_DEFAULTS['gamma']),
+        'contrast': tonal.get('contrast', PHOTO_DEFAULTS['contrast']),
+        'vignette': tonal.get('vignette', PHOTO_DEFAULTS['vignette']),
+        'freq_noise': tonal.get('freqNoise', PHOTO_DEFAULTS['freq_noise']),
+        'invisible_watermark': tonal.get('invisibleWatermark', PHOTO_DEFAULTS['invisible_watermark']),
+        'color_space_conv': tonal.get('colorSpaceConv', PHOTO_DEFAULTS['color_space_conv']),
+        'saturation': tonal.get('saturation', PHOTO_DEFAULTS['saturation']),
+        'tint': visual.get('tint', PHOTO_DEFAULTS['tint']),
+        'chromatic': visual.get('chromatic', PHOTO_DEFAULTS['chromatic']),
+        'noise': visual.get('noise', PHOTO_DEFAULTS['noise']),
+        'quality': compression.get('quality', PHOTO_DEFAULTS['quality']),
+        'double_compress': compression.get('doubleCompress', PHOTO_DEFAULTS['double_compress']),
+        'flip': options.get('flip', PHOTO_DEFAULTS['flip']),
+        'force_916': options.get('force916', PHOTO_DEFAULTS['force_916']),
+    })
+
+    # Prepare work items with unique seeds
+    base_time = time.time_ns()
+    work_items = []
+    for i, image_path in enumerate(image_paths):
+        basename = os.path.basename(image_path)
+        name, ext = os.path.splitext(basename)
+        output_ext = ext if ext.lower() in ['.jpg', '.jpeg', '.png'] else '.jpg'
+        output_path = os.path.join(output_dir, f"{name}_spoofed{output_ext}")
+        seed = generate_unique_seed(image_path, i, base_time + i * 1000)
+        work_items.append((image_path, output_path, params, i, seed))
+
+    total = len(work_items)
+    completed = 0
+    failed = 0
+    results = []
+    phash_distances = []
+    results_lock = threading.Lock()
+
+    def report_progress(msg=""):
+        if progress_callback:
+            with results_lock:
+                progress = completed / total if total > 0 else 0
+            progress_callback(progress, msg)
+
+    report_progress(f"Processing {total} images with {max_parallel} threads...")
+
+    # Process in parallel using ThreadPoolExecutor (CPU-bound PIL operations)
+    with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+        future_to_item = {executor.submit(process_single_image_worker, item): item
+                        for item in work_items}
+
+        for future in as_completed(future_to_item):
+            result = future.result()
+
+            with results_lock:
+                results.append(result)
+
+                if result['status'] == 'completed':
+                    completed += 1
+                    if result.get('phash_distance', 0) > 0:
+                        phash_distances.append(result['phash_distance'])
+                else:
+                    failed += 1
+                    print(f"[Parallel Image] Failed image {result['index']}: {result.get('error', 'unknown')}")
+
+            report_progress(f"Completed {completed}/{total} images ({failed} failed)")
+
+    # Calculate statistics
+    stats = {
+        'status': 'completed',
+        'total': total,
+        'completed': completed,
+        'failed': failed,
+        'results': results,
+        'parallel_threads': max_parallel
+    }
+
+    if phash_distances:
+        stats['phash_avg'] = sum(phash_distances) / len(phash_distances)
+        stats['phash_min'] = min(phash_distances)
+        stats['phash_max'] = max(phash_distances)
+
+    return stats
+
+
+def extract_images_from_zip(zip_path: str, extract_dir: str) -> List[str]:
+    """
+    Extract image files from a ZIP archive.
+    Returns list of paths to extracted image files.
+    """
+    IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.gif'}
+    image_paths = []
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        for name in zf.namelist():
+            ext = os.path.splitext(name)[1].lower()
+            if ext in IMAGE_EXTENSIONS:
+                # Extract to temp dir
+                extracted_path = zf.extract(name, extract_dir)
+                image_paths.append(extracted_path)
+    return image_paths
 
 
 def generate_unique_seed(img_path: str, var_idx: int, base_time: int) -> int:
@@ -1328,17 +1635,63 @@ def process_spoofer(
                     'output_size': os.path.getsize(output_path) if os.path.exists(output_path) else 0
                 }
             else:
-                # ZIP contains images, not videos - fall through to batch image mode
-                # Extract all images and process them
-                report_progress(0.1, "ZIP contains images, processing as batch...")
+                # ZIP contains images, not videos - use parallel image processing
+                report_progress(0.1, "ZIP contains images, checking for batch processing...")
+
+                # Extract images from ZIP
+                image_paths = extract_images_from_zip(input_path, temp_dir)
+
+                if image_paths:
+                    # PARALLEL IMAGE PROCESSING MODE
+                    report_progress(0.12, f"Found {len(image_paths)} images, starting parallel processing...")
+
+                    # Create output directory
+                    output_dir = os.path.join(temp_dir, "output")
+                    os.makedirs(output_dir, exist_ok=True)
+
+                    # Process images in parallel (CPU-bound with ThreadPoolExecutor)
+                    result = process_images_parallel(
+                        image_paths,
+                        output_dir,
+                        config,
+                        progress_callback=progress_callback
+                    )
+
+                    if result.get('error'):
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                        return result
+
+                    # Create output ZIP with processed images
+                    report_progress(0.95, "Creating output ZIP...")
+
+                    with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+                        for r in result.get('results', []):
+                            if r.get('status') == 'completed' and r.get('output_path'):
+                                if os.path.exists(r['output_path']):
+                                    arcname = os.path.basename(r['output_path'])
+                                    zf.write(r['output_path'], arcname)
+
+                    report_progress(1.0, "Complete")
+
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+
+                    return {
+                        'status': 'completed',
+                        'mode': 'parallel_image_batch',
+                        'images_processed': result.get('completed', 0),
+                        'images_failed': result.get('failed', 0),
+                        'parallel_threads': result.get('parallel_threads', 1),
+                        'phash_avg': result.get('phash_avg'),
+                        'output_size': os.path.getsize(output_path) if os.path.exists(output_path) else 0
+                    }
+
+                # No images or videos found in ZIP
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                return {'error': 'ZIP file contains no supported images or videos'}
 
         except Exception as e:
             shutil.rmtree(temp_dir, ignore_errors=True)
             raise
-        finally:
-            # Cleanup temp dir if we processed videos
-            if 'video_paths' in dir() and video_paths:
-                shutil.rmtree(temp_dir, ignore_errors=True)
 
     if is_video:
         return process_video(input_path, output_path, config, report_progress)

@@ -33,13 +33,12 @@ import os
 import subprocess
 import tempfile
 import zipfile
-import multiprocessing
 from typing import Callable, Optional, Dict, Any, List, Tuple
 from PIL import Image, ImageDraw, ImageFont
 import json
 import textwrap
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Video extensions
 VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.webm', '.mkv', '.m4v'}
@@ -53,26 +52,73 @@ NVENC_SESSION_LIMITS = {
 
 
 def get_gpu_info() -> Dict[str, Any]:
-    """Detect GPU type and determine NVENC session limit."""
+    """
+    Detect all GPUs, their types, and determine NVENC session limits.
+
+    Returns:
+        Dict with:
+            - gpu_count: Number of GPUs detected
+            - gpus: List of GPU info dicts (name, type, nvenc_sessions)
+            - total_nvenc_sessions: Total NVENC sessions across all GPUs
+            - gpu_name: Name of first GPU (for backwards compatibility)
+            - gpu_type: Type of first GPU (for backwards compatibility)
+            - nvenc_sessions: Sessions per GPU (for backwards compatibility)
+    """
+    datacenter_keywords = ['A100', 'A6000', 'A5000', 'A4000', 'A4500', 'A40', 'A30', 'A10',
+                           'V100', 'T4', 'Quadro', 'Tesla', 'H100', 'L40', 'RTX 4090', 'RTX 6000']
+
     try:
         result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+            ['nvidia-smi', '--query-gpu=index,name', '--format=csv,noheader'],
             capture_output=True, text=True, timeout=10
         )
         if result.returncode == 0:
-            gpu_name = result.stdout.strip().split('\n')[0]
-            datacenter_keywords = ['A100', 'A6000', 'A5000', 'A4000', 'A4500', 'A40', 'A30', 'A10',
-                                   'V100', 'T4', 'Quadro', 'Tesla', 'H100', 'L40']
-            is_datacenter = any(kw in gpu_name for kw in datacenter_keywords)
-            gpu_type = 'datacenter' if is_datacenter else 'consumer'
-            return {
-                'gpu_name': gpu_name,
-                'gpu_type': gpu_type,
-                'nvenc_sessions': NVENC_SESSION_LIMITS[gpu_type]
-            }
+            lines = result.stdout.strip().split('\n')
+            gpus = []
+
+            for line in lines:
+                if not line.strip():
+                    continue
+                parts = line.split(', ', 1)
+                if len(parts) >= 2:
+                    gpu_index = int(parts[0].strip())
+                    gpu_name = parts[1].strip()
+                else:
+                    gpu_index = len(gpus)
+                    gpu_name = line.strip()
+
+                is_datacenter = any(kw in gpu_name for kw in datacenter_keywords)
+                gpu_type = 'datacenter' if is_datacenter else 'consumer'
+
+                gpus.append({
+                    'index': gpu_index,
+                    'name': gpu_name,
+                    'type': gpu_type,
+                    'nvenc_sessions': NVENC_SESSION_LIMITS[gpu_type]
+                })
+
+            if gpus:
+                total_sessions = sum(g['nvenc_sessions'] for g in gpus)
+                return {
+                    'gpu_count': len(gpus),
+                    'gpus': gpus,
+                    'total_nvenc_sessions': total_sessions,
+                    # Backwards compatibility (first GPU)
+                    'gpu_name': gpus[0]['name'],
+                    'gpu_type': gpus[0]['type'],
+                    'nvenc_sessions': gpus[0]['nvenc_sessions']
+                }
     except Exception as e:
         print(f"[GPU Detection] Error: {e}")
-    return {'gpu_name': 'Unknown', 'gpu_type': 'default', 'nvenc_sessions': NVENC_SESSION_LIMITS['default']}
+
+    return {
+        'gpu_count': 1,
+        'gpus': [{'index': 0, 'name': 'Unknown', 'type': 'default', 'nvenc_sessions': NVENC_SESSION_LIMITS['default']}],
+        'total_nvenc_sessions': NVENC_SESSION_LIMITS['default'],
+        'gpu_name': 'Unknown',
+        'gpu_type': 'default',
+        'nvenc_sessions': NVENC_SESSION_LIMITS['default']
+    }
 
 
 def extract_videos_from_zip(zip_path: str, extract_dir: str) -> List[str]:
@@ -466,9 +512,16 @@ def get_caption_for_index(config: Dict[str, Any], index: int) -> str:
 def process_single_video_caption_worker(args: Tuple) -> Dict[str, Any]:
     """
     Worker function for parallel video captioning.
-    Designed to be called from ProcessPoolExecutor.
+    Designed to be called from ThreadPoolExecutor.
+
+    Args (tuple):
+        input_path: Path to input video
+        output_path: Path to output video
+        config: Caption configuration dict
+        video_index: Index of video in batch
+        gpu_id: GPU device ID for NVENC encoding (0, 1, 2, etc.)
     """
-    input_path, output_path, config, video_index = args
+    input_path, output_path, config, video_index, gpu_id = args
     import subprocess
     import json
 
@@ -510,11 +563,14 @@ def process_single_video_caption_worker(args: Tuple) -> Dict[str, Any]:
         if stroke_color and stroke_width > 0:
             drawtext += f":borderw={stroke_width}:bordercolor={stroke_color}"
 
-        # FFmpeg command
+        # FFmpeg command with GPU selection
+        # -gpu flag specifies which GPU to use for h264_nvenc encoding
         cmd = [
-            'ffmpeg', '-y', '-i', input_path,
+            'ffmpeg', '-y',
+            '-hwaccel', 'cuda', '-hwaccel_device', str(gpu_id),
+            '-i', input_path,
             '-vf', drawtext,
-            '-c:v', 'h264_nvenc', '-preset', 'p2',
+            '-c:v', 'h264_nvenc', '-gpu', str(gpu_id), '-preset', 'p2',
             '-b:v', '5000k', '-maxrate', '7500k',
             '-c:a', 'aac', '-b:a', '128k',
             output_path
@@ -523,12 +579,12 @@ def process_single_video_caption_worker(args: Tuple) -> Dict[str, Any]:
         process = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
         if process.returncode != 0:
-            return {'status': 'failed', 'index': video_index, 'error': process.stderr[-500:]}
+            return {'status': 'failed', 'index': video_index, 'gpu_id': gpu_id, 'error': process.stderr[-500:]}
 
-        return {'status': 'completed', 'index': video_index, 'output_path': output_path, 'duration': duration}
+        return {'status': 'completed', 'index': video_index, 'output_path': output_path, 'duration': duration, 'gpu_id': gpu_id}
 
     except Exception as e:
-        return {'status': 'failed', 'index': video_index, 'error': str(e)}
+        return {'status': 'failed', 'index': video_index, 'gpu_id': gpu_id, 'error': str(e)}
 
 
 def process_videos_parallel_caption(
@@ -538,21 +594,42 @@ def process_videos_parallel_caption(
     progress_callback: Optional[Callable[[float, str], None]] = None,
     max_parallel: int = None
 ) -> Dict[str, Any]:
-    """Process multiple videos with captions in parallel using multiple NVENC sessions."""
+    """
+    Process multiple videos with captions in parallel using multiple NVENC sessions.
+
+    Uses ThreadPoolExecutor (not ProcessPoolExecutor) because FFmpeg subprocesses
+    already handle the GPU work - no need for separate Python processes.
+
+    Implements round-robin GPU assignment to distribute work across all available GPUs.
+    """
     if not video_paths:
         return {'error': 'No videos to process'}
 
-    if max_parallel is None:
-        gpu_info = get_gpu_info()
-        max_parallel = gpu_info['nvenc_sessions']
-        print(f"[Parallel Caption] GPU: {gpu_info['gpu_name']}, Max parallel: {max_parallel}")
+    # Detect all GPUs and calculate total parallel capacity
+    gpu_info = get_gpu_info()
+    gpu_count = gpu_info.get('gpu_count', 1)
+    gpus = gpu_info.get('gpus', [{'index': 0, 'nvenc_sessions': 2}])
+    total_nvenc_sessions = gpu_info.get('total_nvenc_sessions', 2)
 
+    if max_parallel is None:
+        max_parallel = total_nvenc_sessions
+
+    # Log GPU configuration
+    gpu_names = [g.get('name', 'Unknown') for g in gpus]
+    print(f"[Parallel Caption] Detected {gpu_count} GPU(s): {', '.join(gpu_names)}")
+    print(f"[Parallel Caption] Total NVENC sessions available: {total_nvenc_sessions}, using: {max_parallel}")
+
+    # Build work items with round-robin GPU assignment
+    # Each video gets assigned to a GPU in round-robin fashion
     work_items = []
     for i, video_path in enumerate(video_paths):
         basename = os.path.basename(video_path)
         name, ext = os.path.splitext(basename)
         output_path = os.path.join(output_dir, f"{name}_captioned{ext}")
-        work_items.append((video_path, output_path, config, i))
+
+        # Round-robin GPU assignment based on video index
+        gpu_id = gpus[i % gpu_count]['index']
+        work_items.append((video_path, output_path, config, i, gpu_id))
 
     total = len(work_items)
     completed = 0
@@ -561,12 +638,13 @@ def process_videos_parallel_caption(
 
     def report_progress(msg=""):
         if progress_callback:
-            progress_callback(completed / total, msg)
+            progress_callback(completed / total if total > 0 else 0, msg)
 
-    report_progress(f"Processing {total} videos with {max_parallel} parallel sessions...")
+    report_progress(f"Processing {total} videos across {gpu_count} GPU(s) with {max_parallel} parallel sessions...")
 
-    with ProcessPoolExecutor(max_workers=max_parallel,
-                            mp_context=multiprocessing.get_context('spawn')) as executor:
+    # Use ThreadPoolExecutor - FFmpeg handles GPU work in subprocesses
+    # This is more efficient than ProcessPoolExecutor for I/O-bound subprocess calls
+    with ThreadPoolExecutor(max_workers=max_parallel) as executor:
         future_to_item = {executor.submit(process_single_video_caption_worker, item): item for item in work_items}
 
         for future in as_completed(future_to_item):
@@ -576,11 +654,18 @@ def process_videos_parallel_caption(
                 completed += 1
             else:
                 failed += 1
-            report_progress(f"Completed {completed}/{total} videos ({failed} failed)")
+            gpu_used = result.get('gpu_id', 0)
+            report_progress(f"Completed {completed}/{total} videos ({failed} failed) [Last: GPU {gpu_used}]")
 
     return {
-        'status': 'completed', 'total': total, 'completed': completed,
-        'failed': failed, 'results': results, 'parallel_sessions': max_parallel
+        'status': 'completed',
+        'total': total,
+        'completed': completed,
+        'failed': failed,
+        'results': results,
+        'parallel_sessions': max_parallel,
+        'gpu_count': gpu_count,
+        'gpus_used': gpu_names
     }
 
 
@@ -770,7 +855,11 @@ def process_video_caption(
     config: Dict[str, Any],
     report_progress: Callable[[float, str], None]
 ) -> Dict[str, Any]:
-    """Add caption to video using FFmpeg drawtext filter."""
+    """
+    Add caption to video using FFmpeg drawtext filter.
+
+    Supports GPU selection via config['gpuId'] parameter for multi-GPU systems.
+    """
 
     report_progress(0.1, "Analyzing video...")
 
@@ -798,6 +887,9 @@ def process_video_caption(
     start_time = config.get('startTime', 0)
     end_time = config.get('endTime')
     max_width = config.get('maxWidth')
+
+    # GPU selection for multi-GPU systems (default to GPU 0)
+    gpu_id = config.get('gpuId', config.get('gpu_id', 0))
 
     # Get font path
     font_key = f"{font_family} Bold" if font_weight == 'bold' else font_family
@@ -855,13 +947,14 @@ def process_video_caption(
 
     drawtext_filter = f"drawtext={':'.join(drawtext_parts)}"
 
-    report_progress(0.3, "Encoding with NVENC...")
+    report_progress(0.3, f"Encoding with NVENC on GPU {gpu_id}...")
 
     def build_ffmpeg_cmd(use_nvenc: bool = True) -> list:
         """Build FFmpeg command with GPU or CPU encoding."""
         cmd = ['ffmpeg', '-y']
         if use_nvenc:
-            cmd.extend(['-hwaccel', 'cuda'])
+            # Specify GPU for hardware acceleration
+            cmd.extend(['-hwaccel', 'cuda', '-hwaccel_device', str(gpu_id)])
         cmd.extend([
             '-i', input_path,
             '-vf', drawtext_filter,
@@ -870,6 +963,7 @@ def process_video_caption(
         if use_nvenc:
             cmd.extend([
                 '-c:v', 'h264_nvenc',
+                '-gpu', str(gpu_id),  # Specify GPU for NVENC encoder
                 '-preset', 'p4',
                 '-b:v', '5000k',
                 '-maxrate', '7500k',
@@ -962,7 +1056,8 @@ def process_video_caption(
         'position': position,
         'animation': animation,
         'resolution': f"{width}x{height}",
-        'duration': duration
+        'duration': duration,
+        'gpuId': gpu_id
     }
 
 

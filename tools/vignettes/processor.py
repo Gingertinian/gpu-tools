@@ -2,7 +2,7 @@
 Vignettes Processor - Video overlay effects
 
 Applies vignette overlays, borders, and visual effects to videos.
-Uses NVENC for hardware-accelerated encoding.
+Uses NVENC for hardware-accelerated encoding with multi-GPU support.
 
 Config structure:
 {
@@ -12,17 +12,106 @@ Config structure:
     "borderWidth": pixels,
     "cornerRadius": pixels,
     "blurAmount": 0-100,
-    "customOverlay": "url to overlay image"
+    "customOverlay": "url to overlay image",
+    "_gpu_id": int (optional, for multi-GPU selection)
 }
+
+Multi-GPU Features:
+- Automatic GPU detection (count and type)
+- Round-robin GPU assignment for batch processing
+- Parallel video processing with ThreadPoolExecutor
+- ZIP input support for batch mode
 """
 
 import os
 import subprocess
 import tempfile
-from typing import Callable, Optional, Dict, Any
+import zipfile
+import shutil
+import time
+from typing import Callable, Optional, Dict, Any, List, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 import json
+
+# Video extensions
+VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.webm', '.mkv', '.m4v'}
+
+# NVENC session limits by GPU type (per GPU)
+# Consumer GPUs (GeForce): Limited to 3-5 sessions
+# Datacenter GPUs (A-series, Quadro): Unlimited sessions
+NVENC_SESSION_LIMITS = {
+    'consumer': 3,      # RTX 3090, 4090, 4080, etc.
+    'datacenter': 12,   # A5000, A6000, A100, etc.
+    'default': 2,       # Fallback
+}
+
+
+def get_gpu_info() -> Dict[str, Any]:
+    """
+    Detect GPU type, count GPUs, and determine NVENC session limit.
+    For multi-GPU workers, scales sessions by number of GPUs.
+    Returns dict with gpu_name, gpu_type, gpu_count, and nvenc_sessions.
+    """
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            gpu_lines = [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
+            gpu_count = len(gpu_lines)
+            gpu_name = gpu_lines[0] if gpu_lines else 'Unknown'
+
+            # Determine GPU type
+            datacenter_keywords = ['A100', 'A6000', 'A5000', 'A4000', 'A4500', 'A40', 'A30', 'A10',
+                                   'V100', 'T4', 'Quadro', 'Tesla', 'H100', 'L40', 'RTX 4090', 'RTX 6000']
+            is_datacenter = any(kw in gpu_name for kw in datacenter_keywords)
+
+            gpu_type = 'datacenter' if is_datacenter else 'consumer'
+            base_sessions = NVENC_SESSION_LIMITS[gpu_type]
+
+            # Scale sessions by number of GPUs (multi-GPU workers)
+            nvenc_sessions = base_sessions * gpu_count
+
+            print(f"[Vignettes GPU Detection] Found {gpu_count} GPU(s): {gpu_name}")
+            print(f"[Vignettes GPU Detection] Type: {gpu_type}, Sessions per GPU: {base_sessions}, Total: {nvenc_sessions}")
+
+            return {
+                'gpu_name': gpu_name,
+                'gpu_type': gpu_type,
+                'gpu_count': gpu_count,
+                'nvenc_sessions': nvenc_sessions
+            }
+    except Exception as e:
+        print(f"[Vignettes GPU Detection] Error: {e}")
+
+    return {
+        'gpu_name': 'Unknown',
+        'gpu_type': 'default',
+        'gpu_count': 1,
+        'nvenc_sessions': NVENC_SESSION_LIMITS['default']
+    }
+
+
+def extract_videos_from_zip(zip_path: str, extract_dir: str) -> List[str]:
+    """
+    Extract video files from a ZIP archive.
+    Returns list of paths to extracted video files.
+    """
+    video_paths = []
+    with zipfile.ZipFile(zip_path, 'r') as zf:
+        for name in zf.namelist():
+            # Skip directories and hidden files
+            if name.endswith('/') or name.startswith('__MACOSX') or name.startswith('.'):
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if ext in VIDEO_EXTENSIONS:
+                # Extract to temp dir
+                extracted_path = zf.extract(name, extract_dir)
+                video_paths.append(extracted_path)
+    return video_paths
 
 
 def process_vignettes(
@@ -117,11 +206,16 @@ def process_vignettes(
 
         report_progress(0.4, "Encoding with NVENC...")
 
+        # Get GPU ID from config (for multi-GPU batch processing)
+        gpu_id = config.get('_gpu_id', 0)
+        if gpu_id > 0:
+            print(f"[Vignettes] Using GPU {gpu_id} for NVENC encoding")
+
         # Build FFmpeg command - try NVENC first, then CPU fallback
-        def build_ffmpeg_cmd(use_nvenc: bool = True) -> list:
+        def build_ffmpeg_cmd(use_nvenc: bool = True, target_gpu: int = 0) -> list:
             cmd = ['ffmpeg', '-y']
             if use_nvenc:
-                cmd.extend(['-hwaccel', 'cuda'])
+                cmd.extend(['-hwaccel', 'cuda', '-hwaccel_device', str(target_gpu)])
             cmd.extend(['-i', input_path])
 
             if overlay_type != 'blur_edges' and os.path.exists(overlay_path):
@@ -132,9 +226,10 @@ def process_vignettes(
                 cmd.extend(['-filter_complex', filter_str])
 
             if use_nvenc:
-                # NVENC encoding
+                # NVENC encoding with GPU selection
                 cmd.extend([
                     '-c:v', 'h264_nvenc',
+                    '-gpu', str(target_gpu),  # Multi-GPU: select specific GPU
                     '-preset', 'p4',
                     '-b:v', '5000k',
                     '-maxrate', '7500k',
@@ -207,15 +302,15 @@ def process_vignettes(
             stderr_output = ''.join(stderr_lines)
             return process.returncode == 0, stderr_output
 
-        # Try NVENC first
-        cmd = build_ffmpeg_cmd(use_nvenc=True)
-        success, stderr = run_ffmpeg_with_progress(cmd, "NVENC")
+        # Try NVENC first with specified GPU
+        cmd = build_ffmpeg_cmd(use_nvenc=True, target_gpu=gpu_id)
+        success, stderr = run_ffmpeg_with_progress(cmd, f"NVENC-GPU{gpu_id}")
 
         # If NVENC failed, try CPU fallback
         if not success:
-            print(f"[Vignettes] NVENC failed, trying CPU fallback. Error: {stderr[-500:]}")
+            print(f"[Vignettes] NVENC on GPU {gpu_id} failed, trying CPU fallback. Error: {stderr[-500:]}")
             report_progress(0.4, "NVENC failed, trying CPU encoding...")
-            cmd = build_ffmpeg_cmd(use_nvenc=False)
+            cmd = build_ffmpeg_cmd(use_nvenc=False, target_gpu=0)
             success, stderr = run_ffmpeg_with_progress(cmd, "CPU")
 
         if not success:
@@ -378,12 +473,377 @@ def hex_to_rgb(hex_color: str) -> tuple:
         return (0, 0, 0)
 
 
+# ═══════════════════════════════════════════════════════════════
+# PARALLEL VIDEO PROCESSING (Multi-GPU Support)
+# ═══════════════════════════════════════════════════════════════
+
+def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
+    """
+    Worker function for parallel video processing.
+    Designed to be called from ThreadPoolExecutor.
+    FFmpeg handles GPU work, so ThreadPoolExecutor is appropriate.
+
+    Args tuple: (input_path, output_path, config, video_index, gpu_id)
+    Returns: dict with status, output_path, and any errors
+    """
+    input_path, output_path, config, video_index, gpu_id = args
+
+    try:
+        # Create config copy with GPU ID
+        worker_config = config.copy()
+        worker_config['_gpu_id'] = gpu_id
+
+        print(f"[Vignettes Worker {video_index}] Processing on GPU {gpu_id}: {os.path.basename(input_path)}")
+
+        # Get video info first
+        video_info = get_video_info(input_path)
+        duration = video_info.get('duration', 0)
+
+        # Process the video (reuse the main processing logic)
+        result = process_single_video_internal(input_path, output_path, worker_config)
+
+        return {
+            'status': 'completed',
+            'index': video_index,
+            'output_path': output_path,
+            'duration': duration,
+            'gpu_id': gpu_id,
+            'result': result
+        }
+
+    except Exception as e:
+        import traceback
+        print(f"[Vignettes Worker {video_index}] Error: {str(e)}")
+        print(traceback.format_exc())
+        return {
+            'status': 'failed',
+            'index': video_index,
+            'error': str(e),
+            'gpu_id': gpu_id
+        }
+
+
+def process_single_video_internal(
+    input_path: str,
+    output_path: str,
+    config: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Internal video processing function used by workers.
+    Processes a single video with vignette effects using the specified GPU.
+    """
+    # Get video info
+    video_info = get_video_info(input_path)
+    width = video_info.get('width', 1920)
+    height = video_info.get('height', 1080)
+    duration = video_info.get('duration', 0)
+
+    # Extract config
+    overlay_type = config.get('overlayType', 'vignette')
+    intensity = config.get('intensity', 50) / 100
+    color = config.get('color', '#000000')
+    border_width = config.get('borderWidth', 20)
+    corner_radius = config.get('cornerRadius', 0)
+    blur_amount = config.get('blurAmount', 50) / 100
+    gpu_id = config.get('_gpu_id', 0)
+
+    effects_applied = []
+
+    # Create temp directory for overlays
+    temp_dir = tempfile.mkdtemp(prefix='vignettes_worker_')
+    overlay_path = os.path.join(temp_dir, 'overlay.png')
+
+    try:
+        # Generate overlay based on type
+        if overlay_type == 'vignette':
+            create_vignette_overlay(overlay_path, width, height, intensity, color)
+            effects_applied.append(f"vignette:{int(intensity*100)}%")
+        elif overlay_type == 'border':
+            create_border_overlay(overlay_path, width, height, border_width, color, corner_radius)
+            effects_applied.append(f"border:{border_width}px")
+        elif overlay_type == 'frame':
+            create_frame_overlay(overlay_path, width, height, border_width, color, corner_radius)
+            effects_applied.append(f"frame:{border_width}px")
+
+        # Build filter chain
+        filters = []
+        if overlay_type == 'blur_edges':
+            blur_radius = int(blur_amount * 50)
+            filters.append(
+                f"split[original][blur];"
+                f"[blur]boxblur={blur_radius}:{blur_radius}[blurred];"
+                f"[original][blurred]blend=all_expr='if(gt(abs(X-W/2)/(W/2)+abs(Y-H/2)/(H/2),1.5-{intensity}),B,A)'"
+            )
+            effects_applied.append(f"blur_edges:{int(blur_amount*100)}%")
+        elif os.path.exists(overlay_path):
+            filters.append(f"[0:v][1:v]overlay=0:0")
+
+        # Build FFmpeg command with multi-GPU support
+        def build_cmd(use_nvenc: bool, target_gpu: int) -> list:
+            cmd = ['ffmpeg', '-y']
+            if use_nvenc:
+                cmd.extend(['-hwaccel', 'cuda', '-hwaccel_device', str(target_gpu)])
+            cmd.extend(['-i', input_path])
+
+            if overlay_type != 'blur_edges' and os.path.exists(overlay_path):
+                cmd.extend(['-i', overlay_path])
+
+            filter_str = ';'.join(filters) if filters else None
+            if filter_str:
+                cmd.extend(['-filter_complex', filter_str])
+
+            if use_nvenc:
+                cmd.extend([
+                    '-c:v', 'h264_nvenc',
+                    '-gpu', str(target_gpu),
+                    '-preset', 'p4',
+                    '-b:v', '5000k',
+                    '-maxrate', '7500k',
+                    '-bufsize', '10000k',
+                    '-profile:v', 'high',
+                ])
+            else:
+                cmd.extend([
+                    '-c:v', 'libx264',
+                    '-preset', 'medium',
+                    '-crf', '23',
+                    '-profile:v', 'high',
+                ])
+
+            cmd.extend(['-c:a', 'aac', '-b:a', '128k', output_path])
+            return cmd
+
+        # Try NVENC first
+        cmd = build_cmd(use_nvenc=True, target_gpu=gpu_id)
+        process = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
+
+        if process.returncode != 0:
+            # NVENC failed, try CPU
+            print(f"[Vignettes Internal] NVENC on GPU {gpu_id} failed, trying CPU")
+            cmd = build_cmd(use_nvenc=False, target_gpu=0)
+            process = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+
+            if process.returncode != 0:
+                raise RuntimeError(f"FFmpeg failed: {process.stderr[-500:] if process.stderr else 'Unknown'}")
+
+        return {
+            'effects_applied': effects_applied,
+            'overlay_type': overlay_type,
+            'resolution': f"{width}x{height}",
+            'duration': duration,
+            'gpu_id': gpu_id
+        }
+
+    finally:
+        # Cleanup temp files
+        try:
+            shutil.rmtree(temp_dir)
+        except:
+            pass
+
+
+def process_videos_parallel(
+    video_paths: List[str],
+    output_dir: str,
+    config: Dict[str, Any],
+    progress_callback: Optional[Callable[[float, str], None]] = None,
+    max_parallel: int = None
+) -> Dict[str, Any]:
+    """
+    Process multiple videos in parallel using multiple NVENC sessions.
+    Uses ThreadPoolExecutor since FFmpeg handles the GPU work externally.
+
+    Args:
+        video_paths: List of input video paths
+        output_dir: Directory for output videos
+        config: Vignette configuration
+        progress_callback: Optional progress callback
+        max_parallel: Max parallel threads (auto-detected if None)
+
+    Returns:
+        Dict with results including processed count and any errors
+    """
+    if not video_paths:
+        return {'error': 'No videos to process'}
+
+    # Auto-detect parallel limit based on GPU
+    gpu_info = get_gpu_info()
+    gpu_count = gpu_info['gpu_count']
+
+    if max_parallel is None:
+        max_parallel = gpu_info['nvenc_sessions']
+
+    print(f"[Vignettes Parallel] GPU: {gpu_info['gpu_name']}, Type: {gpu_info['gpu_type']}, "
+          f"GPUs: {gpu_count}, Max parallel: {max_parallel}")
+
+    # Prepare work items with GPU assignment (round-robin across GPUs)
+    work_items = []
+    for i, video_path in enumerate(video_paths):
+        basename = os.path.basename(video_path)
+        name, ext = os.path.splitext(basename)
+        # Preserve original extension, default to .mp4
+        out_ext = ext if ext.lower() in VIDEO_EXTENSIONS else '.mp4'
+        output_path = os.path.join(output_dir, f"{name}_vignette{out_ext}")
+        gpu_id = i % gpu_count  # Round-robin GPU assignment
+        work_items.append((video_path, output_path, config, i, gpu_id))
+
+    total = len(work_items)
+    completed = 0
+    failed = 0
+    results = []
+
+    def report_progress(msg=""):
+        if progress_callback:
+            progress = (completed + failed) / total if total > 0 else 0
+            progress_callback(progress, msg)
+
+    report_progress(f"Processing {total} videos with {max_parallel} parallel sessions across {gpu_count} GPU(s)...")
+
+    # Process in parallel using ThreadPoolExecutor
+    # ThreadPoolExecutor is appropriate here because FFmpeg does the GPU work
+    # and we're just launching/managing external processes
+    with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+        future_to_item = {executor.submit(process_single_video_worker, item): item
+                        for item in work_items}
+
+        for future in as_completed(future_to_item):
+            result = future.result()
+            results.append(result)
+
+            if result['status'] == 'completed':
+                completed += 1
+                print(f"[Vignettes Parallel] Completed video {result['index']+1}/{total} on GPU {result['gpu_id']}")
+            else:
+                failed += 1
+                print(f"[Vignettes Parallel] Failed video {result['index']}: {result.get('error', 'unknown')}")
+
+            report_progress(f"Completed {completed}/{total} videos ({failed} failed)")
+
+    return {
+        'status': 'completed',
+        'total': total,
+        'completed': completed,
+        'failed': failed,
+        'results': results,
+        'parallel_sessions': max_parallel,
+        'gpu_count': gpu_count,
+        'gpu_type': gpu_info['gpu_type']
+    }
+
+
+def process_vignettes_batch(
+    input_path: str,
+    output_path: str,
+    config: Dict[str, Any],
+    progress_callback: Optional[Callable[[float, str], None]] = None
+) -> Dict[str, Any]:
+    """
+    Process vignettes with automatic detection of ZIP input for batch mode.
+
+    If input is a ZIP file containing videos:
+    - Extracts videos
+    - Processes them in parallel using multiple GPUs
+    - Creates output ZIP with processed videos
+
+    If input is a single video:
+    - Processes normally with the standard process_vignettes function
+    """
+    def report_progress(progress: float, message: str = ""):
+        if progress_callback:
+            progress_callback(progress, message)
+
+    ext = os.path.splitext(input_path)[1].lower()
+
+    # Check if input is a ZIP
+    if ext == '.zip':
+        report_progress(0.05, "Detected ZIP input, extracting videos...")
+
+        # Create temp directory
+        temp_dir = tempfile.mkdtemp(prefix='vignettes_batch_')
+
+        try:
+            # Extract videos from ZIP
+            video_paths = extract_videos_from_zip(input_path, temp_dir)
+
+            if not video_paths:
+                return {'error': 'No video files found in ZIP archive'}
+
+            report_progress(0.1, f"Found {len(video_paths)} videos, starting parallel processing...")
+
+            # Create output directory
+            output_dir = os.path.join(temp_dir, 'output')
+            os.makedirs(output_dir, exist_ok=True)
+
+            # Process videos in parallel
+            result = process_videos_parallel(
+                video_paths,
+                output_dir,
+                config,
+                progress_callback=lambda p, m: report_progress(0.1 + p * 0.8, m)
+            )
+
+            if result.get('error'):
+                return result
+
+            # Create output ZIP with processed videos
+            report_progress(0.92, "Creating output ZIP...")
+
+            with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_STORED) as zf:
+                for r in result.get('results', []):
+                    if r.get('status') == 'completed' and r.get('output_path'):
+                        if os.path.exists(r['output_path']):
+                            arcname = os.path.basename(r['output_path'])
+                            zf.write(r['output_path'], arcname)
+
+            report_progress(1.0, "Complete")
+
+            return {
+                'status': 'completed',
+                'mode': 'parallel_video_batch',
+                'videos_processed': result.get('completed', 0),
+                'videos_failed': result.get('failed', 0),
+                'parallel_sessions': result.get('parallel_sessions', 1),
+                'gpu_count': result.get('gpu_count', 1),
+                'gpu_type': result.get('gpu_type', 'unknown'),
+                'output_size': os.path.getsize(output_path) if os.path.exists(output_path) else 0
+            }
+
+        finally:
+            # Cleanup temp directory
+            try:
+                shutil.rmtree(temp_dir)
+            except:
+                pass
+
+    # Single video - use standard processing
+    return process_vignettes(input_path, output_path, config, progress_callback)
+
+
 if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 3:
-        print("Usage: python processor.py input_video output_video")
+        print("Usage: python processor.py input_file output_file [--batch]")
+        print("")
+        print("Options:")
+        print("  input_file   - Single video file or ZIP containing multiple videos")
+        print("  output_file  - Output video or ZIP file")
+        print("  --batch      - Force batch processing mode (auto-detected for .zip)")
+        print("")
+        print("Multi-GPU Support:")
+        print("  - Automatically detects number of GPUs")
+        print("  - Uses round-robin GPU assignment for parallel processing")
+        print("  - Supports datacenter GPUs (A5000, A6000, etc.) with unlimited NVENC sessions")
         sys.exit(1)
+
+    # Print GPU info
+    print("\n=== GPU Detection ===")
+    gpu_info = get_gpu_info()
+    print(f"GPU: {gpu_info['gpu_name']}")
+    print(f"Type: {gpu_info['gpu_type']}")
+    print(f"Count: {gpu_info['gpu_count']}")
+    print(f"Max NVENC sessions: {gpu_info['nvenc_sessions']}")
+    print("=====================\n")
 
     test_config = {
         'overlayType': 'vignette',
@@ -392,7 +852,16 @@ if __name__ == "__main__":
     }
 
     def progress(p, msg):
-        print(f"[{int(p*100)}%] {msg}")
+        print(f"[{int(p*100):3d}%] {msg}")
 
-    result = process_vignettes(sys.argv[1], sys.argv[2], test_config, progress)
-    print(f"Result: {result}")
+    # Check if batch mode (ZIP input or --batch flag)
+    use_batch = '--batch' in sys.argv or sys.argv[1].lower().endswith('.zip')
+
+    if use_batch:
+        print("Using batch processing mode...")
+        result = process_vignettes_batch(sys.argv[1], sys.argv[2], test_config, progress)
+    else:
+        print("Using single video processing mode...")
+        result = process_vignettes(sys.argv[1], sys.argv[2], test_config, progress)
+
+    print(f"\nResult: {result}")

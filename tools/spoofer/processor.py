@@ -141,6 +141,10 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
         input_path, output_path, config, video_index = args
         gpu_id = 0  # Default to first GPU
 
+    # Timing and GPU assignment logging
+    start_time = time.time()
+    print(f"[NVENC Worker {video_index}] Starting on GPU {gpu_id}")
+
     try:
         import json
 
@@ -248,21 +252,34 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
             # Fallback to local FFmpeg command building
             def _build_ffmpeg_cmd(use_nvenc: bool = True, target_gpu: int = 0) -> list:
                 """Build FFmpeg command with NVENC (multi-GPU support) or CPU encoding."""
-                cmd = ['ffmpeg', '-y', '-i', input_path]
+                cmd = ['ffmpeg', '-y']
+
+                if use_nvenc:
+                    # Hardware acceleration for decoding - bind to specific GPU
+                    cmd.extend([
+                        '-hwaccel', 'cuda',
+                        '-hwaccel_device', str(target_gpu),
+                    ])
+
+                cmd.extend(['-i', input_path])
+
                 if filter_str:
                     cmd.extend(['-vf', filter_str])
 
                 if use_nvenc:
+                    # NVENC encoding with GPU selection RIGHT AFTER codec selection
+                    # Using p1 (fastest) preset for maximum throughput
                     cmd.extend([
                         '-c:v', 'h264_nvenc',
                         '-gpu', str(target_gpu),  # Multi-GPU: select specific GPU for NVENC
-                        '-preset', 'p2',
+                        '-preset', 'p1',  # Fastest NVENC preset for max sessions
+                        '-tune', 'hq',
                         '-rc', 'vbr',
-                        '-cq', '23',
+                        '-cq', '25',  # Slightly lower quality for speed
                         '-b:v', f'{bitrate}k',
                         '-maxrate', f'{int(bitrate * 1.5)}k',
                         '-bufsize', f'{bitrate * 2}k',
-                        '-rc-lookahead', '8',
+                        '-rc-lookahead', '4',  # Reduced lookahead for speed
                     ])
                 else:
                     # CPU fallback with libx264
@@ -285,7 +302,12 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
 
         # Try NVENC first (with GPU selection via -gpu X flag), then CPU fallback
         print(f"[Spoofer Worker {video_index}] Using GPU {gpu_id} for NVENC encoding")
-        process = subprocess.run(nvenc_cmd, capture_output=True, text=True, timeout=900)
+
+        # Set up environment with CUDA_VISIBLE_DEVICES for process affinity
+        env = os.environ.copy()
+        env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+
+        process = subprocess.run(nvenc_cmd, capture_output=True, text=True, timeout=900, env=env)
 
         if process.returncode != 0:
             # NVENC failed, try CPU fallback
@@ -293,26 +315,36 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
             process = subprocess.run(cpu_cmd, capture_output=True, text=True, timeout=1800)
 
             if process.returncode != 0:
+                elapsed = time.time() - start_time
+                print(f"[NVENC Worker {video_index}] FAILED in {elapsed:.2f}s on GPU {gpu_id}")
                 return {
                     'status': 'failed',
                     'index': video_index,
                     'error': f"Both NVENC and CPU failed: {process.stderr[-500:] if process.stderr else 'Unknown error'}"
                 }
 
+        elapsed = time.time() - start_time
+        print(f"[NVENC Worker {video_index}] Done in {elapsed:.2f}s on GPU {gpu_id}")
+
         return {
             'status': 'completed',
             'index': video_index,
             'output_path': output_path,
-            'duration': duration
+            'duration': duration,
+            'processing_time': elapsed
         }
 
     except subprocess.TimeoutExpired:
+        elapsed = time.time() - start_time
+        print(f"[NVENC Worker {video_index}] TIMEOUT after {elapsed:.2f}s on GPU {gpu_id}")
         return {
             'status': 'failed',
             'index': video_index,
             'error': 'FFmpeg process timed out'
         }
     except Exception as e:
+        elapsed = time.time() - start_time
+        print(f"[NVENC Worker {video_index}] ERROR after {elapsed:.2f}s on GPU {gpu_id}: {str(e)}")
         return {
             'status': 'failed',
             'index': video_index,
@@ -391,8 +423,13 @@ def process_videos_parallel(
     if max_parallel is None:
         max_parallel = gpu_info['nvenc_sessions']
 
+    # Overprovision workers by 50% to keep GPUs busy during I/O wait
+    # This ensures there's always work queued when an NVENC session finishes
+    max_workers = int(max_parallel * 1.5)
+
     print(f"[Parallel Video] GPU: {gpu_info['gpu_name']}, Type: {gpu_info['gpu_type']}, "
-          f"GPUs: {gpu_count}, Sessions/GPU: {sessions_per_gpu}, Max parallel: {max_parallel}")
+          f"GPUs: {gpu_count}, Sessions/GPU: {sessions_per_gpu}, "
+          f"NVENC sessions: {max_parallel}, Workers: {max_workers} (1.5x overprovision)")
 
     # Initialize NVENC session tracker for load balancing across GPUs
     session_tracker = NVENCSessionTracker(gpu_count, sessions_per_gpu)
@@ -418,7 +455,7 @@ def process_videos_parallel(
                 progress = completed / total if total > 0 else 0
             progress_callback(progress, msg)
 
-    report_progress(f"Processing {total} videos with {max_parallel} parallel sessions across {gpu_count} GPU(s)...")
+    report_progress(f"Processing {total} videos with {max_workers} workers ({max_parallel} NVENC sessions) across {gpu_count} GPU(s)...")
 
     def worker_with_gpu_tracking(work_item: Tuple) -> Dict[str, Any]:
         """Wrapper that acquires/releases GPU from session tracker."""
@@ -436,7 +473,8 @@ def process_videos_parallel(
 
     # Process in parallel using ThreadPoolExecutor
     # ThreadPoolExecutor is ideal here because FFmpeg subprocess does the actual GPU work
-    with ThreadPoolExecutor(max_workers=max_parallel) as executor:
+    # Using max_workers (1.5x overprovisioned) to keep GPU queue full
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_item = {executor.submit(worker_with_gpu_tracking, item): item
                         for item in work_items}
 
@@ -463,6 +501,7 @@ def process_videos_parallel(
         'failed': failed,
         'results': results,
         'parallel_sessions': max_parallel,
+        'max_workers': max_workers,
         'gpu_count': gpu_count,
         'gpu_type': gpu_info['gpu_type']
     }
@@ -1927,9 +1966,24 @@ def process_video(
         print(f"[DEBUG] Audio detection failed: {e}")
         has_audio = False
 
-    def build_ffmpeg_cmd(encoder: str, encoder_opts: list) -> list:
+    # Get GPU ID from config (for multi-GPU batch processing)
+    # Must be defined before build_ffmpeg_cmd which uses it as a closure variable
+    gpu_id = config.get('_gpu_id', 0)
+    if gpu_id > 0:
+        print(f"[Video Processing] Using GPU {gpu_id} for NVENC encoding")
+
+    def build_ffmpeg_cmd(encoder: str, encoder_opts: list, use_hwaccel: bool = False) -> list:
         """Build FFmpeg command with specified encoder."""
-        cmd = ['ffmpeg', '-y', '-i', input_path]
+        cmd = ['ffmpeg', '-y']
+
+        # Hardware acceleration for decoding (NVENC only)
+        if use_hwaccel:
+            cmd.extend([
+                '-hwaccel', 'cuda',
+                '-hwaccel_device', str(gpu_id),
+            ])
+
+        cmd.extend(['-i', input_path])
 
         # Apply filters (CPU-based, most compatible)
         if filter_str:
@@ -1949,21 +2003,18 @@ def process_video(
         cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
         return cmd
 
-    # Get GPU ID from config (for multi-GPU batch processing)
-    gpu_id = config.get('_gpu_id', 0)
-    if gpu_id > 0:
-        print(f"[Video Processing] Using GPU {gpu_id} for NVENC encoding")
-
     # NVENC encoder options with multi-GPU support
+    # Using p1 (fastest) preset for maximum throughput
     nvenc_opts = [
         '-gpu', str(gpu_id),  # Multi-GPU: select specific GPU
-        '-preset', 'p2',
+        '-preset', 'p1',  # Fastest NVENC preset for max sessions
+        '-tune', 'hq',
         '-rc', 'vbr',
-        '-cq', '23',
+        '-cq', '25',  # Slightly lower quality for speed
         '-b:v', f'{bitrate}k',
         '-maxrate', f'{int(bitrate * 1.5)}k',
         '-bufsize', f'{bitrate * 2}k',
-        '-rc-lookahead', '8',
+        '-rc-lookahead', '4',  # Reduced lookahead for speed
     ]
 
     # libx264 (CPU) encoder options - fallback
@@ -1976,9 +2027,9 @@ def process_video(
         '-pix_fmt', 'yuv420p',
     ]
 
-    # Try NVENC first (GPU-accelerated)
+    # Try NVENC first (GPU-accelerated with hardware decoding)
     report_progress(0.2, "Encoding with GPU (NVENC)...")
-    cmd = build_ffmpeg_cmd('h264_nvenc', nvenc_opts)
+    cmd = build_ffmpeg_cmd('h264_nvenc', nvenc_opts, use_hwaccel=True)
     success, stderr_output, returncode = run_ffmpeg(cmd, "NVENC")
 
     if not success:

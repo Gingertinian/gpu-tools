@@ -196,78 +196,137 @@ def process_video_resize(
     target_height: int,
     report_progress: Callable[[float, str], None]
 ) -> Dict[str, Any]:
-    """Resize video using FFmpeg with GPU acceleration."""
+    """Resize video using FFmpeg with GPU acceleration and CPU fallback."""
 
     report_progress(0.15, "Building resize filter...")
 
     target_aspect = target_width / target_height
     original_aspect = current_width / current_height
 
-    # Build video filter
-    if abs(original_aspect - target_aspect) < 0.01:
-        # Aspect ratio is close enough, just scale
-        vf = f"scale_cuda={target_width}:{target_height}"
-    elif original_aspect > target_aspect:
-        # Video is wider, crop horizontally first then scale
-        new_width = int(target_aspect * current_height)
-        x = (current_width - new_width) // 2
-        vf = f"crop={new_width}:{current_height}:{x}:0,scale_cuda={target_width}:{target_height}"
-    else:
-        # Video is taller, crop vertically first then scale
-        new_height = int(current_width / target_aspect)
-        y = (current_height - new_height) // 2
-        vf = f"crop={current_width}:{new_height}:0:{y},scale_cuda={target_width}:{target_height}"
-
-    report_progress(0.2, "Encoding with NVENC...")
-
-    # FFmpeg command with GPU acceleration
-    cmd = [
-        'ffmpeg', '-y',
-        '-hwaccel', 'cuda',
-        '-hwaccel_output_format', 'cuda',
-        '-i', input_path,
-        '-vf', vf,
-        '-c:v', 'h264_nvenc',
-        '-preset', 'p4',
-        '-b:v', '5000k',
-        '-maxrate', '7500k',
-        '-bufsize', '10000k',
-        '-c:a', 'aac',
-        '-b:a', '128k',
-        output_path
-    ]
-
     # Get video duration for progress
     duration = get_video_duration(input_path)
 
-    # Run FFmpeg
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        universal_newlines=True
-    )
+    def build_ffmpeg_cmd(use_nvenc: bool = True) -> list:
+        """Build FFmpeg command with GPU or CPU encoding."""
+        # Build video filter based on encoding mode
+        if use_nvenc:
+            if abs(original_aspect - target_aspect) < 0.01:
+                vf = f"scale_cuda={target_width}:{target_height}"
+            elif original_aspect > target_aspect:
+                new_width = int(target_aspect * current_height)
+                x = (current_width - new_width) // 2
+                vf = f"crop={new_width}:{current_height}:{x}:0,scale_cuda={target_width}:{target_height}"
+            else:
+                new_height = int(current_width / target_aspect)
+                y = (current_height - new_height) // 2
+                vf = f"crop={current_width}:{new_height}:0:{y},scale_cuda={target_width}:{target_height}"
 
-    # Monitor progress
-    while True:
-        line = process.stderr.readline()
-        if not line and process.poll() is not None:
-            break
+            cmd = [
+                'ffmpeg', '-y',
+                '-hwaccel', 'cuda',
+                '-hwaccel_output_format', 'cuda',
+                '-i', input_path,
+                '-vf', vf,
+                '-c:v', 'h264_nvenc',
+                '-preset', 'p4',
+                '-b:v', '5000k',
+                '-maxrate', '7500k',
+                '-bufsize', '10000k',
+            ]
+        else:
+            # CPU fallback - use standard scale filter
+            if abs(original_aspect - target_aspect) < 0.01:
+                vf = f"scale={target_width}:{target_height}"
+            elif original_aspect > target_aspect:
+                new_width = int(target_aspect * current_height)
+                x = (current_width - new_width) // 2
+                vf = f"crop={new_width}:{current_height}:{x}:0,scale={target_width}:{target_height}"
+            else:
+                new_height = int(current_width / target_aspect)
+                y = (current_height - new_height) // 2
+                vf = f"crop={current_width}:{new_height}:0:{y},scale={target_width}:{target_height}"
 
-        if 'time=' in line:
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', input_path,
+                '-vf', vf,
+                '-c:v', 'libx264',
+                '-preset', 'medium',
+                '-crf', '23',
+            ]
+
+        cmd.extend([
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            output_path
+        ])
+        return cmd
+
+    def run_ffmpeg_with_progress(cmd: list, mode_name: str) -> tuple:
+        """Run FFmpeg and capture stderr properly. Returns (success, stderr_output)."""
+        stderr_lines = []
+
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+
+        # Read stderr line by line for progress
+        try:
+            while True:
+                line = process.stderr.readline()
+                if not line:
+                    if process.poll() is not None:
+                        break
+                    continue
+
+                stderr_lines.append(line)
+                # Keep last 50 lines to avoid memory issues
+                if len(stderr_lines) > 50:
+                    stderr_lines.pop(0)
+
+                if 'time=' in line:
+                    try:
+                        time_str = line.split('time=')[1].split()[0]
+                        h, m, s = time_str.split(':')
+                        current_time = int(h) * 3600 + int(m) * 60 + float(s)
+                        if duration > 0:
+                            progress = min(0.2 + (current_time / duration) * 0.75, 0.95)
+                            report_progress(progress, f"Encoding ({mode_name})... {int(current_time)}s / {int(duration)}s")
+                    except Exception:
+                        pass
+
+            # Wait for process to complete with timeout
             try:
-                time_str = line.split('time=')[1].split()[0]
-                h, m, s = time_str.split(':')
-                current_time = int(h) * 3600 + int(m) * 60 + float(s)
-                if duration > 0:
-                    progress = min(0.2 + (current_time / duration) * 0.75, 0.95)
-                    report_progress(progress, f"Encoding... {int(current_time)}s / {int(duration)}s")
-            except Exception:
-                pass
+                process.wait(timeout=600)  # 10 minute timeout
+            except subprocess.TimeoutExpired:
+                process.kill()
+                return False, "FFmpeg process timed out after 600 seconds"
 
-    if process.returncode != 0:
-        stderr = process.stderr.read()
-        raise RuntimeError(f"FFmpeg failed: {stderr}")
+        except Exception as e:
+            process.kill()
+            return False, f"Error during encoding: {str(e)}"
+
+        stderr_output = ''.join(stderr_lines)
+        return process.returncode == 0, stderr_output
+
+    report_progress(0.2, "Encoding with NVENC...")
+
+    # Try NVENC first
+    cmd = build_ffmpeg_cmd(use_nvenc=True)
+    success, stderr = run_ffmpeg_with_progress(cmd, "NVENC")
+
+    # If NVENC failed, try CPU fallback
+    if not success:
+        print(f"[Resize] NVENC failed, trying CPU fallback. Error: {stderr[-500:]}")
+        report_progress(0.2, "NVENC failed, trying CPU encoding...")
+        cmd = build_ffmpeg_cmd(use_nvenc=False)
+        success, stderr = run_ffmpeg_with_progress(cmd, "CPU")
+
+    if not success:
+        raise RuntimeError(f"FFmpeg failed with all encoders: {stderr[-1000:]}")
 
     report_progress(1.0, "Complete")
 

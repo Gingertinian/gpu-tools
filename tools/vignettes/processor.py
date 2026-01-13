@@ -117,57 +117,109 @@ def process_vignettes(
 
         report_progress(0.4, "Encoding with NVENC...")
 
-        # Build FFmpeg command
-        cmd = ['ffmpeg', '-y', '-hwaccel', 'cuda', '-i', input_path]
+        # Build FFmpeg command - try NVENC first, then CPU fallback
+        def build_ffmpeg_cmd(use_nvenc: bool = True) -> list:
+            cmd = ['ffmpeg', '-y']
+            if use_nvenc:
+                cmd.extend(['-hwaccel', 'cuda'])
+            cmd.extend(['-i', input_path])
 
-        if overlay_type != 'blur_edges' and os.path.exists(overlay_path):
-            cmd.extend(['-i', overlay_path])
+            if overlay_type != 'blur_edges' and os.path.exists(overlay_path):
+                cmd.extend(['-i', overlay_path])
 
-        filter_str = ';'.join(filters) if filters else None
-        if filter_str:
-            cmd.extend(['-filter_complex', filter_str])
+            filter_str = ';'.join(filters) if filters else None
+            if filter_str:
+                cmd.extend(['-filter_complex', filter_str])
 
-        # NVENC encoding
-        cmd.extend([
-            '-c:v', 'h264_nvenc',
-            '-preset', 'p4',
-            '-b:v', '5000k',
-            '-maxrate', '7500k',
-            '-bufsize', '10000k',
-            '-profile:v', 'high',
-            '-c:a', 'aac',
-            '-b:a', '128k',
-            output_path
-        ])
+            if use_nvenc:
+                # NVENC encoding
+                cmd.extend([
+                    '-c:v', 'h264_nvenc',
+                    '-preset', 'p4',
+                    '-b:v', '5000k',
+                    '-maxrate', '7500k',
+                    '-bufsize', '10000k',
+                    '-profile:v', 'high',
+                ])
+            else:
+                # CPU fallback with libx264
+                cmd.extend([
+                    '-c:v', 'libx264',
+                    '-preset', 'medium',
+                    '-crf', '23',
+                    '-profile:v', 'high',
+                ])
 
-        # Run FFmpeg
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True
-        )
+            cmd.extend([
+                '-c:a', 'aac',
+                '-b:a', '128k',
+                output_path
+            ])
+            return cmd
 
-        # Monitor progress
-        while True:
-            line = process.stderr.readline()
-            if not line and process.poll() is not None:
-                break
+        def run_ffmpeg_with_progress(cmd: list, mode_name: str) -> tuple:
+            """Run FFmpeg and capture stderr properly. Returns (success, stderr_output)."""
+            stderr_lines = []
 
-            if 'time=' in line:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+
+            # Read stderr line by line for progress
+            try:
+                while True:
+                    line = process.stderr.readline()
+                    if not line:
+                        if process.poll() is not None:
+                            break
+                        continue
+
+                    stderr_lines.append(line)
+                    # Keep last 50 lines to avoid memory issues
+                    if len(stderr_lines) > 50:
+                        stderr_lines.pop(0)
+
+                    if 'time=' in line:
+                        try:
+                            time_str = line.split('time=')[1].split()[0]
+                            h, m, s = time_str.split(':')
+                            current_time = int(h) * 3600 + int(m) * 60 + float(s)
+                            if duration > 0:
+                                progress = min(0.4 + (current_time / duration) * 0.55, 0.95)
+                                report_progress(progress, f"Encoding ({mode_name})... {int(current_time)}s / {int(duration)}s")
+                        except:
+                            pass
+
+                # Wait for process to complete with timeout
                 try:
-                    time_str = line.split('time=')[1].split()[0]
-                    h, m, s = time_str.split(':')
-                    current_time = int(h) * 3600 + int(m) * 60 + float(s)
-                    if duration > 0:
-                        progress = min(0.4 + (current_time / duration) * 0.55, 0.95)
-                        report_progress(progress, f"Encoding... {int(current_time)}s / {int(duration)}s")
-                except:
-                    pass
+                    process.wait(timeout=600)  # 10 minute timeout
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    return False, "FFmpeg process timed out after 600 seconds"
 
-        if process.returncode != 0:
-            stderr = process.stderr.read()
-            raise RuntimeError(f"FFmpeg failed: {stderr}")
+            except Exception as e:
+                process.kill()
+                return False, f"Error during encoding: {str(e)}"
+
+            stderr_output = ''.join(stderr_lines)
+            return process.returncode == 0, stderr_output
+
+        # Try NVENC first
+        cmd = build_ffmpeg_cmd(use_nvenc=True)
+        success, stderr = run_ffmpeg_with_progress(cmd, "NVENC")
+
+        # If NVENC failed, try CPU fallback
+        if not success:
+            print(f"[Vignettes] NVENC failed, trying CPU fallback. Error: {stderr[-500:]}")
+            report_progress(0.4, "NVENC failed, trying CPU encoding...")
+            cmd = build_ffmpeg_cmd(use_nvenc=False)
+            success, stderr = run_ffmpeg_with_progress(cmd, "CPU")
+
+        if not success:
+            raise RuntimeError(f"FFmpeg failed with all encoders: {stderr[-1000:]}")
 
         report_progress(1.0, "Complete")
 

@@ -109,6 +109,7 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
     """
     Worker function for parallel video processing.
     Designed to be called from ProcessPoolExecutor.
+    Includes CPU fallback if NVENC fails.
 
     Args tuple: (input_path, output_path, config, video_index)
     Returns: dict with status, output_path, and any errors
@@ -121,14 +122,17 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
         import math
         import subprocess
         import json
+        import os
 
-        py_rng = random.Random(int(time.time() * 1000) + video_index)
+        # Use nanosecond timestamp + pid + index for unique seed (prevents collisions)
+        seed = int(time.time_ns()) ^ (os.getpid() << 16) ^ (video_index * 997)
+        py_rng = random.Random(seed)
 
         # Get video info
         try:
             probe_cmd = ['ffprobe', '-v', 'quiet', '-print_format', 'json',
                         '-show_streams', '-show_format', input_path]
-            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
             video_info = json.loads(probe_result.stdout)
             video_stream = next((s for s in video_info.get('streams', [])
                                if s.get('codec_type') == 'video'), {})
@@ -192,44 +196,60 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
         if video_cfg.get('fpsVar', 0) > 0:
             fps = 30 + py_rng.uniform(-video_cfg['fpsVar'], video_cfg['fpsVar'])
 
-        # Build FFmpeg command
+        # Build filter string
         filter_str = ','.join(filters) if filters else None
-        cmd = ['ffmpeg', '-y', '-i', input_path]
-
-        if filter_str:
-            cmd.extend(['-vf', filter_str])
-
-        # NVENC settings
         bitrate = int(5000 * video_cfg.get('bitrate', 90) / 100)
-        cmd.extend([
-            '-c:v', 'h264_nvenc',
-            '-preset', 'p2',
-            '-rc', 'vbr',
-            '-cq', '23',
-            '-b:v', f'{bitrate}k',
-            '-maxrate', f'{int(bitrate * 1.5)}k',
-            '-bufsize', f'{bitrate * 2}k',
-            '-rc-lookahead', '8',
-        ])
-
-        # Audio
         keep_audio = video_cfg.get('keepAudio', True)
-        if keep_audio:
-            cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
-        else:
-            cmd.append('-an')
 
-        cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
+        def build_ffmpeg_cmd(use_nvenc: bool = True) -> list:
+            """Build FFmpeg command with NVENC or CPU encoding."""
+            cmd = ['ffmpeg', '-y', '-i', input_path]
+            if filter_str:
+                cmd.extend(['-vf', filter_str])
 
-        # Run FFmpeg
-        process = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            if use_nvenc:
+                cmd.extend([
+                    '-c:v', 'h264_nvenc',
+                    '-preset', 'p2',
+                    '-rc', 'vbr',
+                    '-cq', '23',
+                    '-b:v', f'{bitrate}k',
+                    '-maxrate', f'{int(bitrate * 1.5)}k',
+                    '-bufsize', f'{bitrate * 2}k',
+                    '-rc-lookahead', '8',
+                ])
+            else:
+                # CPU fallback with libx264
+                cmd.extend([
+                    '-c:v', 'libx264',
+                    '-preset', 'fast',
+                    '-crf', '23',
+                ])
+
+            if keep_audio:
+                cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
+            else:
+                cmd.append('-an')
+
+            cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
+            return cmd
+
+        # Try NVENC first, then CPU fallback
+        nvenc_cmd = build_ffmpeg_cmd(use_nvenc=True)
+        process = subprocess.run(nvenc_cmd, capture_output=True, text=True, timeout=900)
 
         if process.returncode != 0:
-            return {
-                'status': 'failed',
-                'index': video_index,
-                'error': process.stderr[-500:] if process.stderr else 'Unknown error'
-            }
+            # NVENC failed, try CPU fallback
+            print(f"[Spoofer Worker {video_index}] NVENC failed, trying CPU fallback")
+            cpu_cmd = build_ffmpeg_cmd(use_nvenc=False)
+            process = subprocess.run(cpu_cmd, capture_output=True, text=True, timeout=1800)
+
+            if process.returncode != 0:
+                return {
+                    'status': 'failed',
+                    'index': video_index,
+                    'error': f"Both NVENC and CPU failed: {process.stderr[-500:] if process.stderr else 'Unknown error'}"
+                }
 
         return {
             'status': 'completed',
@@ -238,6 +258,12 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
             'duration': duration
         }
 
+    except subprocess.TimeoutExpired:
+        return {
+            'status': 'failed',
+            'index': video_index,
+            'error': 'FFmpeg process timed out'
+        }
     except Exception as e:
         return {
             'status': 'failed',

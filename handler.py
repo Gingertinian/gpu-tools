@@ -23,6 +23,7 @@ import requests
 import tempfile
 import shutil
 import zipfile
+import subprocess
 from pathlib import Path
 
 # ==================== Constants ====================
@@ -143,9 +144,14 @@ def upload_file(path: str, url: str, max_retries: int = 3) -> dict:
         '.jpeg': 'image/jpeg',
         '.png': 'image/png',
         '.webp': 'image/webp',
+        '.gif': 'image/gif',
+        '.bmp': 'image/bmp',
         '.mp4': 'video/mp4',
         '.mov': 'video/quicktime',
         '.webm': 'video/webm',
+        '.mkv': 'video/x-matroska',
+        '.avi': 'video/x-msvideo',
+        '.m4v': 'video/x-m4v',
     }
     content_type = content_types.get(ext, 'application/octet-stream')
 
@@ -380,7 +386,7 @@ def process_batch_mode(job, job_input: dict) -> dict:
 
             # Determine output extension
             if processor in ["spoofer", "captioner", "vignettes", "resize"]:
-                output_ext = ext if ext in ['.mp4', '.mov', '.avi', '.webm', '.mkv'] else '.jpg'
+                output_ext = ext if ext in ['.mp4', '.mov', '.avi', '.webm', '.mkv', '.m4v'] else '.jpg'
             else:
                 output_ext = ext
             output_paths.append(os.path.join(temp_dir, f"output_{i}{output_ext}"))

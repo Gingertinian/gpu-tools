@@ -5,7 +5,17 @@ on:
     branches:
       - main
       - master
+      - development
   workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: false
+        default: 'production'
+        type: choice
+        options:
+          - production
+          - development
 
 env:
   REGISTRY: ghcr.io
@@ -49,7 +59,8 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/development' }}
             type=sha,prefix=
 
       - name: Build and push Docker image

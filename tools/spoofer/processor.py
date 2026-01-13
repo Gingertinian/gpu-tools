@@ -1596,8 +1596,14 @@ def process_video(
         cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
         return cmd
 
-    # NVENC encoder options
+    # Get GPU ID from config (for multi-GPU batch processing)
+    gpu_id = config.get('_gpu_id', 0)
+    if gpu_id > 0:
+        print(f"[Video Processing] Using GPU {gpu_id} for NVENC encoding")
+
+    # NVENC encoder options with multi-GPU support
     nvenc_opts = [
+        '-gpu', str(gpu_id),  # Multi-GPU: select specific GPU
         '-preset', 'p2',
         '-rc', 'vbr',
         '-cq', '23',

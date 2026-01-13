@@ -227,23 +227,36 @@ def is_video(ext: str) -> bool:
 # ==================== Batch Mode Processor ====================
 
 def get_gpu_info() -> dict:
-    """Detect GPU type and determine NVENC session limit."""
+    """Detect GPU type, count GPUs, and determine NVENC session limit."""
     try:
         result = subprocess.run(
             ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'],
             capture_output=True, text=True, timeout=10
         )
         if result.returncode == 0:
-            gpu_name = result.stdout.strip().split('\n')[0]
+            gpu_lines = [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
+            gpu_count = len(gpu_lines)
+            gpu_name = gpu_lines[0] if gpu_lines else 'Unknown'
+
             datacenter_keywords = ['A100', 'A6000', 'A5000', 'A4000', 'A4500', 'A40', 'A30', 'A10',
-                                   'V100', 'T4', 'Quadro', 'Tesla', 'H100', 'L40']
+                                   'V100', 'T4', 'Quadro', 'Tesla', 'H100', 'L40', 'L4', 'RTX 6000', 'RTX 4090']
             is_datacenter = any(kw in gpu_name for kw in datacenter_keywords)
             gpu_type = 'datacenter' if is_datacenter else 'consumer'
-            nvenc_sessions = 10 if is_datacenter else 3
-            return {'gpu_name': gpu_name, 'gpu_type': gpu_type, 'nvenc_sessions': nvenc_sessions}
+            base_sessions = 12 if is_datacenter else 3
+            nvenc_sessions = base_sessions * gpu_count
+
+            print(f"[GPU Detection] Found {gpu_count} GPU(s): {gpu_name}")
+            print(f"[GPU Detection] Type: {gpu_type}, Sessions/GPU: {base_sessions}, Total: {nvenc_sessions}")
+
+            return {
+                'gpu_name': gpu_name,
+                'gpu_type': gpu_type,
+                'gpu_count': gpu_count,
+                'nvenc_sessions': nvenc_sessions
+            }
     except Exception as e:
         print(f"[GPU Detection] Error: {e}")
-    return {'gpu_name': 'Unknown', 'gpu_type': 'default', 'nvenc_sessions': 2}
+    return {'gpu_name': 'Unknown', 'gpu_type': 'default', 'gpu_count': 1, 'nvenc_sessions': 2}
 
 
 def download_files_parallel(urls: list, paths: list, max_workers: int = 10) -> list:
@@ -272,8 +285,14 @@ def process_single_file_for_batch(args: tuple) -> dict:
     """
     Worker function for batch processing.
     Processes a single file with the specified tool.
+    Supports multi-GPU via gpu_id parameter.
     """
-    input_path, output_path, tool, config, file_index = args
+    # Support both old (5-tuple) and new (6-tuple) format with gpu_id
+    if len(args) == 6:
+        input_path, output_path, tool, config, file_index, gpu_id = args
+    else:
+        input_path, output_path, tool, config, file_index = args
+        gpu_id = 0
 
     try:
         input_ext = os.path.splitext(input_path)[1].lower()
@@ -281,7 +300,10 @@ def process_single_file_for_batch(args: tuple) -> dict:
         # Process based on tool type
         if tool == "spoofer":
             if process_spoofer is not None:
-                result = process_spoofer(input_path, output_path, config)
+                # Pass gpu_id in config for multi-GPU support
+                spoofer_config = {**config, "_gpu_id": gpu_id}
+                print(f"[Batch Worker {file_index}] Processing on GPU {gpu_id}")
+                result = process_spoofer(input_path, output_path, spoofer_config)
             else:
                 return {"index": file_index, "status": "failed", "error": "Spoofer not available"}
 
@@ -361,8 +383,9 @@ def process_batch_mode(job, job_input: dict) -> dict:
 
     # Detect GPU capabilities
     gpu_info = get_gpu_info()
+    gpu_count = gpu_info.get('gpu_count', 1)
     max_parallel = gpu_info['nvenc_sessions']
-    print(f"[Batch Mode] GPU: {gpu_info['gpu_name']}, Type: {gpu_info['gpu_type']}, Max parallel: {max_parallel}")
+    print(f"[Batch Mode] GPU: {gpu_info['gpu_name']}, Type: {gpu_info['gpu_type']}, GPUs: {gpu_count}, Max parallel: {max_parallel}")
 
     runpod.serverless.progress_update(job, {
         "progress": 5,
@@ -399,14 +422,15 @@ def process_batch_mode(job, job_input: dict) -> dict:
         # 2. Process all files in parallel
         runpod.serverless.progress_update(job, {
             "progress": 30,
-            "status": f"Processing {total_files} files with {max_parallel} parallel sessions..."
+            "status": f"Processing {total_files} files with {max_parallel} sessions across {gpu_count} GPU(s)..."
         })
 
-        # Prepare work items
+        # Prepare work items with GPU assignment (round-robin across GPUs)
         work_items = []
         for i in range(total_files):
             if download_results[i].get("success"):
-                work_items.append((input_paths[i], output_paths[i], processor, config, i))
+                gpu_id = i % gpu_count  # Distribute across GPUs
+                work_items.append((input_paths[i], output_paths[i], processor, config, i, gpu_id))
 
         completed = 0
         failed = 0

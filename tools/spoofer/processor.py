@@ -303,11 +303,9 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
         # Try NVENC first (with GPU selection via -gpu X flag), then CPU fallback
         print(f"[Spoofer Worker {video_index}] Using GPU {gpu_id} for NVENC encoding")
 
-        # Set up environment with CUDA_VISIBLE_DEVICES for process affinity
-        env = os.environ.copy()
-        env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-
-        process = subprocess.run(nvenc_cmd, capture_output=True, text=True, timeout=900, env=env)
+        # NOTE: Do NOT set CUDA_VISIBLE_DEVICES - it remaps GPU indices and breaks -gpu X flag
+        # The -gpu X flag in h264_nvenc is sufficient to select the specific GPU
+        process = subprocess.run(nvenc_cmd, capture_output=True, text=True, timeout=900)
 
         if process.returncode != 0:
             # NVENC failed, try CPU fallback

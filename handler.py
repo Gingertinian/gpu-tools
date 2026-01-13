@@ -486,9 +486,10 @@ def process_single_file_for_batch(args: tuple, gpu_tracker: GPULoadTracker = Non
         input_path, output_path, tool, config, file_index = args
         gpu_id = 0
 
-    # Set CUDA_VISIBLE_DEVICES for GPU affinity (important for multi-GPU)
-    # This ensures the subprocess (FFmpeg, PyTorch, etc.) uses the correct GPU
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    # NOTE: Do NOT set os.environ['CUDA_VISIBLE_DEVICES'] here!
+    # In ThreadPoolExecutor, all threads share the same environment, so setting this
+    # would affect all threads (race condition). Instead, each processor should use
+    # GPU-specific flags like FFmpeg's -gpu X. For PyTorch, pass gpu_id in config.
 
     # Start timing for performance tracking
     start_time = time.time()
@@ -1385,8 +1386,7 @@ def process_single_pipeline_for_batch(args: tuple) -> dict:
 
     input_path, output_dir, pipeline, config, file_index, gpu_id = args
 
-    # Set CUDA_VISIBLE_DEVICES for GPU affinity
-    os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+    # NOTE: Do NOT set os.environ['CUDA_VISIBLE_DEVICES'] - see comment in process_single_file_for_batch
 
     try:
         print(f"[Pipeline Worker {file_index}] Processing on GPU {gpu_id}: {os.path.basename(input_path)}")

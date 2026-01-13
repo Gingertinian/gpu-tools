@@ -43,20 +43,21 @@ TARGET_RESOLUTIONS = {
 # Video extensions
 VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.webm', '.mkv', '.m4v'}
 
-# NVENC session limits by GPU type
+# NVENC session limits by GPU type (per GPU)
 # Consumer GPUs (GeForce): Limited to 3-5 sessions
 # Datacenter GPUs (A-series, Quadro): Unlimited sessions
 NVENC_SESSION_LIMITS = {
     'consumer': 3,      # RTX 3090, 4090, 4080, etc.
-    'datacenter': 10,   # A5000, A6000, A100, etc. (conservative limit)
+    'datacenter': 12,   # A5000, A6000, A100, etc. (increased for parallel video)
     'default': 2,       # Fallback
 }
 
 
 def get_gpu_info() -> Dict[str, Any]:
     """
-    Detect GPU type and determine NVENC session limit.
-    Returns dict with gpu_name, gpu_type ('consumer' or 'datacenter'), and nvenc_sessions.
+    Detect GPU type, count GPUs, and determine NVENC session limit.
+    For multi-GPU workers, scales sessions by number of GPUs.
+    Returns dict with gpu_name, gpu_type, gpu_count, and nvenc_sessions.
     """
     try:
         result = subprocess.run(
@@ -64,19 +65,29 @@ def get_gpu_info() -> Dict[str, Any]:
             capture_output=True, text=True, timeout=10
         )
         if result.returncode == 0:
-            gpu_name = result.stdout.strip().split('\n')[0]
+            gpu_lines = [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
+            gpu_count = len(gpu_lines)
+            gpu_name = gpu_lines[0] if gpu_lines else 'Unknown'
 
             # Determine GPU type
             datacenter_keywords = ['A100', 'A6000', 'A5000', 'A4000', 'A4500', 'A40', 'A30', 'A10',
-                                   'V100', 'T4', 'Quadro', 'Tesla', 'H100', 'L40']
+                                   'V100', 'T4', 'Quadro', 'Tesla', 'H100', 'L40', 'RTX 4090', 'RTX 6000']
             is_datacenter = any(kw in gpu_name for kw in datacenter_keywords)
 
             gpu_type = 'datacenter' if is_datacenter else 'consumer'
-            nvenc_sessions = NVENC_SESSION_LIMITS[gpu_type]
+            base_sessions = NVENC_SESSION_LIMITS[gpu_type]
+
+            # Scale sessions by number of GPUs (multi-GPU workers)
+            # Each GPU can handle its own NVENC sessions independently
+            nvenc_sessions = base_sessions * gpu_count
+
+            print(f"[GPU Detection] Found {gpu_count} GPU(s): {gpu_name}")
+            print(f"[GPU Detection] Type: {gpu_type}, Sessions per GPU: {base_sessions}, Total: {nvenc_sessions}")
 
             return {
                 'gpu_name': gpu_name,
                 'gpu_type': gpu_type,
+                'gpu_count': gpu_count,
                 'nvenc_sessions': nvenc_sessions
             }
     except Exception as e:
@@ -85,6 +96,7 @@ def get_gpu_info() -> Dict[str, Any]:
     return {
         'gpu_name': 'Unknown',
         'gpu_type': 'default',
+        'gpu_count': 1,
         'nvenc_sessions': NVENC_SESSION_LIMITS['default']
     }
 
@@ -110,11 +122,17 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
     Worker function for parallel video processing.
     Designed to be called from ProcessPoolExecutor.
     Includes CPU fallback if NVENC fails.
+    Supports multi-GPU workers via gpu_id parameter.
 
-    Args tuple: (input_path, output_path, config, video_index)
+    Args tuple: (input_path, output_path, config, video_index, gpu_id)
     Returns: dict with status, output_path, and any errors
     """
-    input_path, output_path, config, video_index = args
+    # Support both old (4-tuple) and new (5-tuple) format
+    if len(args) == 5:
+        input_path, output_path, config, video_index, gpu_id = args
+    else:
+        input_path, output_path, config, video_index = args
+        gpu_id = 0  # Default to first GPU
 
     try:
         # Import here to avoid pickling issues
@@ -201,8 +219,8 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
         bitrate = int(5000 * video_cfg.get('bitrate', 90) / 100)
         keep_audio = video_cfg.get('keepAudio', True)
 
-        def build_ffmpeg_cmd(use_nvenc: bool = True) -> list:
-            """Build FFmpeg command with NVENC or CPU encoding."""
+        def build_ffmpeg_cmd(use_nvenc: bool = True, target_gpu: int = 0) -> list:
+            """Build FFmpeg command with NVENC (multi-GPU support) or CPU encoding."""
             cmd = ['ffmpeg', '-y', '-i', input_path]
             if filter_str:
                 cmd.extend(['-vf', filter_str])
@@ -210,6 +228,7 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
             if use_nvenc:
                 cmd.extend([
                     '-c:v', 'h264_nvenc',
+                    '-gpu', str(target_gpu),  # Multi-GPU: select specific GPU
                     '-preset', 'p2',
                     '-rc', 'vbr',
                     '-cq', '23',
@@ -234,14 +253,15 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
             cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
             return cmd
 
-        # Try NVENC first, then CPU fallback
-        nvenc_cmd = build_ffmpeg_cmd(use_nvenc=True)
+        # Try NVENC first (with GPU selection), then CPU fallback
+        print(f"[Spoofer Worker {video_index}] Using GPU {gpu_id} for NVENC encoding")
+        nvenc_cmd = build_ffmpeg_cmd(use_nvenc=True, target_gpu=gpu_id)
         process = subprocess.run(nvenc_cmd, capture_output=True, text=True, timeout=900)
 
         if process.returncode != 0:
             # NVENC failed, try CPU fallback
-            print(f"[Spoofer Worker {video_index}] NVENC failed, trying CPU fallback")
-            cpu_cmd = build_ffmpeg_cmd(use_nvenc=False)
+            print(f"[Spoofer Worker {video_index}] NVENC on GPU {gpu_id} failed, trying CPU fallback")
+            cpu_cmd = build_ffmpeg_cmd(use_nvenc=False, target_gpu=0)
             process = subprocess.run(cpu_cmd, capture_output=True, text=True, timeout=1800)
 
             if process.returncode != 0:
@@ -296,19 +316,23 @@ def process_videos_parallel(
         return {'error': 'No videos to process'}
 
     # Auto-detect parallel limit based on GPU
-    if max_parallel is None:
-        gpu_info = get_gpu_info()
-        max_parallel = gpu_info['nvenc_sessions']
-        print(f"[Parallel Video] GPU: {gpu_info['gpu_name']}, Type: {gpu_info['gpu_type']}, "
-              f"Max parallel: {max_parallel}")
+    gpu_info = get_gpu_info()
+    gpu_count = gpu_info['gpu_count']
 
-    # Prepare work items
+    if max_parallel is None:
+        max_parallel = gpu_info['nvenc_sessions']
+
+    print(f"[Parallel Video] GPU: {gpu_info['gpu_name']}, Type: {gpu_info['gpu_type']}, "
+          f"GPUs: {gpu_count}, Max parallel: {max_parallel}")
+
+    # Prepare work items with GPU assignment (round-robin across GPUs)
     work_items = []
     for i, video_path in enumerate(video_paths):
         basename = os.path.basename(video_path)
         name, ext = os.path.splitext(basename)
         output_path = os.path.join(output_dir, f"{name}_spoofed{ext}")
-        work_items.append((video_path, output_path, config, i))
+        gpu_id = i % gpu_count  # Distribute across GPUs
+        work_items.append((video_path, output_path, config, i, gpu_id))
 
     total = len(work_items)
     completed = 0
@@ -320,7 +344,7 @@ def process_videos_parallel(
             progress = completed / total
             progress_callback(progress, msg)
 
-    report_progress(f"Processing {total} videos with {max_parallel} parallel sessions...")
+    report_progress(f"Processing {total} videos with {max_parallel} parallel sessions across {gpu_count} GPU(s)...")
 
     # Process in parallel using ProcessPoolExecutor
     # Use 'spawn' context to avoid CUDA issues with fork
@@ -347,7 +371,9 @@ def process_videos_parallel(
         'completed': completed,
         'failed': failed,
         'results': results,
-        'parallel_sessions': max_parallel
+        'parallel_sessions': max_parallel,
+        'gpu_count': gpu_count,
+        'gpu_type': gpu_info['gpu_type']
     }
 
 # Photo defaults (from original)

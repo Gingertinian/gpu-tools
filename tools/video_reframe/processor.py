@@ -278,9 +278,16 @@ def _calculate_layout(orig_w: int, orig_h: int, final_w: int, final_h: int) -> d
     """
     Calculate how to fit original video into final dimensions.
     Returns scaling factor and blur zone heights.
+
+    For 9:16 vertical outputs, we ALWAYS create blur zones by cropping/zooming
+    the content, even if the input is already 9:16. This ensures variety and
+    blur effects on every vertical video.
     """
     orig_ratio = orig_w / orig_h
     final_ratio = final_w / final_h
+
+    # Check if output is 9:16 vertical format
+    is_vertical_output = final_w == 1080 and final_h == 1920
 
     if orig_ratio > final_ratio:
         # Original is wider - fit to width, add blur top/bottom
@@ -293,15 +300,46 @@ def _calculate_layout(orig_w: int, orig_h: int, final_w: int, final_h: int) -> d
         blur_bottom = blur_space - blur_top
         content_y = blur_top
     else:
-        # Original is taller or same - fit to height, add blur left/right (or exact fit)
-        scale = final_h / orig_h
-        scaled_w = int(orig_w * scale)
-        scaled_h = final_h
+        # Original is taller or same aspect ratio
 
-        # For vertical content, we still center it
-        blur_top = 0
-        blur_bottom = 0
-        content_y = 0
+        # For 9:16 outputs, FORCE blur zones by zooming/cropping the content
+        # This ensures every vertical video gets blur treatment with random transforms
+        if is_vertical_output:
+            # Zoom factor: crop content to ~85% height, creating 15% blur space
+            zoom_crop_factor = 0.85
+
+            # Calculate scaled dimensions with forced crop
+            # Content will only take up 85% of the vertical space
+            available_height = int(final_h * zoom_crop_factor)
+
+            scale = available_height / orig_h
+            scaled_w = int(orig_w * scale)
+            scaled_h = available_height
+
+            # If scaled width exceeds final width, constrain to width instead
+            if scaled_w > final_w:
+                scale = final_w / orig_w
+                scaled_w = final_w
+                scaled_h = int(orig_h * scale)
+
+            # Calculate blur zones (content centered vertically)
+            blur_space = final_h - scaled_h
+            blur_top = blur_space // 2
+            blur_bottom = blur_space - blur_top
+            content_y = blur_top
+
+            print(f"[VideoReframe] Forcing blur zones for 9:16: content={scaled_w}x{scaled_h}, "
+                  f"blur_top={blur_top}, blur_bottom={blur_bottom}")
+        else:
+            # Non-vertical output: fit to height, no forced blur
+            scale = final_h / orig_h
+            scaled_w = int(orig_w * scale)
+            scaled_h = final_h
+
+            # For non-vertical content, center it
+            blur_top = 0
+            blur_bottom = 0
+            content_y = 0
 
     # Ensure even dimensions
     scaled_w = scaled_w - (scaled_w % 2)

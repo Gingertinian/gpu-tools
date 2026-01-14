@@ -181,8 +181,34 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
             filters.append(f"crop={crop_w}:{crop_h}")
 
         if spatial.get('rotation', 0) > 0:
-            angle = py_rng.uniform(-spatial['rotation'], spatial['rotation']) * math.pi / 180
-            filters.append(f"rotate={angle}:fillcolor=black")
+            angle_deg = py_rng.uniform(-spatial['rotation'], spatial['rotation'])
+            angle_rad = angle_deg * math.pi / 180
+
+            # Calculate zoom factor to compensate for black borders after rotation
+            # Formula: zoom = 1 / cos(|angle|) ensures no black borders appear
+            abs_angle = abs(angle_rad)
+            cos_angle = math.cos(abs_angle)
+
+            if cos_angle > 0.001:
+                # Zoom to eliminate black borders
+                zoom_factor = 1.0 / cos_angle
+                # Clamp zoom to reasonable range (1.0 to 1.5)
+                zoom_factor = max(1.0, min(zoom_factor, 1.5))
+
+                # Rotate with enlarged output dimensions, then scale back to original
+                # This crops out the black borders while maintaining original resolution
+                new_w = int(original_width * zoom_factor)
+                new_h = int(original_height * zoom_factor)
+                # Ensure even dimensions for video encoding
+                new_w = new_w + (new_w % 2)
+                new_h = new_h + (new_h % 2)
+
+                # Apply rotation with zoom, then scale back to original dimensions
+                filters.append(f"rotate={angle_rad}:ow={new_w}:oh={new_h}:fillcolor=black")
+                filters.append(f"scale={original_width}:{original_height}:flags=lanczos")
+            else:
+                # Fallback for very small angles (shouldn't happen with typical rotation values)
+                filters.append(f"rotate={angle_rad}:fillcolor=black")
 
         # Tonal filters
         eq_params = []

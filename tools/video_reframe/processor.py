@@ -15,6 +15,8 @@ import os
 import subprocess
 import tempfile
 import json
+import random
+import math
 from pathlib import Path
 from typing import Optional, Callable, Dict, Any
 
@@ -47,7 +49,8 @@ def process_video_reframe(
     output_path: str,
     config: dict,
     progress_callback: Optional[Callable[[float, str], None]] = None,
-    gpu_id: int = 0
+    gpu_id: int = 0,
+    video_index: int = 0
 ) -> dict:
     """
     Convert any video to vertical format using 100% FFmpeg GPU pipeline.
@@ -65,6 +68,7 @@ def process_video_reframe(
             - contrast: Contrast adjustment -50 to 50 (default: 0)
         progress_callback: Optional callback(progress: float, message: str)
         gpu_id: GPU device ID to use
+        video_index: Index of the video in batch processing (used as seed for random blur transformations)
 
     Returns:
         dict with status, outputPath, dimensions, etc.
@@ -121,7 +125,8 @@ def process_video_reframe(
         orig_w, orig_h, final_w, final_h,
         layout, blur_intensity,
         brightness, saturation, contrast,
-        logo_path, logo_size
+        logo_path, logo_size,
+        video_index
     )
 
     print(f"[VideoReframe] Filter: {filter_complex[:200]}...")
@@ -411,17 +416,22 @@ def _build_filter_complex(
     blur_intensity: int,
     brightness: int, saturation: int, contrast: int,
     logo_path: Optional[str],
-    logo_size: float
+    logo_size: float,
+    video_index: int = 0
 ) -> str:
     """
     Build FFmpeg filter_complex string for the entire reframe pipeline.
 
     Strategy:
     1. Create blurred background from input (scaled up, blurred)
+       - For 9:16 outputs: apply random transformations to blur background
     2. Scale content to fit
     3. Overlay content on blurred background
     4. Optionally overlay logo
     5. Apply color adjustments
+
+    Args:
+        video_index: Used as random seed for deterministic randomization per video
     """
     filters = []
 
@@ -434,9 +444,39 @@ def _build_filter_complex(
     content_y = layout['content_y']
 
     # ==========================================================================
+    # DETECT IF OUTPUT IS 9:16 (VERTICAL) FOR RANDOM BLUR TRANSFORMATIONS
+    # ==========================================================================
+    is_vertical_output = final_w == 1080 and final_h == 1920  # 9:16 format
+
+    # Generate random transformation parameters for 9:16 videos
+    # Use video_index as seed for deterministic but varied results
+    if is_vertical_output:
+        rng = random.Random(video_index + 42)  # Seeded random for reproducibility
+
+        # Random rotation angle: -5 to +5 degrees
+        rand_angle = rng.uniform(-5, 5)
+        rand_angle_rad = rand_angle * math.pi / 180  # Convert to radians for FFmpeg
+
+        # Random zoom: 1.0 to 1.15 (slight zoom)
+        rand_zoom = rng.uniform(1.0, 1.15)
+
+        # Random brightness adjustment: -0.05 to +0.05
+        rand_brightness = rng.uniform(-0.05, 0.05)
+
+        # Random contrast adjustment: 0.95 to 1.05
+        rand_contrast = rng.uniform(0.95, 1.05)
+
+        # Random horizontal flip: 50% chance
+        apply_hflip = rng.random() < 0.5
+
+        print(f"[VideoReframe] 9:16 blur transformations: angle={rand_angle:.2f}deg, "
+              f"zoom={rand_zoom:.2f}, brightness={rand_brightness:.3f}, "
+              f"contrast={rand_contrast:.3f}, hflip={apply_hflip}")
+
+    # ==========================================================================
     # FILTER CHAIN:
     # [0:v] -> split into background and foreground
-    # background: scale to fill + blur
+    # background: scale to fill + (random transforms for 9:16) + blur
     # foreground: scale to fit
     # overlay foreground on background
     # optional: overlay logo
@@ -447,19 +487,57 @@ def _build_filter_complex(
 
     # Background: scale to fill entire frame (crop center), then blur
     # Calculate scale to fill (cover) the output dimensions
-    scale_fill = max(final_w / orig_w, final_h / orig_h) * 1.1  # 10% extra for crop margin
+    base_scale = max(final_w / orig_w, final_h / orig_h) * 1.1  # 10% extra for crop margin
+
+    # For 9:16, apply additional zoom factor and account for rotation padding
+    if is_vertical_output:
+        # Extra scaling to account for rotation (corners need margin)
+        rotation_margin = 1.0 + abs(math.sin(rand_angle_rad)) * 0.15
+        scale_fill = base_scale * rand_zoom * rotation_margin
+    else:
+        scale_fill = base_scale
+
     bg_scaled_w = int(orig_w * scale_fill)
     bg_scaled_h = int(orig_h * scale_fill)
     # Ensure even
     bg_scaled_w = bg_scaled_w + (bg_scaled_w % 2)
     bg_scaled_h = bg_scaled_h + (bg_scaled_h % 2)
 
-    # Background filter chain: scale -> crop center -> blur
-    bg_filter = (
-        f"[bg_in]scale={bg_scaled_w}:{bg_scaled_h}:flags=fast_bilinear,"
-        f"crop={final_w}:{final_h}:(iw-{final_w})/2:(ih-{final_h})/2,"
-        f"gblur=sigma={blur_sigma}[bg]"
-    )
+    # Background filter chain
+    if is_vertical_output:
+        # Build filter chain with random transformations for 9:16
+        bg_filter_parts = [f"[bg_in]scale={bg_scaled_w}:{bg_scaled_h}:flags=fast_bilinear"]
+
+        # Apply horizontal flip (before rotation for more variety)
+        if apply_hflip:
+            bg_filter_parts.append("hflip")
+
+        # Apply rotation (angle in radians, fillcolor for edges)
+        # Use larger output size to capture rotated content
+        rot_out_w = int(bg_scaled_w * 1.2)
+        rot_out_h = int(bg_scaled_h * 1.2)
+        # Ensure even dimensions
+        rot_out_w = rot_out_w + (rot_out_w % 2)
+        rot_out_h = rot_out_h + (rot_out_h % 2)
+        bg_filter_parts.append(f"rotate={rand_angle_rad:.6f}:ow={rot_out_w}:oh={rot_out_h}:fillcolor=black")
+
+        # Apply brightness/contrast adjustments
+        bg_filter_parts.append(f"eq=brightness={rand_brightness:.4f}:contrast={rand_contrast:.4f}")
+
+        # Crop to final dimensions (center crop)
+        bg_filter_parts.append(f"crop={final_w}:{final_h}:(iw-{final_w})/2:(ih-{final_h})/2")
+
+        # Apply blur
+        bg_filter_parts.append(f"gblur=sigma={blur_sigma}[bg]")
+
+        bg_filter = ",".join(bg_filter_parts)
+    else:
+        # Original behavior for non-9:16 outputs
+        bg_filter = (
+            f"[bg_in]scale={bg_scaled_w}:{bg_scaled_h}:flags=fast_bilinear,"
+            f"crop={final_w}:{final_h}:(iw-{final_w})/2:(ih-{final_h})/2,"
+            f"gblur=sigma={blur_sigma}[bg]"
+        )
     filters.append(bg_filter)
 
     # Foreground: scale to fit within output dimensions
@@ -561,13 +639,15 @@ def _run_ffmpeg_reframe(
             cmd.extend([
                 '-c:v', 'h264_nvenc',
                 '-gpu', str(gpu_id),
-                '-preset', 'p4',  # Good balance of speed/quality
-                '-tune', 'hq',
+                '-preset', 'p1',  # Fastest preset for maximum speed
+                '-tune', 'll',   # Low latency tuning for faster encoding
                 '-rc', 'vbr',
                 '-cq', '23',
                 '-b:v', '8000k',
                 '-maxrate', '12000k',
                 '-bufsize', '16000k',
+                '-rc-lookahead', '0',  # Disable lookahead for faster encoding
+                '-bf', '0',  # Disable B-frames for speed
             ])
         else:
             cmd.extend([
@@ -717,7 +797,8 @@ def process_video_reframe_batch(
                 str(output_path),
                 config,
                 sub_progress,
-                gpu_id
+                gpu_id,
+                video_index=i  # Pass index for deterministic random transformations
             )
             results.append(result)
 

@@ -150,6 +150,12 @@ try:
 except ImportError:
     process_video_gen = None
 
+# Video Reframe
+try:
+    from video_reframe.processor import process_video_reframe
+except ImportError:
+    process_video_reframe = None
+
 
 # ==================== Helper Functions ====================
 
@@ -1975,6 +1981,8 @@ def process_single_pipeline_for_batch(args: tuple) -> dict:
                     process_pic_to_video(current_file, output_path, step_config)
                 elif tool == "video_gen" and process_video_gen is not None:
                     process_video_gen(current_file, output_path, step_config)
+                elif tool == "video_reframe" and process_video_reframe is not None:
+                    process_video_reframe(current_file, output_path, step_config)
 
                 if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                     next_files.append(output_path)
@@ -2497,6 +2505,16 @@ def handler(job):
                 return {"error": "Video Gen processor not available. Install: pip install replicate diffusers"}
             output_path = os.path.join(temp_dir, "output.mp4")
             result = process_video_gen(
+                input_path, output_path, config,
+                progress_callback=progress_callback
+            )
+
+        # ==================== VIDEO REFRAME ====================
+        elif tool == "video_reframe":
+            if process_video_reframe is None:
+                return {"error": "Video Reframe processor not available"}
+            output_path = os.path.join(temp_dir, "output.mp4")
+            result = process_video_reframe(
                 input_path, output_path, config,
                 progress_callback=progress_callback
             )

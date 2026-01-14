@@ -46,10 +46,42 @@ COMPRESSED_EXTENSIONS = {
 # Larger chunk size for faster downloads (1MB instead of 8KB)
 DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
 
-# Pipeline configuration
-DOWNLOAD_WORKERS = 50  # Concurrent download connections
-UPLOAD_WORKERS = 50    # Concurrent upload connections
-PROCESSING_OVERPROVISION = 1.5  # Overprovision factor for processing queue
+# =============================================================================
+# MEGA-GPU I/O CONFIGURATION
+# =============================================================================
+# With 20+ GPUs, the bottleneck shifts from GPU to I/O. We need enough
+# download/upload workers to keep all GPUs saturated.
+#
+# Formula: I/O workers = max(BASE_WORKERS, GPU_COUNT × WORKERS_PER_GPU)
+#
+# Example scaling:
+#   1 GPU:  max(50, 1×10) = 50 workers
+#   4 GPUs: max(50, 4×10) = 50 workers
+#   9 GPUs: max(50, 9×10) = 90 workers
+#   20 GPUs: max(50, 20×10) = 200 workers
+
+BASE_DOWNLOAD_WORKERS = 50    # Minimum download connections
+BASE_UPLOAD_WORKERS = 50      # Minimum upload connections
+IO_WORKERS_PER_GPU = 10       # Additional I/O workers per GPU
+
+# Processing configuration
+PROCESSING_OVERPROVISION = 1.2  # Reduced from 1.5, semaphores handle blocking
+
+
+def get_optimal_io_workers(gpu_count: int) -> tuple:
+    """
+    Calculate optimal download/upload workers based on GPU count.
+    For mega-GPU workers (9-20+ GPUs), we need more I/O parallelism.
+    """
+    download_workers = max(BASE_DOWNLOAD_WORKERS, gpu_count * IO_WORKERS_PER_GPU)
+    upload_workers = max(BASE_UPLOAD_WORKERS, gpu_count * IO_WORKERS_PER_GPU)
+
+    # Cap at reasonable maximum to avoid file descriptor issues
+    MAX_IO_WORKERS = 500
+    download_workers = min(download_workers, MAX_IO_WORKERS)
+    upload_workers = min(upload_workers, MAX_IO_WORKERS)
+
+    return download_workers, upload_workers
 
 # Add tools directory to path
 WORKSPACE = os.environ.get('WORKSPACE', '/workspace')
@@ -366,6 +398,9 @@ class GPULoadTracker:
     """
     Tracks current load (active jobs) per GPU for smart work distribution.
     Thread-safe for concurrent batch processing.
+
+    IMPROVED: Uses semaphores to enforce REAL limits per GPU.
+    Critical for scaling to 9+ GPUs without over-subscription.
     """
     def __init__(self, gpu_count: int, max_sessions_per_gpu: int):
         self.gpu_count = gpu_count
@@ -374,39 +409,74 @@ class GPULoadTracker:
         self.total_jobs = [0] * gpu_count   # Total jobs assigned per GPU
         self.lock = threading.Lock()
 
-    def get_best_gpu(self) -> int:
-        """Get the GPU with the lowest current load."""
+        # CRITICAL: Semaphores enforce REAL limits per GPU
+        # Prevents over-subscription when scaling to many GPUs
+        self._gpu_semaphores = {i: threading.Semaphore(max_sessions_per_gpu) for i in range(gpu_count)}
+
+    def get_best_gpu(self, blocking: bool = True, timeout: float = None) -> int:
+        """
+        Get GPU with capacity available. Uses semaphores for REAL enforcement.
+
+        Args:
+            blocking: If True, wait for GPU to become available
+            timeout: Max seconds to wait (None = infinite)
+
+        Returns GPU ID (0-indexed), or -1 if non-blocking and none available.
+        """
+        # First, find GPUs sorted by total jobs (prefer less used)
         with self.lock:
-            # Find GPU with minimum active jobs
-            min_load = min(self.active_jobs)
-            # If tie, prefer GPU with fewer total jobs assigned
-            best_gpu = 0
-            best_score = float('inf')
-            for i in range(self.gpu_count):
-                # Score = active_jobs * 1000 + total_jobs (prioritize active, then total)
-                score = self.active_jobs[i] * 1000 + self.total_jobs[i]
-                if score < best_score:
-                    best_score = score
-                    best_gpu = i
-            return best_gpu
+            gpu_order = sorted(range(self.gpu_count), key=lambda i: self.total_jobs[i])
+
+        # Try to acquire from least-used GPU first (non-blocking)
+        for gpu_id in gpu_order:
+            acquired = self._gpu_semaphores[gpu_id].acquire(blocking=False)
+            if acquired:
+                with self.lock:
+                    self.active_jobs[gpu_id] += 1
+                    self.total_jobs[gpu_id] += 1
+                return gpu_id
+
+        # If non-blocking and none available
+        if not blocking:
+            return -1
+
+        # Blocking: wait for ANY GPU
+        start_gpu = gpu_order[0]
+        for i in range(self.gpu_count):
+            gpu_id = (start_gpu + i) % self.gpu_count
+            acquired = self._gpu_semaphores[gpu_id].acquire(blocking=True, timeout=timeout)
+            if acquired:
+                with self.lock:
+                    self.active_jobs[gpu_id] += 1
+                    self.total_jobs[gpu_id] += 1
+                return gpu_id
+
+        return -1  # Timeout
 
     def assign_job(self, gpu_id: int) -> None:
-        """Mark a job as assigned to a GPU."""
-        with self.lock:
-            self.active_jobs[gpu_id] += 1
-            self.total_jobs[gpu_id] += 1
+        """Mark a job as assigned to a GPU (legacy compatibility)."""
+        # Note: With semaphore-based get_best_gpu(), this is called internally
+        pass  # Assignment is handled in get_best_gpu()
 
     def complete_job(self, gpu_id: int) -> None:
         """Mark a job as completed on a GPU."""
+        if gpu_id < 0 or gpu_id >= self.gpu_count:
+            return
+
         with self.lock:
             self.active_jobs[gpu_id] = max(0, self.active_jobs[gpu_id] - 1)
+
+        # Release semaphore - allows waiting thread to proceed
+        self._gpu_semaphores[gpu_id].release()
 
     def get_stats(self) -> dict:
         """Get current load statistics."""
         with self.lock:
             return {
                 'active_jobs': list(self.active_jobs),
-                'total_jobs': list(self.total_jobs)
+                'total_jobs': list(self.total_jobs),
+                'capacity_per_gpu': self.max_sessions_per_gpu,
+                'total_capacity': self.max_sessions_per_gpu * self.gpu_count
             }
 
 
@@ -417,15 +487,16 @@ class AsyncPipelineProcessor:
     Async I/O pipeline processor that overlaps downloads, processing, and uploads
     to maximize GPU utilization.
 
-    Architecture:
-    - Download workers (50): Prefetch files into download queue
-    - Processing workers (NVENC * 1.5): Process from download queue, output to upload queue
-    - Upload workers (50): Upload completed files from upload queue
+    MEGA-GPU OPTIMIZED Architecture:
+    - Download workers: Scales with GPU count (10 per GPU, min 50)
+    - Processing workers: NVENC sessions × 1.2 (semaphores handle blocking)
+    - Upload workers: Scales with GPU count (10 per GPU, min 50)
 
     This ensures:
-    1. GPU never waits for downloads (prefetch buffer)
+    1. GPU never waits for downloads (prefetch buffer scaled to GPU count)
     2. Uploads don't block processing (async upload queue)
     3. Full overlap of all three stages
+    4. SCALES to 20+ GPUs without bottleneck
     """
 
     def __init__(
@@ -433,16 +504,21 @@ class AsyncPipelineProcessor:
         gpu_info: dict,
         job,
         temp_dir: str,
-        download_workers: int = DOWNLOAD_WORKERS,
-        upload_workers: int = UPLOAD_WORKERS
+        download_workers: int = None,
+        upload_workers: int = None
     ):
         self.gpu_info = gpu_info
         self.job = job
         self.temp_dir = temp_dir
-        self.download_workers = download_workers
-        self.upload_workers = upload_workers
 
-        # Calculate processing workers: overprovision to keep queue full
+        # MEGA-GPU: Scale I/O workers based on GPU count
+        gpu_count = gpu_info.get('gpu_count', 1)
+        optimal_download, optimal_upload = get_optimal_io_workers(gpu_count)
+
+        self.download_workers = download_workers or optimal_download
+        self.upload_workers = upload_workers or optimal_upload
+
+        # Calculate processing workers: smaller buffer, semaphores handle blocking
         nvenc_sessions = gpu_info.get('nvenc_sessions', 6)
         self.processing_workers = int(nvenc_sessions * PROCESSING_OVERPROVISION)
 
@@ -787,12 +863,26 @@ class AsyncPipelineProcessor:
 
         gpu_count = self.gpu_info.get('gpu_count', 1)
         nvenc_sessions = self.gpu_info.get('nvenc_sessions', 6)
+        gpu_name = self.gpu_info.get('gpu_name', 'Unknown')
+        sessions_per_gpu = self.gpu_info.get('nvenc_sessions_per_gpu', 16)
 
-        print(f"[AsyncPipeline] ===== BATCH START =====")
-        print(f"[AsyncPipeline] Items: {self.total_items}, Tool: {tool}")
-        print(f"[AsyncPipeline] Download workers: {self.download_workers}")
-        print(f"[AsyncPipeline] Process workers: {self.processing_workers} (NVENC: {nvenc_sessions})")
-        print(f"[AsyncPipeline] Upload workers: {self.upload_workers}")
+        # Calculate theoretical throughput (assuming ~2s per video encode)
+        theoretical_throughput = nvenc_sessions / 2.0  # videos/second
+        estimated_time = self.total_items / theoretical_throughput if theoretical_throughput > 0 else 0
+
+        print(f"[AsyncPipeline] =============== MEGA-GPU BATCH START ===============")
+        print(f"[AsyncPipeline] GPU Model: {gpu_name}")
+        print(f"[AsyncPipeline] GPU Count: {gpu_count} | Sessions/GPU: {sessions_per_gpu}")
+        print(f"[AsyncPipeline] Total NVENC Capacity: {nvenc_sessions} parallel encodes")
+        print(f"[AsyncPipeline] ---")
+        print(f"[AsyncPipeline] Items to Process: {self.total_items} | Tool: {tool}")
+        print(f"[AsyncPipeline] Download Workers: {self.download_workers}")
+        print(f"[AsyncPipeline] Process Workers: {self.processing_workers}")
+        print(f"[AsyncPipeline] Upload Workers: {self.upload_workers}")
+        print(f"[AsyncPipeline] ---")
+        print(f"[AsyncPipeline] Theoretical Throughput: ~{theoretical_throughput:.1f} videos/sec")
+        print(f"[AsyncPipeline] Estimated Time: ~{estimated_time:.1f}s ({estimated_time/60:.1f} min)")
+        print(f"[AsyncPipeline] =======================================================")
 
         # Prepare work items
         work_items = []

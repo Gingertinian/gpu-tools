@@ -421,7 +421,10 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
 class NVENCSessionTracker:
     """
     Thread-safe tracker for active NVENC sessions per GPU.
-    Helps balance load across multiple GPUs and respect session limits.
+    Uses semaphores to enforce REAL limits per GPU - critical for 9+ GPU scaling.
+
+    Key improvement: Semaphores block when GPU is at capacity, preventing
+    over-subscription and memory issues with many GPUs.
     """
 
     def __init__(self, gpu_count: int, sessions_per_gpu: int):
@@ -430,27 +433,77 @@ class NVENCSessionTracker:
         self.active_sessions = {i: 0 for i in range(gpu_count)}
         self._lock = threading.Lock()
 
-    def acquire_gpu(self) -> int:
+        # CRITICAL: Semaphores enforce REAL limits per GPU
+        # This prevents over-subscription when scaling to 9+ GPUs
+        self._gpu_semaphores = {i: threading.Semaphore(sessions_per_gpu) for i in range(gpu_count)}
+
+        # Track total sessions for load balancing decisions
+        self._total_assigned = {i: 0 for i in range(gpu_count)}
+
+    def acquire_gpu(self, blocking: bool = True, timeout: float = None) -> int:
         """
-        Get the GPU with the least active sessions.
-        Returns GPU ID (0-indexed).
+        Get GPU with capacity available. Uses semaphores for REAL enforcement.
+
+        Args:
+            blocking: If True, wait for GPU to become available
+            timeout: Max seconds to wait (None = infinite)
+
+        Returns GPU ID (0-indexed), or -1 if non-blocking and none available.
         """
+        # First, find the GPU with least total assignments (for fairness)
         with self._lock:
-            # Find GPU with minimum active sessions
-            min_gpu = min(self.active_sessions, key=self.active_sessions.get)
-            self.active_sessions[min_gpu] += 1
-            return min_gpu
+            # Sort GPUs by total assigned (prefer less used)
+            gpu_order = sorted(range(self.gpu_count), key=lambda i: self._total_assigned[i])
+
+        # Try to acquire from least-used GPU first
+        for gpu_id in gpu_order:
+            acquired = self._gpu_semaphores[gpu_id].acquire(blocking=False)
+            if acquired:
+                with self._lock:
+                    self.active_sessions[gpu_id] += 1
+                    self._total_assigned[gpu_id] += 1
+                return gpu_id
+
+        # If non-blocking and none available, return -1
+        if not blocking:
+            return -1
+
+        # Blocking mode: wait for ANY GPU to become available
+        # Use round-robin starting from least-used
+        start_gpu = gpu_order[0]
+        for i in range(self.gpu_count):
+            gpu_id = (start_gpu + i) % self.gpu_count
+            acquired = self._gpu_semaphores[gpu_id].acquire(blocking=True, timeout=timeout)
+            if acquired:
+                with self._lock:
+                    self.active_sessions[gpu_id] += 1
+                    self._total_assigned[gpu_id] += 1
+                return gpu_id
+
+        # Timeout expired on all GPUs
+        return -1
 
     def release_gpu(self, gpu_id: int):
         """Release a session from the specified GPU."""
+        if gpu_id < 0 or gpu_id >= self.gpu_count:
+            return
+
         with self._lock:
-            if gpu_id in self.active_sessions and self.active_sessions[gpu_id] > 0:
+            if self.active_sessions[gpu_id] > 0:
                 self.active_sessions[gpu_id] -= 1
 
-    def get_stats(self) -> Dict[int, int]:
+        # Release semaphore - allows waiting thread to proceed
+        self._gpu_semaphores[gpu_id].release()
+
+    def get_stats(self) -> Dict[str, Any]:
         """Get current session counts per GPU."""
         with self._lock:
-            return dict(self.active_sessions)
+            return {
+                'active': dict(self.active_sessions),
+                'total_assigned': dict(self._total_assigned),
+                'capacity_per_gpu': self.sessions_per_gpu,
+                'total_capacity': self.sessions_per_gpu * self.gpu_count
+            }
 
 
 def process_videos_parallel(
@@ -489,17 +542,55 @@ def process_videos_parallel(
     if max_parallel is None:
         max_parallel = gpu_info['nvenc_sessions']
 
-    # Overprovision workers by 2x to keep GPU queue ALWAYS full
-    # This ensures maximum GPU utilization - there's always work queued when an NVENC session finishes
-    # 2x is optimal because:
-    # 1. FFmpeg startup/teardown has overhead
-    # 2. File I/O (reading input, writing output) can stall briefly
-    # 3. More queued work = less GPU idle time between jobs
-    max_workers = int(max_parallel * 2)
+    # ==========================================================================
+    # MEGA-GPU WORKER SCALING (optimized for 1-20+ GPUs per worker)
+    # ==========================================================================
+    #
+    # Architecture: Fewer workers with MORE GPUs each is BETTER because:
+    #   1. Less network overhead between workers
+    #   2. All GPUs share same memory/storage (faster transfers)
+    #   3. Better for batch processing (single download, parallel encode)
+    #   4. RunPod worker allocation is the bottleneck, not GPUs
+    #
+    # Scaling strategy:
+    #   - Workers = NVENC_sessions × 1.2 (small buffer, semaphores handle blocking)
+    #   - NO CAP - if you have 20 GPUs × 16 sessions = 320 NVENC, use 384 workers
+    #   - Semaphores enforce REAL limits per GPU (no over-subscription)
+    #
+    # Example scaling:
+    #   1 GPU:  16 sessions × 1.2 = 19 workers
+    #   4 GPUs: 64 sessions × 1.2 = 77 workers
+    #   9 GPUs: 144 sessions × 1.2 = 173 workers
+    #   20 GPUs: 320 sessions × 1.2 = 384 workers
+    #
+    # The 1.2x buffer ensures:
+    #   - Always work queued when NVENC session finishes
+    #   - Minimal thread overhead (not 2x anymore)
+    #   - Semaphores block excess threads efficiently
 
-    print(f"[Parallel Video] GPU: {gpu_info['gpu_name']}, Type: {gpu_info['gpu_type']}, "
-          f"GPUs: {gpu_count}, Sessions/GPU: {sessions_per_gpu}, "
-          f"NVENC sessions: {max_parallel}, Workers: {max_workers} (2x overprovision for max throughput)")
+    # Calculate optimal worker count - NO CAP for mega-GPU workers
+    base_workers = max_parallel  # = gpu_count × sessions_per_gpu
+
+    # Small buffer (1.2x) - semaphores handle the rest
+    # This is enough to keep GPUs fed without excessive thread overhead
+    WORKER_BUFFER_MULTIPLIER = 1.2
+    max_workers = int(base_workers * WORKER_BUFFER_MULTIPLIER)
+
+    # Minimum workers = NVENC sessions (ensure we can saturate all GPUs)
+    max_workers = max(max_workers, base_workers)
+
+    # Calculate theoretical throughput
+    # Assuming ~2 seconds per video with full GPU utilization
+    theoretical_throughput = max_parallel / 2.0  # videos per second
+
+    print(f"[Parallel Video] ========== MEGA-GPU CONFIGURATION ==========")
+    print(f"[Parallel Video] GPU Model: {gpu_info['gpu_name']}")
+    print(f"[Parallel Video] GPU Count: {gpu_count} | Sessions/GPU: {sessions_per_gpu}")
+    print(f"[Parallel Video] Total NVENC Capacity: {max_parallel} parallel encodes")
+    print(f"[Parallel Video] Worker Threads: {max_workers} (1.2x buffer)")
+    print(f"[Parallel Video] Theoretical Throughput: ~{theoretical_throughput:.1f} videos/sec")
+    print(f"[Parallel Video] Videos to Process: {len(video_paths)}")
+    print(f"[Parallel Video] =============================================")
 
     # Initialize NVENC session tracker for load balancing across GPUs
     session_tracker = NVENCSessionTracker(gpu_count, sessions_per_gpu)

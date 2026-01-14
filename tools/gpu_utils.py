@@ -13,6 +13,8 @@ Usage:
         assign_gpu,
         build_ffmpeg_nvenc_args,
         build_ffmpeg_cpu_fallback_args,
+        build_ffmpeg_command,
+        get_optimal_nvenc_params,
         run_ffmpeg_with_fallback,
         GPUManager
     )
@@ -27,6 +29,20 @@ Usage:
     # Build FFmpeg encoding arguments
     nvenc_args = build_ffmpeg_nvenc_args(gpu_id=0, bitrate=5000)
     cpu_args = build_ffmpeg_cpu_fallback_args(bitrate=5000)
+
+    # Build complete FFmpeg command with max throughput (RECOMMENDED)
+    cmd = build_ffmpeg_command(
+        input_path='input.mp4',
+        output_path='output.mp4',
+        filter_str='scale=1920:1080',
+        gpu_id=0,
+        bitrate=5000,
+        fps=30.0,
+        use_nvenc=True
+    )
+
+    # Get optimal NVENC parameters for custom commands
+    params = get_optimal_nvenc_params(bitrate=5000, fps=30.0)
 
     # Run FFmpeg with automatic fallback
     success, result = run_ffmpeg_with_fallback(
@@ -51,10 +67,10 @@ import multiprocessing
 # =============================================================================
 
 # NVENC session limits by GPU type (per GPU)
-# Datacenter GPUs: Unlimited NVENC sessions (we use 12 as practical limit)
+# Datacenter GPUs: Unlimited NVENC sessions (we use 16 as practical limit for max throughput)
 # Consumer GPUs: Limited to 3-5 sessions by NVIDIA driver
 NVENC_SESSION_LIMITS = {
-    'datacenter': 12,   # A100, A6000, A5000, H100, L40, L40S, RTX 6000 Ada, etc.
+    'datacenter': 16,   # A100, A6000, A5000, H100, L40, L40S, RTX 6000 Ada, etc. (increased for max throughput)
     'consumer': 3,      # RTX 4090, 3090, 4080, 3080, etc.
     'default': 2,       # Fallback for unknown GPUs
 }
@@ -398,9 +414,10 @@ def assign_gpu(task_index: int) -> int:
 def build_ffmpeg_nvenc_args(
     gpu_id: int = 0,
     bitrate: int = 5000,
-    preset: str = 'p4',
-    cq: int = 23,
-    lookahead: int = 8
+    preset: str = 'p1',
+    cq: int = 26,
+    lookahead: int = 0,
+    max_throughput: bool = True
 ) -> List[str]:
     """
     Build common NVENC encoding arguments for FFmpeg.
@@ -408,9 +425,10 @@ def build_ffmpeg_nvenc_args(
     Args:
         gpu_id: GPU to use for encoding (for multi-GPU systems)
         bitrate: Target bitrate in kbps (default 5000)
-        preset: NVENC preset (p1=fastest to p7=best quality, default p4)
-        cq: Constant quality value (0-51, lower=better, default 23)
-        lookahead: RC lookahead frames (default 8)
+        preset: NVENC preset (p1=fastest to p7=best quality, default p1 for max throughput)
+        cq: Constant quality value (0-51, lower=better, default 26)
+        lookahead: RC lookahead frames (default 0 for minimum latency)
+        max_throughput: If True, adds extra flags for maximum encoding speed (default True)
 
     Returns:
         List of FFmpeg arguments for NVENC encoding
@@ -419,22 +437,33 @@ def build_ffmpeg_nvenc_args(
         args = build_ffmpeg_nvenc_args(gpu_id=0, bitrate=5000)
         cmd = ['ffmpeg', '-i', 'input.mp4', *args, 'output.mp4']
     """
-    return [
+    args = [
         '-c:v', 'h264_nvenc',
         '-gpu', str(gpu_id),
         '-preset', preset,
+        '-tune', 'll',  # Low latency tuning
         '-rc', 'vbr',
         '-cq', str(cq),
         '-b:v', f'{bitrate}k',
-        '-maxrate', f'{int(bitrate * 1.5)}k',
+        '-maxrate', f'{int(bitrate * 2)}k',  # 2x headroom for peaks
         '-bufsize', f'{bitrate * 2}k',
         '-rc-lookahead', str(lookahead),
     ]
 
+    # Add maximum throughput flags
+    if max_throughput:
+        args.extend([
+            '-bf', '0',           # No B-frames for maximum speed
+            '-spatial-aq', '0',   # Disable spatial AQ for speed
+            '-temporal-aq', '0',  # Disable temporal AQ for speed
+        ])
+
+    return args
+
 
 def build_ffmpeg_cpu_fallback_args(
     bitrate: int = 5000,
-    preset: str = 'fast',
+    preset: str = 'ultrafast',
     crf: int = 23
 ) -> List[str]:
     """
@@ -442,7 +471,7 @@ def build_ffmpeg_cpu_fallback_args(
 
     Args:
         bitrate: Target bitrate in kbps (default 5000)
-        preset: x264 preset (ultrafast to veryslow, default fast)
+        preset: x264 preset (ultrafast to veryslow, default ultrafast for speed)
         crf: Constant rate factor (0-51, lower=better, default 23)
 
     Returns:
@@ -482,6 +511,206 @@ def build_ffmpeg_audio_args(
     if not keep_audio:
         return ['-an']
     return ['-c:a', codec, '-b:a', f'{bitrate}k']
+
+
+def get_optimal_nvenc_params(
+    bitrate: int = 5000,
+    fps: float = 30.0
+) -> Dict[str, Any]:
+    """
+    Get the fastest NVENC encoding parameters for maximum throughput.
+
+    These settings prioritize encoding speed over compression efficiency,
+    ideal for batch processing where throughput is critical.
+
+    Args:
+        bitrate: Target bitrate in kbps (default 5000)
+        fps: Target frame rate (default 30.0)
+
+    Returns:
+        Dict with optimal NVENC parameters:
+        - preset: 'p1' (fastest preset)
+        - tune: 'll' (low latency)
+        - rc: 'vbr' (variable bitrate)
+        - cq: 23 (constant quality)
+        - lookahead: 0 (disabled for minimum latency)
+        - b_frames: 0 (disabled for speed)
+        - bitrate: target bitrate in kbps
+        - maxrate: 2x bitrate for peaks
+        - fps: target frame rate
+
+    Example:
+        params = get_optimal_nvenc_params(bitrate=5000, fps=30.0)
+        # Returns: {'preset': 'p1', 'tune': 'll', 'rc': 'vbr', ...}
+    """
+    return {
+        'preset': 'p1',           # Fastest NVENC preset (p1-p7, p1=fastest)
+        'tune': 'll',             # Low latency tuning
+        'rc': 'vbr',              # Variable bitrate for quality
+        'cq': 23,                 # Constant quality (0-51, 23 is good balance)
+        'lookahead': 0,           # No lookahead for minimum latency
+        'b_frames': 0,            # No B-frames for fastest encoding
+        'bitrate': bitrate,       # Target bitrate in kbps
+        'maxrate': bitrate * 2,   # Max bitrate (2x for peaks)
+        'fps': fps,               # Target frame rate
+        'spatial_aq': False,      # Disable spatial AQ for speed
+        'temporal_aq': False,     # Disable temporal AQ for speed
+    }
+
+
+def build_ffmpeg_command(
+    input_path: str,
+    output_path: str,
+    filter_str: Optional[str] = None,
+    gpu_id: int = 0,
+    bitrate: int = 5000,
+    fps: float = 30.0,
+    keep_audio: bool = True,
+    use_nvenc: bool = True
+) -> List[str]:
+    """
+    Build FFmpeg command with maximum throughput settings.
+
+    This function creates an optimized FFmpeg command for video encoding,
+    prioritizing encoding speed over compression efficiency. It supports
+    both NVENC (GPU) and libx264 (CPU) encoding.
+
+    Args:
+        input_path: Path to input video file
+        output_path: Path for output video file
+        filter_str: Optional video filter string (e.g., "scale=1920:1080")
+        gpu_id: GPU device ID for NVENC encoding (default 0)
+        bitrate: Target video bitrate in kbps (default 5000)
+        fps: Target frame rate (default 30.0)
+        keep_audio: Whether to preserve audio track (default True)
+        use_nvenc: Use NVENC GPU encoding (True) or CPU fallback (False)
+
+    Returns:
+        Complete FFmpeg command as list of strings
+
+    NVENC Settings (use_nvenc=True):
+        - Hardware decode: -hwaccel cuda -hwaccel_device {gpu_id}
+        - Encoder: h264_nvenc with -gpu {gpu_id}
+        - Speed: -preset p1 -tune ll (fastest preset, low latency)
+        - Quality: -rc vbr -cq 23 (variable bitrate, constant quality)
+        - Latency: -rc-lookahead 0 (no lookahead for minimum latency)
+        - Bitrate: -b:v {bitrate}k -maxrate {bitrate*2}k
+
+    CPU Settings (use_nvenc=False):
+        - Encoder: libx264
+        - Speed: -preset ultrafast
+        - Quality: -crf 23
+
+    Example:
+        # NVENC encoding with filter
+        cmd = build_ffmpeg_command(
+            "input.mp4", "output.mp4",
+            filter_str="scale=1920:1080",
+            gpu_id=0, bitrate=5000, use_nvenc=True
+        )
+        subprocess.run(cmd)
+
+        # CPU fallback encoding
+        cmd = build_ffmpeg_command(
+            "input.mp4", "output.mp4",
+            use_nvenc=False
+        )
+        subprocess.run(cmd)
+    """
+    cmd = ['ffmpeg', '-y']
+
+    if use_nvenc:
+        # =====================================================================
+        # NVENC (GPU) ENCODING - FULL Hardware Pipeline for Maximum Throughput
+        # =====================================================================
+        # Key optimizations:
+        # 1. -hwaccel cuda: Enable CUDA hardware acceleration
+        # 2. -hwaccel_device X: Bind decode to specific GPU
+        # 3. -hwaccel_output_format cuda: Keep decoded frames in GPU memory
+        # 4. -c:v h264_cuvid: Use hardware H264 decoder (if input is H264)
+        # 5. -preset p1 -tune ll: Fastest NVENC settings
+        # 6. -rc-lookahead 0: No lookahead for minimum latency
+        # 7. -bf 0: No B-frames for maximum speed
+
+        # FULL hardware acceleration pipeline - keeps frames in GPU memory
+        cmd.extend([
+            '-hwaccel', 'cuda',
+            '-hwaccel_device', str(gpu_id),
+            '-hwaccel_output_format', 'cuda',  # Keep decoded frames in GPU memory
+            '-c:v', 'h264_cuvid',  # Hardware H264 decoder (fastest for H264 input)
+        ])
+
+        # Input file
+        cmd.extend(['-i', input_path])
+
+        # Video filter (if provided)
+        # For full hardware pipeline, use hwdownload/hwupload for filter processing
+        if filter_str:
+            cmd.extend(['-vf', f'hwdownload,format=nv12,{filter_str},hwupload_cuda'])
+
+        # Frame rate
+        cmd.extend(['-r', str(fps)])
+
+        # NVENC encoder with MAXIMUM THROUGHPUT settings
+        cmd.extend([
+            '-c:v', 'h264_nvenc',
+            '-gpu', str(gpu_id),
+            '-preset', 'p1',              # Fastest preset (p1-p7)
+            '-tune', 'll',                # Low latency tuning (faster than hq)
+            '-rc', 'vbr',                 # Variable bitrate mode
+            '-cq', '26',                  # Slightly relaxed quality for speed
+            '-rc-lookahead', '0',         # No lookahead (minimum latency)
+            '-bf', '0',                   # No B-frames for maximum speed
+            '-spatial-aq', '0',           # Disable spatial AQ for speed
+            '-temporal-aq', '0',          # Disable temporal AQ for speed
+            '-b:v', f'{bitrate}k',        # Target bitrate
+            '-maxrate', f'{bitrate * 2}k',  # Max bitrate (2x for peaks)
+            '-bufsize', f'{bitrate * 2}k',  # VBV buffer size
+        ])
+
+    else:
+        # =====================================================================
+        # CPU (libx264) ENCODING - Fallback with ultrafast preset
+        # =====================================================================
+
+        # Input file
+        cmd.extend(['-i', input_path])
+
+        # Video filter (if provided)
+        if filter_str:
+            cmd.extend(['-vf', filter_str])
+
+        # Frame rate
+        cmd.extend(['-r', str(fps)])
+
+        # libx264 encoder with ultrafast preset
+        cmd.extend([
+            '-c:v', 'libx264',
+            '-preset', 'ultrafast',       # Fastest x264 preset
+            '-crf', '23',                 # Constant rate factor
+            '-pix_fmt', 'yuv420p',        # Pixel format for compatibility
+        ])
+
+    # =========================================================================
+    # AUDIO HANDLING
+    # =========================================================================
+    if keep_audio:
+        cmd.extend([
+            '-c:a', 'aac',
+            '-b:a', '128k',
+        ])
+    else:
+        cmd.append('-an')
+
+    # =========================================================================
+    # OUTPUT OPTIONS
+    # =========================================================================
+    cmd.extend([
+        '-movflags', '+faststart',  # Enable fast start for streaming
+        output_path
+    ])
+
+    return cmd
 
 
 def build_complete_ffmpeg_cmd(

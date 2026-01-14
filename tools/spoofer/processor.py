@@ -55,7 +55,7 @@ VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.webm', '.mkv', '.m4v'}
 # Datacenter GPUs (A-series, Quadro): Unlimited sessions
 NVENC_SESSION_LIMITS = {
     'consumer': 3,      # RTX 3090, 4090, 4080, etc.
-    'datacenter': 12,   # A5000, A6000, A100, etc. (increased for parallel video)
+    'datacenter': 16,   # A5000, A6000, A100, etc. (increased for max parallel throughput)
     'default': 2,       # Fallback
 }
 
@@ -225,101 +225,169 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
         bitrate = int(5000 * video_cfg.get('bitrate', 90) / 100)
         keep_audio = video_cfg.get('keepAudio', True)
 
-        # Use gpu_utils module if available for FFmpeg command building
-        if GPU_UTILS_AVAILABLE:
-            # Use the gpu_utils module for standardized FFmpeg command building
-            nvenc_cmd = build_ffmpeg_command(
-                input_path=input_path,
-                output_path=output_path,
-                filter_str=filter_str,
-                gpu_id=gpu_id,
-                bitrate=bitrate,
-                fps=fps,
-                keep_audio=keep_audio,
-                use_nvenc=True
-            )
-            cpu_cmd = build_ffmpeg_command(
-                input_path=input_path,
-                output_path=output_path,
-                filter_str=filter_str,
-                gpu_id=0,
-                bitrate=bitrate,
-                fps=fps,
-                keep_audio=keep_audio,
-                use_nvenc=False
-            )
-        else:
-            # Fallback to local FFmpeg command building
-            def _build_ffmpeg_cmd(use_nvenc: bool = True, target_gpu: int = 0) -> list:
-                """Build FFmpeg command with NVENC (multi-GPU support) or CPU encoding."""
-                cmd = ['ffmpeg', '-y']
+        # Build FFmpeg commands optimized for maximum GPU throughput
+        # Key optimizations:
+        # 1. Full hardware decode pipeline: -hwaccel cuda -hwaccel_device X -hwaccel_output_format cuda
+        # 2. Use h264_cuvid decoder for H264 input (hardware decode)
+        # 3. Fastest NVENC preset: p1 with -tune ll (low latency)
+        # 4. Zero lookahead for minimum latency
+        # 5. No B-frames for maximum encoding speed
 
-                if use_nvenc:
-                    # Hardware acceleration for decoding - bind to specific GPU
-                    cmd.extend([
-                        '-hwaccel', 'cuda',
-                        '-hwaccel_device', str(target_gpu),
-                    ])
+        def _build_ffmpeg_cmd_max_throughput(use_nvenc: bool = True, target_gpu: int = 0) -> list:
+            """Build FFmpeg command optimized for maximum GPU throughput."""
+            cmd = ['ffmpeg', '-y']
 
-                cmd.extend(['-i', input_path])
+            if use_nvenc:
+                # FULL hardware acceleration pipeline - keeps frames in GPU memory
+                cmd.extend([
+                    '-hwaccel', 'cuda',
+                    '-hwaccel_device', str(target_gpu),
+                    '-hwaccel_output_format', 'cuda',  # Keep decoded frames in GPU memory
+                    '-c:v', 'h264_cuvid',  # Hardware H264 decoder (if input is H264)
+                ])
 
-                if filter_str:
-                    cmd.extend(['-vf', filter_str])
+            cmd.extend(['-i', input_path])
 
-                if use_nvenc:
-                    # NVENC encoding with GPU selection RIGHT AFTER codec selection
-                    # Using p1 (fastest) preset for maximum throughput
-                    cmd.extend([
-                        '-c:v', 'h264_nvenc',
-                        '-gpu', str(target_gpu),  # Multi-GPU: select specific GPU for NVENC
-                        '-preset', 'p1',  # Fastest NVENC preset for max sessions
-                        '-tune', 'hq',
-                        '-rc', 'vbr',
-                        '-cq', '25',  # Slightly lower quality for speed
-                        '-b:v', f'{bitrate}k',
-                        '-maxrate', f'{int(bitrate * 1.5)}k',
-                        '-bufsize', f'{bitrate * 2}k',
-                        '-rc-lookahead', '4',  # Reduced lookahead for speed
-                    ])
-                else:
-                    # CPU fallback with libx264
-                    cmd.extend([
-                        '-c:v', 'libx264',
-                        '-preset', 'fast',
-                        '-crf', '23',
-                    ])
+            if filter_str:
+                # For hardware pipeline, need to download to CPU for filters, then upload back
+                # Use hwdownload -> filter -> hwupload for GPU memory efficiency
+                # However, most spoofer filters are simple and work better on CPU
+                cmd.extend(['-vf', f'hwdownload,format=nv12,{filter_str},hwupload_cuda'])
+            else:
+                # No filters - can stay entirely on GPU
+                pass
 
-                if keep_audio:
-                    cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
-                else:
-                    cmd.append('-an')
+            if use_nvenc:
+                # NVENC encoding with MAXIMUM THROUGHPUT settings
+                # p1 = fastest preset, ll = low latency tuning
+                # No lookahead, no B-frames for minimum latency
+                cmd.extend([
+                    '-c:v', 'h264_nvenc',
+                    '-gpu', str(target_gpu),  # Multi-GPU: select specific GPU for NVENC
+                    '-preset', 'p1',          # Fastest NVENC preset (p1-p7)
+                    '-tune', 'll',            # Low latency tuning (faster than hq)
+                    '-rc', 'vbr',             # Variable bitrate
+                    '-cq', '26',              # Slightly relaxed quality for speed
+                    '-b:v', f'{bitrate}k',
+                    '-maxrate', f'{int(bitrate * 2)}k',  # 2x headroom for peaks
+                    '-bufsize', f'{bitrate * 2}k',
+                    '-rc-lookahead', '0',     # Zero lookahead for minimum latency
+                    '-bf', '0',               # No B-frames for maximum speed
+                    '-spatial-aq', '0',       # Disable spatial AQ for speed
+                    '-temporal-aq', '0',      # Disable temporal AQ for speed
+                ])
+            else:
+                # CPU fallback with libx264 ultrafast
+                cmd.extend([
+                    '-c:v', 'libx264',
+                    '-preset', 'ultrafast',   # Fastest x264 preset
+                    '-crf', '23',
+                    '-pix_fmt', 'yuv420p',
+                ])
 
-                cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
-                return cmd
+            if keep_audio:
+                cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
+            else:
+                cmd.append('-an')
 
-            nvenc_cmd = _build_ffmpeg_cmd(use_nvenc=True, target_gpu=gpu_id)
-            cpu_cmd = _build_ffmpeg_cmd(use_nvenc=False, target_gpu=0)
+            cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
+            return cmd
 
-        # Try NVENC first (with GPU selection via -gpu X flag), then CPU fallback
-        print(f"[Spoofer Worker {video_index}] Using GPU {gpu_id} for NVENC encoding")
+        # Also build a simpler NVENC command without hardware decode (fallback if cuvid fails)
+        def _build_ffmpeg_cmd_nvenc_simple(target_gpu: int = 0) -> list:
+            """Build simpler NVENC command without hardware decode (fallback)."""
+            cmd = ['ffmpeg', '-y']
+
+            # Software decode but hardware encode
+            cmd.extend([
+                '-hwaccel', 'cuda',
+                '-hwaccel_device', str(target_gpu),
+            ])
+
+            cmd.extend(['-i', input_path])
+
+            if filter_str:
+                cmd.extend(['-vf', filter_str])
+
+            # NVENC with fast settings
+            cmd.extend([
+                '-c:v', 'h264_nvenc',
+                '-gpu', str(target_gpu),
+                '-preset', 'p1',
+                '-tune', 'll',
+                '-rc', 'vbr',
+                '-cq', '26',
+                '-b:v', f'{bitrate}k',
+                '-maxrate', f'{int(bitrate * 2)}k',
+                '-bufsize', f'{bitrate * 2}k',
+                '-rc-lookahead', '0',
+                '-bf', '0',
+            ])
+
+            if keep_audio:
+                cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
+            else:
+                cmd.append('-an')
+
+            cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
+            return cmd
+
+        def _build_ffmpeg_cmd_cpu() -> list:
+            """Build CPU fallback command."""
+            cmd = ['ffmpeg', '-y', '-i', input_path]
+
+            if filter_str:
+                cmd.extend(['-vf', filter_str])
+
+            cmd.extend([
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-crf', '23',
+                '-pix_fmt', 'yuv420p',
+            ])
+
+            if keep_audio:
+                cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
+            else:
+                cmd.append('-an')
+
+            cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
+            return cmd
+
+        nvenc_cmd = _build_ffmpeg_cmd_max_throughput(use_nvenc=True, target_gpu=gpu_id)
+        nvenc_simple_cmd = _build_ffmpeg_cmd_nvenc_simple(target_gpu=gpu_id)
+        cpu_cmd = _build_ffmpeg_cmd_cpu()
+
+        # Try encoding with 3-tier fallback for maximum reliability:
+        # 1. Full hardware pipeline (h264_cuvid + NVENC) - fastest
+        # 2. Simple NVENC (software decode + NVENC) - if cuvid fails
+        # 3. CPU fallback (libx264) - if NVENC fails entirely
+        print(f"[Spoofer Worker {video_index}] Using GPU {gpu_id} with full hardware pipeline")
 
         # NOTE: Do NOT set CUDA_VISIBLE_DEVICES - it remaps GPU indices and breaks -gpu X flag
         # The -gpu X flag in h264_nvenc is sufficient to select the specific GPU
+
+        # Tier 1: Try full hardware pipeline (h264_cuvid decoder + NVENC encoder)
         process = subprocess.run(nvenc_cmd, capture_output=True, text=True, timeout=900)
 
         if process.returncode != 0:
-            # NVENC failed, try CPU fallback
-            print(f"[Spoofer Worker {video_index}] NVENC on GPU {gpu_id} failed, trying CPU fallback")
-            process = subprocess.run(cpu_cmd, capture_output=True, text=True, timeout=1800)
+            # Tier 2: Full hardware failed (likely input not H264), try simple NVENC
+            print(f"[Spoofer Worker {video_index}] Full hardware pipeline failed, trying simple NVENC")
+            process = subprocess.run(nvenc_simple_cmd, capture_output=True, text=True, timeout=900)
 
             if process.returncode != 0:
-                elapsed = time.time() - start_time
-                print(f"[NVENC Worker {video_index}] FAILED in {elapsed:.2f}s on GPU {gpu_id}")
-                return {
-                    'status': 'failed',
-                    'index': video_index,
-                    'error': f"Both NVENC and CPU failed: {process.stderr[-500:] if process.stderr else 'Unknown error'}"
-                }
+                # Tier 3: NVENC failed entirely, use CPU fallback
+                print(f"[Spoofer Worker {video_index}] NVENC on GPU {gpu_id} failed, trying CPU fallback")
+                process = subprocess.run(cpu_cmd, capture_output=True, text=True, timeout=1800)
+
+                if process.returncode != 0:
+                    elapsed = time.time() - start_time
+                    print(f"[NVENC Worker {video_index}] FAILED in {elapsed:.2f}s on GPU {gpu_id}")
+                    return {
+                        'status': 'failed',
+                        'index': video_index,
+                        'error': f"All encoders failed: {process.stderr[-500:] if process.stderr else 'Unknown error'}"
+                    }
 
         elapsed = time.time() - start_time
         print(f"[NVENC Worker {video_index}] Done in {elapsed:.2f}s on GPU {gpu_id}")
@@ -421,13 +489,17 @@ def process_videos_parallel(
     if max_parallel is None:
         max_parallel = gpu_info['nvenc_sessions']
 
-    # Overprovision workers by 50% to keep GPUs busy during I/O wait
-    # This ensures there's always work queued when an NVENC session finishes
-    max_workers = int(max_parallel * 1.5)
+    # Overprovision workers by 2x to keep GPU queue ALWAYS full
+    # This ensures maximum GPU utilization - there's always work queued when an NVENC session finishes
+    # 2x is optimal because:
+    # 1. FFmpeg startup/teardown has overhead
+    # 2. File I/O (reading input, writing output) can stall briefly
+    # 3. More queued work = less GPU idle time between jobs
+    max_workers = int(max_parallel * 2)
 
     print(f"[Parallel Video] GPU: {gpu_info['gpu_name']}, Type: {gpu_info['gpu_type']}, "
           f"GPUs: {gpu_count}, Sessions/GPU: {sessions_per_gpu}, "
-          f"NVENC sessions: {max_parallel}, Workers: {max_workers} (1.5x overprovision)")
+          f"NVENC sessions: {max_parallel}, Workers: {max_workers} (2x overprovision for max throughput)")
 
     # Initialize NVENC session tracker for load balancing across GPUs
     session_tracker = NVENCSessionTracker(gpu_count, sessions_per_gpu)
@@ -1970,30 +2042,30 @@ def process_video(
     if gpu_id > 0:
         print(f"[Video Processing] Using GPU {gpu_id} for NVENC encoding")
 
-    def build_ffmpeg_cmd(encoder: str, encoder_opts: list, use_hwaccel: bool = False) -> list:
-        """Build FFmpeg command with specified encoder."""
+    def build_ffmpeg_cmd_full_hw(encoder_opts: list) -> list:
+        """Build FFmpeg command with FULL hardware pipeline (decode + encode on GPU)."""
         cmd = ['ffmpeg', '-y']
 
-        # Hardware acceleration for decoding (NVENC only)
-        if use_hwaccel:
-            cmd.extend([
-                '-hwaccel', 'cuda',
-                '-hwaccel_device', str(gpu_id),
-            ])
+        # FULL hardware acceleration pipeline - keeps frames in GPU memory
+        cmd.extend([
+            '-hwaccel', 'cuda',
+            '-hwaccel_device', str(gpu_id),
+            '-hwaccel_output_format', 'cuda',  # Keep decoded frames in GPU memory
+            '-c:v', 'h264_cuvid',  # Hardware H264 decoder
+        ])
 
         cmd.extend(['-i', input_path])
 
-        # Apply filters (CPU-based, most compatible)
+        # Apply filters with GPU memory transfer
         if filter_str:
-            cmd.extend(['-vf', filter_str])
+            cmd.extend(['-vf', f'hwdownload,format=nv12,{filter_str},hwupload_cuda'])
 
         # Video encoder
-        cmd.extend(['-c:v', encoder])
+        cmd.extend(['-c:v', 'h264_nvenc'])
         cmd.extend(encoder_opts)
 
-        # Audio handling - be cautious with TikTok videos
+        # Audio handling
         if keep_audio and has_audio:
-            # Try to copy audio first, fallback to re-encode if issues
             cmd.extend(['-c:a', 'aac', '-b:a', '128k', '-strict', 'experimental'])
         else:
             cmd.append('-an')
@@ -2001,70 +2073,132 @@ def process_video(
         cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
         return cmd
 
-    # NVENC encoder options with multi-GPU support
-    # Using p1 (fastest) preset for maximum throughput
+    def build_ffmpeg_cmd_simple_nvenc(encoder_opts: list) -> list:
+        """Build FFmpeg command with software decode + NVENC encode."""
+        cmd = ['ffmpeg', '-y']
+
+        # Hardware acceleration for decoding (but not full pipeline)
+        cmd.extend([
+            '-hwaccel', 'cuda',
+            '-hwaccel_device', str(gpu_id),
+        ])
+
+        cmd.extend(['-i', input_path])
+
+        # Apply filters (CPU-based)
+        if filter_str:
+            cmd.extend(['-vf', filter_str])
+
+        # Video encoder
+        cmd.extend(['-c:v', 'h264_nvenc'])
+        cmd.extend(encoder_opts)
+
+        # Audio handling
+        if keep_audio and has_audio:
+            cmd.extend(['-c:a', 'aac', '-b:a', '128k', '-strict', 'experimental'])
+        else:
+            cmd.append('-an')
+
+        cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
+        return cmd
+
+    def build_ffmpeg_cmd_cpu(encoder_opts: list) -> list:
+        """Build FFmpeg command with CPU encoding (fallback)."""
+        cmd = ['ffmpeg', '-y', '-i', input_path]
+
+        # Apply filters (CPU-based)
+        if filter_str:
+            cmd.extend(['-vf', filter_str])
+
+        # Video encoder
+        cmd.extend(['-c:v', 'libx264'])
+        cmd.extend(encoder_opts)
+
+        # Audio handling
+        if keep_audio and has_audio:
+            cmd.extend(['-c:a', 'aac', '-b:a', '128k', '-strict', 'experimental'])
+        else:
+            cmd.append('-an')
+
+        cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
+        return cmd
+
+    # NVENC encoder options with MAXIMUM THROUGHPUT settings
+    # p1 = fastest preset, ll = low latency, no lookahead, no B-frames
     nvenc_opts = [
-        '-gpu', str(gpu_id),  # Multi-GPU: select specific GPU
-        '-preset', 'p1',  # Fastest NVENC preset for max sessions
-        '-tune', 'hq',
-        '-rc', 'vbr',
-        '-cq', '25',  # Slightly lower quality for speed
+        '-gpu', str(gpu_id),      # Multi-GPU: select specific GPU
+        '-preset', 'p1',          # Fastest NVENC preset (p1-p7)
+        '-tune', 'll',            # Low latency tuning (faster than hq)
+        '-rc', 'vbr',             # Variable bitrate
+        '-cq', '26',              # Slightly relaxed quality for speed
         '-b:v', f'{bitrate}k',
-        '-maxrate', f'{int(bitrate * 1.5)}k',
+        '-maxrate', f'{int(bitrate * 2)}k',  # 2x headroom for peaks
         '-bufsize', f'{bitrate * 2}k',
-        '-rc-lookahead', '4',  # Reduced lookahead for speed
+        '-rc-lookahead', '0',     # Zero lookahead for minimum latency
+        '-bf', '0',               # No B-frames for maximum speed
+        '-spatial-aq', '0',       # Disable spatial AQ for speed
+        '-temporal-aq', '0',      # Disable temporal AQ for speed
     ]
 
-    # libx264 (CPU) encoder options - fallback
+    # libx264 (CPU) encoder options - ultrafast fallback
     libx264_opts = [
-        '-preset', 'fast',
+        '-preset', 'ultrafast',   # Fastest x264 preset
         '-crf', '23',
         '-b:v', f'{bitrate}k',
-        '-maxrate', f'{int(bitrate * 1.5)}k',
+        '-maxrate', f'{int(bitrate * 2)}k',
         '-bufsize', f'{bitrate * 2}k',
         '-pix_fmt', 'yuv420p',
     ]
 
-    # Try NVENC first (GPU-accelerated with hardware decoding)
-    report_progress(0.2, "Encoding with GPU (NVENC)...")
-    cmd = build_ffmpeg_cmd('h264_nvenc', nvenc_opts, use_hwaccel=True)
-    success, stderr_output, returncode = run_ffmpeg(cmd, "NVENC")
+    # Tier 1: Try FULL hardware pipeline (h264_cuvid decoder + NVENC encoder)
+    report_progress(0.2, "Encoding with full GPU pipeline...")
+    cmd = build_ffmpeg_cmd_full_hw(nvenc_opts)
+    success, stderr_output, returncode = run_ffmpeg(cmd, "NVENC-Full")
 
     if not success:
-        print(f"[DEBUG] NVENC failed (code {returncode}), trying CPU fallback...")
-        print(f"[DEBUG] NVENC stderr: {stderr_output}")
+        # Tier 2: Full hardware failed, try simple NVENC (software decode + hardware encode)
+        print(f"[DEBUG] Full GPU pipeline failed (code {returncode}), trying simple NVENC...")
+        print(f"[DEBUG] Full GPU stderr: {stderr_output}")
 
-        # Fallback to CPU encoding (libx264)
-        report_progress(0.25, "GPU failed, encoding with CPU (libx264)...")
-        cmd = build_ffmpeg_cmd('libx264', libx264_opts)
-        success, stderr_output, returncode = run_ffmpeg(cmd, "libx264")
+        report_progress(0.25, "Trying simple NVENC (software decode)...")
+        cmd = build_ffmpeg_cmd_simple_nvenc(nvenc_opts)
+        success, stderr_output, returncode = run_ffmpeg(cmd, "NVENC-Simple")
 
         if not success:
-            print(f"[DEBUG] libx264 also failed (code {returncode})")
-            print(f"[DEBUG] libx264 stderr: {stderr_output}")
+            # Tier 3: NVENC failed entirely, use CPU fallback
+            print(f"[DEBUG] Simple NVENC failed (code {returncode}), trying CPU fallback...")
+            print(f"[DEBUG] Simple NVENC stderr: {stderr_output}")
 
-            # Last resort: try without audio
-            if keep_audio and has_audio:
-                report_progress(0.3, "Trying without audio...")
-                cmd = build_ffmpeg_cmd('libx264', libx264_opts)
-                # Remove audio options and add -an
-                cmd = [c for c in cmd if c not in ['-c:a', 'aac', '-b:a', '128k', '-strict', 'experimental']]
-                # Find and remove the audio codec arguments
-                for i in range(len(cmd) - 1, -1, -1):
-                    if cmd[i] == '-c:a' or cmd[i] == '-b:a':
-                        cmd.pop(i)
-                        if i < len(cmd):
-                            cmd.pop(i)
-                # Add -an if not present
-                if '-an' not in cmd:
-                    insert_idx = cmd.index('-r') if '-r' in cmd else -1
-                    if insert_idx > 0:
-                        cmd.insert(insert_idx, '-an')
-
-                success, stderr_output, returncode = run_ffmpeg(cmd, "libx264-no-audio")
+            report_progress(0.30, "GPU failed, encoding with CPU (libx264)...")
+            cmd = build_ffmpeg_cmd_cpu(libx264_opts)
+            success, stderr_output, returncode = run_ffmpeg(cmd, "libx264")
 
             if not success:
-                raise RuntimeError(f"FFmpeg failed with all encoders (code {returncode}): {stderr_output}")
+                print(f"[DEBUG] libx264 also failed (code {returncode})")
+                print(f"[DEBUG] libx264 stderr: {stderr_output}")
+
+                # Last resort: try without audio
+                if keep_audio and has_audio:
+                    report_progress(0.35, "Trying without audio...")
+                    # Rebuild command without audio
+                    cmd = ['ffmpeg', '-y', '-i', input_path]
+                    if filter_str:
+                        cmd.extend(['-vf', filter_str])
+                    cmd.extend([
+                        '-c:v', 'libx264',
+                        '-preset', 'ultrafast',
+                        '-crf', '23',
+                        '-pix_fmt', 'yuv420p',
+                        '-an',  # No audio
+                        '-r', f'{fps:.1f}',
+                        '-movflags', '+faststart',
+                        output_path
+                    ])
+
+                    success, stderr_output, returncode = run_ffmpeg(cmd, "libx264-no-audio")
+
+                if not success:
+                    raise RuntimeError(f"FFmpeg failed with all encoders (code {returncode}): {stderr_output}")
 
     report_progress(1.0, "Complete")
 

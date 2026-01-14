@@ -2286,8 +2286,11 @@ def handler(job):
     output_url = job_input.get("outputUrl")
     config = job_input.get("config", {})
 
+    # VERSION IDENTIFIER - Change this to verify deployment
+    HANDLER_VERSION = "2026-01-15-v3-video_reframe_enabled"
+
     # DEBUG: Log tool and check video_reframe availability
-    print(f"[Handler] DEBUG: tool='{tool}', process_video_reframe={process_video_reframe is not None}")
+    print(f"[Handler] VERSION={HANDLER_VERSION}, tool='{tool}', process_video_reframe={process_video_reframe is not None}")
 
     # Validate inputs
     if not tool:
@@ -2531,8 +2534,8 @@ def handler(job):
 
         # ==================== UNKNOWN TOOL ====================
         else:
-            print(f"[Handler] DEBUG: Unknown tool path reached, tool='{tool}'")
-            return {"error": f"Unknown tool: {tool}"}
+            print(f"[Handler] DEBUG: Unknown tool path reached, tool='{tool}', version={HANDLER_VERSION}")
+            return {"error": f"Unknown tool: {tool}", "handler_version": HANDLER_VERSION}
 
         # Check if output was created
         if not os.path.exists(output_path):

@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y \
     libxext6 \
     libgl1-mesa-glx \
     libglib2.0-0 \
+    libcairo2-dev \
     && ln -s /usr/bin/python3 /usr/bin/python \
     && rm -rf /var/lib/apt/lists/*
 
@@ -25,6 +26,9 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # Copy handler and tools
 COPY handler.py /handler.py
 COPY tools/ /workspace/tools/
+
+# Copy logo assets for VideoReframe
+COPY assets/ /workspace/assets/
 
 # Copy TikTok fonts for Captioner
 COPY fonts/ /app/fonts/

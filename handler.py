@@ -2286,6 +2286,9 @@ def handler(job):
     output_url = job_input.get("outputUrl")
     config = job_input.get("config", {})
 
+    # DEBUG: Log tool and check video_reframe availability
+    print(f"[Handler] DEBUG: tool='{tool}', process_video_reframe={process_video_reframe is not None}")
+
     # Validate inputs
     if not tool:
         return {"error": "Missing 'tool' parameter"}
@@ -2528,6 +2531,7 @@ def handler(job):
 
         # ==================== UNKNOWN TOOL ====================
         else:
+            print(f"[Handler] DEBUG: Unknown tool path reached, tool='{tool}'")
             return {"error": f"Unknown tool: {tool}"}
 
         # Check if output was created

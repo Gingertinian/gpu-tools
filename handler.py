@@ -1802,6 +1802,13 @@ def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipel
                     if os.path.exists(output_path):
                         next_files.append(output_path)
 
+                elif tool == "video_reframe":
+                    if process_video_reframe is None:
+                        return {"error": "Video Reframe processor not available"}
+                    result = process_video_reframe(current_file, output_path, batch_config, progress_callback=step_callback)
+                    if os.path.exists(output_path):
+                        next_files.append(output_path)
+
                 else:
                     return {"error": f"Unknown tool in pipeline: {tool}"}
 

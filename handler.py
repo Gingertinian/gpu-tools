@@ -2580,3 +2580,5 @@ def handler(job):
 
 # Start the serverless handler
 runpod.serverless.start({"handler": handler})
+
+# Force rebuild 1768419629

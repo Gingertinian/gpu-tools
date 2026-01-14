@@ -511,10 +511,16 @@ def process_videos_parallel(
     output_dir: str,
     config: Dict[str, Any],
     progress_callback: Optional[Callable[[float, str], None]] = None,
-    max_parallel: int = None
+    max_parallel: int = None,
+    variations: int = 1
 ) -> Dict[str, Any]:
     """
     Process multiple videos in parallel using multiple NVENC sessions.
+
+    Supports VARIATIONS: Each input video can generate N unique variations,
+    each with different random transforms (crop, rotation, brightness, etc.)
+
+    Example: 20 videos × 100 variations = 2,000 unique output videos
 
     Uses ThreadPoolExecutor instead of ProcessPoolExecutor because:
     - FFmpeg runs as subprocess and does the actual GPU work
@@ -527,12 +533,16 @@ def process_videos_parallel(
         config: Processing configuration
         progress_callback: Optional progress callback
         max_parallel: Max parallel threads (auto-detected if None)
+        variations: Number of unique variations per input video (default 1)
 
     Returns:
         Dict with results including processed count and any errors
     """
     if not video_paths:
         return {'error': 'No videos to process'}
+
+    # Ensure variations is at least 1
+    variations = max(1, variations)
 
     # Auto-detect parallel limit based on GPU
     gpu_info = get_gpu_info()
@@ -583,26 +593,43 @@ def process_videos_parallel(
     # Assuming ~2 seconds per video with full GPU utilization
     theoretical_throughput = max_parallel / 2.0  # videos per second
 
+    # Calculate total work items (videos × variations)
+    total_outputs = len(video_paths) * variations
+
     print(f"[Parallel Video] ========== MEGA-GPU CONFIGURATION ==========")
     print(f"[Parallel Video] GPU Model: {gpu_info['gpu_name']}")
     print(f"[Parallel Video] GPU Count: {gpu_count} | Sessions/GPU: {sessions_per_gpu}")
     print(f"[Parallel Video] Total NVENC Capacity: {max_parallel} parallel encodes")
     print(f"[Parallel Video] Worker Threads: {max_workers} (1.2x buffer)")
     print(f"[Parallel Video] Theoretical Throughput: ~{theoretical_throughput:.1f} videos/sec")
-    print(f"[Parallel Video] Videos to Process: {len(video_paths)}")
+    print(f"[Parallel Video] Input Videos: {len(video_paths)}")
+    print(f"[Parallel Video] Variations per Video: {variations}")
+    print(f"[Parallel Video] Total Output Videos: {total_outputs}")
     print(f"[Parallel Video] =============================================")
 
     # Initialize NVENC session tracker for load balancing across GPUs
     session_tracker = NVENCSessionTracker(gpu_count, sessions_per_gpu)
 
-    # Prepare work items (GPU assignment will be done dynamically)
+    # Prepare work items: each video × each variation = unique output
+    # Each variation gets a unique work_index for different random transforms
     work_items = []
-    for i, video_path in enumerate(video_paths):
+    for video_idx, video_path in enumerate(video_paths):
         basename = os.path.basename(video_path)
         name, ext = os.path.splitext(basename)
-        output_path = os.path.join(output_dir, f"{name}_spoofed{ext}")
-        # GPU ID will be assigned dynamically via session tracker
-        work_items.append((video_path, output_path, config, i))
+
+        for var_idx in range(variations):
+            # Unique work index ensures different random seed per variation
+            work_index = video_idx * variations + var_idx
+
+            # Output filename includes variation number if variations > 1
+            if variations > 1:
+                output_filename = f"{name}_var{var_idx:04d}{ext}"
+            else:
+                output_filename = f"{name}_spoofed{ext}"
+
+            output_path = os.path.join(output_dir, output_filename)
+            # GPU ID will be assigned dynamically via session tracker
+            work_items.append((video_path, output_path, config, work_index))
 
     total = len(work_items)
     completed = 0
@@ -664,7 +691,9 @@ def process_videos_parallel(
         'parallel_sessions': max_parallel,
         'max_workers': max_workers,
         'gpu_count': gpu_count,
-        'gpu_type': gpu_info['gpu_type']
+        'gpu_type': gpu_info['gpu_type'],
+        'input_videos': len(video_paths),
+        'variations': variations
     }
 
 # Photo defaults (from original)
@@ -1796,19 +1825,25 @@ def process_spoofer(
             video_paths = extract_videos_from_zip(input_path, temp_dir)
 
             if video_paths:
-                # PARALLEL VIDEO PROCESSING MODE
-                report_progress(0.1, f"Found {len(video_paths)} videos, starting parallel processing...")
+                # PARALLEL VIDEO PROCESSING MODE WITH VARIATIONS
+                # Get variations count from config (supports both formats)
+                variations = config.get('variations') or config.get('copies') or config.get('options', {}).get('copies', 1)
+                variations = max(1, int(variations))
+
+                total_outputs = len(video_paths) * variations
+                report_progress(0.1, f"Found {len(video_paths)} videos × {variations} variations = {total_outputs} outputs")
 
                 # Create output directory
                 output_dir = os.path.join(temp_dir, "output")
                 os.makedirs(output_dir, exist_ok=True)
 
-                # Process videos in parallel
+                # Process videos in parallel with variations
                 result = process_videos_parallel(
                     video_paths,
                     output_dir,
                     config,
-                    progress_callback=progress_callback
+                    progress_callback=progress_callback,
+                    variations=variations
                 )
 
                 if result.get('error'):
@@ -1829,9 +1864,12 @@ def process_spoofer(
                 return {
                     'status': 'completed',
                     'mode': 'parallel_video_batch',
+                    'input_videos': result.get('input_videos', len(video_paths)),
+                    'variations': result.get('variations', variations),
                     'videos_processed': result.get('completed', 0),
                     'videos_failed': result.get('failed', 0),
                     'parallel_sessions': result.get('parallel_sessions', 1),
+                    'gpu_count': result.get('gpu_count', 1),
                     'output_size': os.path.getsize(output_path) if os.path.exists(output_path) else 0
                 }
             else:

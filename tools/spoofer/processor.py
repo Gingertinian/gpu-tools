@@ -1931,16 +1931,138 @@ def process_spoofer(
             shutil.rmtree(temp_dir, ignore_errors=True)
             raise
 
+    # Check if batch mode (copies > 1)
+    copies = config.get('copies') or config.get('options', {}).get('copies', 1)
+    output_mode = config.get('outputMode', 'file')
+    output_dir = config.get('outputDir')
+
     if is_video:
-        return process_video(input_path, output_path, config, report_progress)
+        if copies > 1 or output_mode == 'directory':
+            # BATCH VIDEO MODE: Create multiple variations
+            return process_batch_video(input_path, output_path, config, copies, progress_callback)
+        else:
+            return process_video(input_path, output_path, config, report_progress)
     else:
-        # Check if batch mode
-        # Check both config.copies (from workflows) and config.options.copies (from tool view)
-        copies = config.get('copies') or config.get('options', {}).get('copies', 1)
         if copies > 1:
             return process_batch_spoofer(input_path, output_path, config, copies, progress_callback)
         else:
             return process_single_image(input_path, output_path, config, report_progress)
+
+
+def process_batch_video(
+    input_path: str,
+    output_path: str,
+    config: Dict[str, Any],
+    copies: int,
+    progress_callback: Optional[Callable[[float, str], None]] = None
+) -> Dict[str, Any]:
+    """
+    Process video in batch mode - create multiple variations.
+    Uses parallel NVENC sessions for maximum throughput on datacenter GPUs.
+
+    Args:
+        input_path: Path to input video
+        output_path: Output directory path (when outputMode='directory') or base path
+        config: Processing configuration
+        copies: Number of copies/variations to create
+        progress_callback: Progress callback function
+    """
+    import tempfile
+    import shutil
+
+    def report_progress(progress: float, message: str = ""):
+        if progress_callback:
+            progress_callback(progress, message)
+
+    copies = max(1, int(copies))
+    report_progress(0.05, f"Preparing batch video processing ({copies} variations)...")
+
+    # Determine output directory
+    output_mode = config.get('outputMode', 'file')
+    output_dir = config.get('outputDir')
+
+    if output_mode == 'directory' and output_dir:
+        # Pipeline mode: output to specified directory
+        out_dir = output_dir
+    elif os.path.isdir(output_path):
+        # output_path is already a directory
+        out_dir = output_path
+    else:
+        # Create temp directory for outputs
+        out_dir = tempfile.mkdtemp(prefix="video_batch_")
+
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Get base filename for outputs
+    base_name = os.path.splitext(os.path.basename(input_path))[0]
+
+    # Create list of output paths for each variation
+    video_tasks = []
+    for i in range(copies):
+        output_file = os.path.join(out_dir, f"{base_name}_v{i+1}.mp4")
+        # Each copy gets a unique seed for different transforms
+        copy_config = {
+            **config,
+            '_seed': int(time.time() * 1000) + i * 12345,
+            '_copy_index': i
+        }
+        video_tasks.append({
+            'input': input_path,
+            'output': output_file,
+            'config': copy_config
+        })
+
+    report_progress(0.1, f"Processing {copies} video variations in parallel...")
+
+    # Use process_videos_parallel for efficient multi-NVENC processing
+    # Pass the video ONCE with variations=copies to generate unique filenames
+    result = process_videos_parallel(
+        [input_path],  # Single input video
+        out_dir,
+        config,
+        progress_callback=progress_callback,
+        max_parallel=None,  # Auto-detect based on GPU
+        variations=copies  # Create N unique variations
+    )
+
+    if result.get('error'):
+        return result
+
+    # Count successful outputs
+    completed = 0
+    failed = 0
+    output_files = []
+
+    for r in result.get('results', []):
+        if r.get('status') == 'completed' and r.get('output_path'):
+            if os.path.exists(r['output_path']):
+                completed += 1
+                output_files.append(r['output_path'])
+        else:
+            failed += 1
+
+    # If outputMode is 'file' (not directory), create ZIP
+    if output_mode != 'directory' and not os.path.isdir(output_path):
+        report_progress(0.95, "Creating output ZIP...")
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_STORED) as zf:
+            for f in output_files:
+                zf.write(f, os.path.basename(f))
+
+        # Cleanup temp directory
+        if out_dir != output_path and out_dir.startswith(tempfile.gettempdir()):
+            shutil.rmtree(out_dir, ignore_errors=True)
+
+    report_progress(1.0, "Complete")
+
+    return {
+        'status': 'completed',
+        'mode': 'batch_video',
+        'copies_requested': copies,
+        'videos_processed': completed,
+        'videos_failed': failed,
+        'output_files': output_files,
+        'output_dir': out_dir if output_mode == 'directory' else None
+    }
 
 
 def process_single_image(

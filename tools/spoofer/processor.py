@@ -831,31 +831,35 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
             angle_deg = py_rng.uniform(-spatial['rotation'], spatial['rotation'])
             angle_rad = angle_deg * math.pi / 180
 
-            # Calculate zoom factor to compensate for black borders after rotation
-            # Formula: zoom = 1 / cos(|angle|) ensures no black borders appear
+            # Calculate zoom factor to eliminate black borders after rotation
+            # Uses the inscribed rectangle formula based on aspect ratio
             abs_angle = abs(angle_rad)
-            cos_angle = math.cos(abs_angle)
+            cos_a = math.cos(abs_angle)
+            sin_a = math.sin(abs_angle)
 
-            if cos_angle > 0.001:
-                # Zoom to eliminate black borders
-                zoom_factor = 1.0 / cos_angle
-                # Clamp zoom to reasonable range (1.0 to 1.5)
-                zoom_factor = max(1.0, min(zoom_factor, 1.5))
+            if sin_a > 0.001:
+                # Zoom factor = inverse of inscribed rectangle scale
+                # This ensures we scale up enough to crop away black corners
+                zoom_w = cos_a + sin_a * (original_height / original_width)
+                zoom_h = cos_a + sin_a * (original_width / original_height)
+                zoom_factor = max(zoom_w, zoom_h)
+                zoom_factor = max(1.0, min(zoom_factor, 2.0))
 
-                # Rotate with enlarged output dimensions, then scale back to original
-                # This crops out the black borders while maintaining original resolution
-                new_w = int(original_width * zoom_factor)
-                new_h = int(original_height * zoom_factor)
+                # Scale up first, rotate, then crop to original dimensions
+                # This removes black corners completely
+                scaled_w = int(original_width * zoom_factor)
+                scaled_h = int(original_height * zoom_factor)
                 # Ensure even dimensions for video encoding
-                new_w = new_w + (new_w % 2)
-                new_h = new_h + (new_h % 2)
+                scaled_w = scaled_w + (scaled_w % 2)
+                scaled_h = scaled_h + (scaled_h % 2)
 
-                # Apply rotation with zoom, then scale back to original dimensions
-                filters.append(f"rotate={angle_rad}:ow={new_w}:oh={new_h}:fillcolor=black")
-                filters.append(f"scale={original_width}:{original_height}:flags=lanczos")
-            else:
-                # Fallback for very small angles (shouldn't happen with typical rotation values)
+                # Pipeline: scale up → rotate → crop center
+                filters.append(f"scale={scaled_w}:{scaled_h}:flags=lanczos")
                 filters.append(f"rotate={angle_rad}:fillcolor=black")
+                filters.append(f"crop={original_width}:{original_height}")
+            else:
+                # Nearly zero rotation - skip
+                pass
 
         # Tonal filters
         eq_params = []
@@ -2908,8 +2912,29 @@ def process_video(
         filters.append(f"crop={crop_w}:{crop_h}")
 
     if spatial.get('rotation', 0) > 0:
-        angle = py_rng.uniform(-spatial['rotation'], spatial['rotation']) * math.pi / 180
-        filters.append(f"rotate={angle}:fillcolor=black")
+        angle_deg = py_rng.uniform(-spatial['rotation'], spatial['rotation'])
+        angle_rad = angle_deg * math.pi / 180
+
+        # Calculate zoom factor to eliminate black borders
+        abs_angle = abs(angle_rad)
+        cos_a = math.cos(abs_angle)
+        sin_a = math.sin(abs_angle)
+
+        if sin_a > 0.001:
+            zoom_w = cos_a + sin_a * (original_height / original_width)
+            zoom_h = cos_a + sin_a * (original_width / original_height)
+            zoom_factor = max(zoom_w, zoom_h)
+            zoom_factor = max(1.0, min(zoom_factor, 2.0))
+
+            scaled_w = int(original_width * zoom_factor)
+            scaled_h = int(original_height * zoom_factor)
+            scaled_w = scaled_w + (scaled_w % 2)
+            scaled_h = scaled_h + (scaled_h % 2)
+
+            # Pipeline: scale up → rotate → crop center
+            filters.append(f"scale={scaled_w}:{scaled_h}:flags=lanczos")
+            filters.append(f"rotate={angle_rad}:fillcolor=black")
+            filters.append(f"crop={original_width}:{original_height}")
 
     # Tonal filters (eq filter)
     eq_params = []

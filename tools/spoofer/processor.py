@@ -490,8 +490,73 @@ def _create_spoofer_blur_zone(
     return blur_section
 
 
+def _svg_to_cv2(svg_path: str, target_width: int):
+    """
+    Convert SVG to CV2 BGRA image.
+    Tries multiple methods: cairosvg, svglib, or fallback to placeholder.
+    """
+    # Method 1: Try cairosvg (best quality, available on RunPod)
+    try:
+        import cairosvg
+        import io
+        from PIL import Image
+        # Render SVG to PNG at target size
+        png_data = cairosvg.svg2png(url=svg_path, output_width=target_width * 2)
+        pil_img = Image.open(io.BytesIO(png_data)).convert('RGBA')
+        # Convert PIL RGBA to CV2 BGRA
+        img_array = np.array(pil_img)
+        return cv2.cvtColor(img_array, cv2.COLOR_RGBA2BGRA)
+    except Exception as e:
+        print(f"[Spoofer] cairosvg failed: {e}")
+
+    # Method 2: Try svglib + reportlab
+    try:
+        from svglib.svglib import svg2rlg
+        from reportlab.graphics import renderPM
+        import io
+        from PIL import Image
+        drawing = svg2rlg(svg_path)
+        if drawing:
+            scale = (target_width * 2) / drawing.width
+            drawing.width *= scale
+            drawing.height *= scale
+            drawing.scale(scale, scale)
+            png_data = io.BytesIO()
+            renderPM.drawToFile(drawing, png_data, fmt='PNG')
+            png_data.seek(0)
+            pil_img = Image.open(png_data).convert('RGBA')
+            img_array = np.array(pil_img)
+            return cv2.cvtColor(img_array, cv2.COLOR_RGBA2BGRA)
+    except Exception as e:
+        print(f"[Spoofer] svglib failed: {e}")
+
+    # Method 3: Fallback - create a placeholder logo
+    print(f"[Spoofer] Using placeholder logo (SVG conversion not available)")
+    from PIL import Image, ImageDraw, ImageFont
+
+    logo_h = int(target_width * 0.3)
+    logo = Image.new('RGBA', (target_width, logo_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(logo)
+
+    try:
+        font = ImageFont.truetype("arial.ttf", logo_h // 2)
+    except:
+        font = ImageFont.load_default()
+
+    text = "FARMIUM"
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    x = (target_width - text_w) // 2
+    y = (logo_h - text_h) // 2
+    draw.text((x, y), text, fill=(255, 255, 255, 230), font=font)
+
+    img_array = np.array(logo)
+    return cv2.cvtColor(img_array, cv2.COLOR_RGBA2BGRA)
+
+
 def _prepare_spoofer_logo(logo_name: str, video_width: int, size_percent: float):
-    """Prepare logo for overlay."""
+    """Prepare logo for overlay. Supports PNG and SVG."""
     try:
         script_dir = Path(__file__).parent.resolve()
         search_paths = [
@@ -502,26 +567,45 @@ def _prepare_spoofer_logo(logo_name: str, video_width: int, size_percent: float)
         ]
 
         logo_source = None
+        is_svg = False
+
         if logo_name in ['farmium_icon', 'farmium_full']:
             for search_path in search_paths:
+                # Try PNG first
                 png_path = search_path / f'{logo_name}.png'
                 if png_path.exists():
                     logo_source = str(png_path)
+                    print(f"[Spoofer] Found PNG logo: {logo_source}")
+                    break
+                # Try SVG fallback
+                svg_path = search_path / f'{logo_name}.svg'
+                if svg_path.exists():
+                    logo_source = str(svg_path)
+                    is_svg = True
+                    print(f"[Spoofer] Found SVG logo: {logo_source}")
                     break
 
         if not logo_source:
             print(f"[Spoofer] Logo not found: {logo_name}")
             return None
 
-        # Load logo
-        logo_img = cv2.imread(logo_source, cv2.IMREAD_UNCHANGED)
-        if logo_img is None:
-            return None
+        target_width = max(int(video_width * size_percent / 100), 80)
 
-        # Resize
-        logo_w = max(int(video_width * size_percent / 100), 80)
+        # Load logo (PNG or convert SVG)
+        if is_svg:
+            logo_img = _svg_to_cv2(logo_source, target_width)
+            if logo_img is None:
+                return None
+        else:
+            logo_img = cv2.imread(logo_source, cv2.IMREAD_UNCHANGED)
+            if logo_img is None:
+                return None
+
+        # Resize if needed
+        logo_w = target_width
         logo_h = int(logo_w * logo_img.shape[0] / logo_img.shape[1])
-        logo_img = cv2.resize(logo_img, (logo_w, logo_h), interpolation=cv2.INTER_LANCZOS4)
+        if logo_img.shape[1] != logo_w:
+            logo_img = cv2.resize(logo_img, (logo_w, logo_h), interpolation=cv2.INTER_LANCZOS4)
 
         # Split alpha
         if logo_img.shape[2] == 4:
@@ -538,6 +622,8 @@ def _prepare_spoofer_logo(logo_name: str, video_width: int, size_percent: float)
         }
     except Exception as e:
         print(f"[Spoofer] Error preparing logo: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 

@@ -1,19 +1,18 @@
 """
-Video Reframe Processor - Frame-by-Frame with Animated Blur Zones
+Video/Image Reframe Processor - GPU-Accelerated with CuPy
 
-Converts any aspect ratio video to vertical (9:16) with blur zones on TOP and BOTTOM.
+Converts any aspect ratio video OR IMAGE to vertical (9:16) with blur zones on TOP and BOTTOM.
 
 Key features:
-1. Video content stays CENTERED, scaled to fill the WIDTH
-2. Blur zones on TOP and BOTTOM (not left/right)
-3. Blur is generated FROM the video content itself
-4. Blur ANIMATES - updates every ~20 frames with different random parameters
-5. Optional logo overlay
-
-For 9:16 output (1080x1920):
-- Video content fills width (1080px)
-- Height is scaled proportionally
-- Blur fills the gaps above and below the video
+1. FULL GPU PROCESSING with CuPy (when available)
+2. Supports both VIDEO and IMAGE inputs
+3. Image input → Image output (JPG/PNG)
+4. Video input → Video output (MP4)
+5. Video content stays CENTERED, scaled to fill the WIDTH
+6. Blur zones on TOP and BOTTOM (not left/right)
+7. Blur is generated FROM the content itself
+8. Blur ANIMATES (for videos) - updates every ~20 frames
+9. Optional logo overlay
 """
 
 import os
@@ -26,7 +25,26 @@ import shutil
 import cv2
 import numpy as np
 from pathlib import Path
-from typing import Optional, Callable, Dict, Any, List
+from typing import Optional, Callable, Dict, Any, List, Union
+
+# Import GPU operations module
+try:
+    from .gpu_ops import (
+        GPUProcessor, GPUBlurEffects, get_gpu_processor,
+        is_gpu_available, HAS_CUPY
+    )
+except ImportError:
+    try:
+        from gpu_ops import (
+            GPUProcessor, GPUBlurEffects, get_gpu_processor,
+            is_gpu_available, HAS_CUPY
+        )
+    except ImportError:
+        HAS_CUPY = False
+        GPUProcessor = None
+        GPUBlurEffects = None
+        get_gpu_processor = None
+        is_gpu_available = lambda: False
 
 # Import GPU utilities
 try:
@@ -52,33 +70,62 @@ except ImportError:
 
 
 # =============================================================================
-# BLUR EFFECTS CLASS
+# MEDIA TYPE DETECTION
+# =============================================================================
+
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'}
+VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v', '.wmv', '.flv'}
+
+
+def is_image_file(path: str) -> bool:
+    """Check if file is an image based on extension."""
+    return Path(path).suffix.lower() in IMAGE_EXTENSIONS
+
+
+def is_video_file(path: str) -> bool:
+    """Check if file is a video based on extension."""
+    return Path(path).suffix.lower() in VIDEO_EXTENSIONS
+
+
+def get_output_extension(input_path: str, output_path: str) -> str:
+    """Determine appropriate output extension."""
+    input_ext = Path(input_path).suffix.lower()
+    output_ext = Path(output_path).suffix.lower()
+
+    # If input is image, output should be image
+    if input_ext in IMAGE_EXTENSIONS:
+        if output_ext in IMAGE_EXTENSIONS:
+            return output_ext
+        return '.jpg'  # Default image format
+
+    # If input is video, output should be video
+    return output_ext if output_ext in VIDEO_EXTENSIONS else '.mp4'
+
+
+# =============================================================================
+# CPU FALLBACK BLUR EFFECTS
 # =============================================================================
 
 class BlurEffects:
-    """Optimized blur and visual effects for video processing."""
+    """CPU-based blur effects (fallback when GPU not available)."""
 
     @staticmethod
     def gaussian_blur(image: np.ndarray, strength: int = 25) -> np.ndarray:
-        """Apply Gaussian blur with specified strength."""
         if strength <= 0:
             return image
-        k = int(strength) | 1  # Ensure odd kernel size
+        k = int(strength) | 1
         return cv2.GaussianBlur(image, (k, k), 0)
 
     @staticmethod
     def flip_vertical(image: np.ndarray) -> np.ndarray:
-        """Flip image vertically (mirror effect)."""
         return cv2.flip(image, 0)
 
     @staticmethod
     def flip_horizontal(image: np.ndarray) -> np.ndarray:
-        """Flip image horizontally."""
         return cv2.flip(image, 1)
 
     @staticmethod
     def color_shift(image: np.ndarray, hue_shift: int) -> np.ndarray:
-        """Shift hue values in image."""
         if hue_shift == 0:
             return image
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
@@ -87,7 +134,6 @@ class BlurEffects:
 
     @staticmethod
     def adjust_saturation_brightness(image: np.ndarray, saturation: float = 1.0, brightness: float = 1.0) -> np.ndarray:
-        """Adjust saturation and brightness."""
         if saturation == 1.0 and brightness == 1.0:
             return image
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
@@ -98,16 +144,7 @@ class BlurEffects:
         return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
     @staticmethod
-    def add_noise(image: np.ndarray, intensity: int) -> np.ndarray:
-        """Add random noise to image."""
-        if intensity <= 0:
-            return image
-        noise = np.random.randint(-intensity, intensity + 1, image.shape, dtype=np.int16)
-        return np.clip(image.astype(np.int16) + noise, 0, 255).astype(np.uint8)
-
-    @staticmethod
     def tilt(image: np.ndarray, angle: float, rotation_matrix: np.ndarray = None) -> np.ndarray:
-        """Apply rotation/tilt to image."""
         if angle == 0:
             return image
         h, w = image.shape[:2]
@@ -118,21 +155,19 @@ class BlurEffects:
 
     @staticmethod
     def adjust_contrast(image: np.ndarray, contrast: float) -> np.ndarray:
-        """Adjust image contrast."""
         if contrast == 1.0:
             return image
         return cv2.convertScaleAbs(image, alpha=contrast, beta=(1 - contrast) * 128)
 
     @staticmethod
     def darken(image: np.ndarray, factor: float = 0.7) -> np.ndarray:
-        """Darken image by a factor."""
         if factor >= 1.0:
             return image
         return (image.astype(np.float32) * factor).astype(np.uint8)
 
 
 # =============================================================================
-# MAIN PROCESSOR
+# UNIFIED PROCESSOR (GPU + IMAGE SUPPORT)
 # =============================================================================
 
 def process_video_reframe(
@@ -144,32 +179,189 @@ def process_video_reframe(
     video_index: int = 0
 ) -> dict:
     """
-    Convert any video to vertical format with blur zones on TOP and BOTTOM.
+    Convert any video OR IMAGE to vertical format with blur zones on TOP and BOTTOM.
 
-    The video content is centered and fills the WIDTH. Blur zones fill the
-    vertical gaps above and below the video content.
+    Automatically detects if input is image or video:
+    - IMAGE input → IMAGE output (JPG/PNG)
+    - VIDEO input → VIDEO output (MP4)
 
     Args:
-        input_path: Path to input video file
-        output_path: Path to output video file
+        input_path: Path to input video or image file
+        output_path: Path to output file
         config: Configuration dict with:
             - aspectRatio: Target aspect ratio as string '9:16', '4:5', '1:1', '16:9'
             - logoName: 'farmium_icon' | 'farmium_full' | 'none' | URL
             - logoSize: Logo size as percentage (default: 15)
             - blurIntensity: Blur strength 1-100 (default: 25)
+            - forceBlur: Force blur % for same-aspect-ratio (e.g., 25 = 25% top + 25% bottom)
             - brightness: Brightness adjustment -50 to 50 (default: 0)
             - saturation: Saturation adjustment -100 to 100 (default: 0)
             - contrast: Contrast adjustment -50 to 50 (default: 0)
             - blurUpdateInterval: Frames between blur updates (default: 20)
         progress_callback: Optional callback(progress: float, message: str)
-        gpu_id: GPU device ID (used for encoder selection)
-        video_index: Index of video in batch (for random seed)
+        gpu_id: GPU device ID
+        video_index: Index in batch (for random seed)
 
     Returns:
-        dict with status, outputPath, dimensions, etc.
+        dict with status, outputPath, dimensions, type ('image' or 'video'), etc.
     """
     input_path = Path(input_path)
     output_path = Path(output_path)
+
+    # Detect input type
+    if is_image_file(str(input_path)):
+        return _process_image_reframe(
+            input_path, output_path, config, progress_callback, gpu_id, video_index
+        )
+    else:
+        return _process_video_reframe(
+            input_path, output_path, config, progress_callback, gpu_id, video_index
+        )
+
+
+def _process_image_reframe(
+    input_path: Path,
+    output_path: Path,
+    config: dict,
+    progress_callback: Optional[Callable] = None,
+    gpu_id: int = 0,
+    video_index: int = 0
+) -> dict:
+    """
+    Process a single IMAGE with reframe (GPU-accelerated).
+
+    Output is an IMAGE file (JPG/PNG), not a video.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if progress_callback:
+        progress_callback(0.05, "Loading image...")
+
+    # Read image
+    image = cv2.imread(str(input_path), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError(f"Could not read image: {input_path}")
+
+    orig_h, orig_w = image.shape[:2]
+    print(f"[ImageReframe] Input: {orig_w}x{orig_h}")
+
+    # Parse config
+    aspect_raw = config.get('aspectRatio', '9:16')
+    if isinstance(aspect_raw, (list, tuple)) and len(aspect_raw) == 2:
+        aspect_str = f"{aspect_raw[0]}:{aspect_raw[1]}"
+    else:
+        aspect_str = str(aspect_raw) if aspect_raw else '9:16'
+
+    logo_name = config.get('logoName', 'farmium_full')
+    logo_size = config.get('logoSize', 15)
+    blur_intensity = config.get('blurIntensity', 25)
+    brightness_adj = config.get('brightness', 0)
+    saturation_adj = config.get('saturation', 0)
+    contrast_adj = config.get('contrast', 0)
+    force_blur_percent = config.get('forceBlur', 0)
+
+    # Calculate output dimensions
+    final_w, final_h = _get_output_dimensions(aspect_str)
+    print(f"[ImageReframe] Output: {final_w}x{final_h} (aspect: {aspect_str})")
+
+    # Calculate layout
+    layout = _calculate_layout(orig_w, orig_h, final_w, final_h, force_blur_percent)
+
+    print(f"[ImageReframe] Layout: content={layout['scaled_w']}x{layout['scaled_h']}, "
+          f"blur_top={layout['blur_top']}px, blur_bottom={layout['blur_bottom']}px")
+
+    if progress_callback:
+        progress_callback(0.15, "Initializing GPU...")
+
+    # Initialize GPU processor
+    use_gpu = is_gpu_available() and HAS_CUPY
+    if use_gpu:
+        gpu = get_gpu_processor(gpu_id)
+        effects = GPUBlurEffects(gpu)
+        print(f"[ImageReframe] Using GPU acceleration (device {gpu_id})")
+    else:
+        gpu = None
+        effects = BlurEffects()
+        print("[ImageReframe] Using CPU processing")
+
+    if progress_callback:
+        progress_callback(0.20, "Processing image...")
+
+    # Prepare logo
+    logo_data = None
+    if logo_name and logo_name != 'none':
+        logo_data = _prepare_logo(logo_name, final_w, logo_size)
+
+    # Random generator
+    rng = random.Random(video_index + 42)
+    blur_params = _generate_blur_params(rng)
+
+    # Process image
+    if use_gpu:
+        output_frame = _process_frame_gpu(
+            gpu, effects, image, layout, final_w, final_h,
+            blur_intensity, blur_params,
+            brightness_adj, saturation_adj, contrast_adj,
+            logo_data
+        )
+    else:
+        output_frame = _process_frame_cpu(
+            effects, image, layout, final_w, final_h,
+            blur_intensity, blur_params,
+            brightness_adj, saturation_adj, contrast_adj,
+            logo_data
+        )
+
+    if progress_callback:
+        progress_callback(0.80, "Saving image...")
+
+    # Determine output format and quality
+    output_ext = output_path.suffix.lower()
+    if output_ext not in IMAGE_EXTENSIONS:
+        # Force image extension
+        output_path = output_path.with_suffix('.jpg')
+        output_ext = '.jpg'
+
+    # Save image with appropriate quality
+    if output_ext in ['.jpg', '.jpeg']:
+        quality = config.get('quality', 95)
+        cv2.imwrite(str(output_path), output_frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    elif output_ext == '.png':
+        compression = config.get('compression', 3)  # 0-9, lower = faster
+        cv2.imwrite(str(output_path), output_frame, [cv2.IMWRITE_PNG_COMPRESSION, compression])
+    elif output_ext == '.webp':
+        quality = config.get('quality', 95)
+        cv2.imwrite(str(output_path), output_frame, [cv2.IMWRITE_WEBP_QUALITY, quality])
+    else:
+        cv2.imwrite(str(output_path), output_frame)
+
+    if progress_callback:
+        progress_callback(1.0, "Complete")
+
+    output_size = os.path.getsize(output_path) if output_path.exists() else 0
+
+    return {
+        "status": "completed",
+        "type": "image",
+        "outputPath": str(output_path),
+        "outputSize": output_size,
+        "dimensions": f"{final_w}x{final_h}",
+        "inputDimensions": f"{orig_w}x{orig_h}",
+        "processor": "GPU" if use_gpu else "CPU"
+    }
+
+
+def _process_video_reframe(
+    input_path: Path,
+    output_path: Path,
+    config: dict,
+    progress_callback: Optional[Callable] = None,
+    gpu_id: int = 0,
+    video_index: int = 0
+) -> dict:
+    """
+    Process a VIDEO with reframe (GPU-accelerated).
+    """
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if progress_callback:
@@ -205,20 +397,32 @@ def process_video_reframe(
     brightness_adj = config.get('brightness', 0)
     saturation_adj = config.get('saturation', 0)
     contrast_adj = config.get('contrast', 0)
-    blur_update_interval = config.get('blurUpdateInterval', 20)  # Update blur every N frames
+    blur_update_interval = config.get('blurUpdateInterval', 20)
+    force_blur_percent = config.get('forceBlur', 0)
 
     # Calculate output dimensions
     final_w, final_h = _get_output_dimensions(aspect_str)
     print(f"[VideoReframe] Output: {final_w}x{final_h} (aspect: {aspect_str})")
 
-    # Calculate layout - content fills WIDTH, blur on TOP/BOTTOM
-    layout = _calculate_layout(orig_w, orig_h, final_w, final_h)
+    # Calculate layout
+    layout = _calculate_layout(orig_w, orig_h, final_w, final_h, force_blur_percent)
 
     print(f"[VideoReframe] Layout: content={layout['scaled_w']}x{layout['scaled_h']}, "
           f"blur_top={layout['blur_top']}px, blur_bottom={layout['blur_bottom']}px")
 
     if progress_callback:
         progress_callback(0.10, "Preparing processing pipeline...")
+
+    # Initialize GPU processor
+    use_gpu = is_gpu_available() and HAS_CUPY
+    if use_gpu:
+        gpu = get_gpu_processor(gpu_id)
+        effects = GPUBlurEffects(gpu)
+        print(f"[VideoReframe] Using GPU acceleration (device {gpu_id})")
+    else:
+        gpu = None
+        effects = BlurEffects()
+        print("[VideoReframe] Using CPU processing")
 
     # Prepare logo
     logo_data = None
@@ -227,13 +431,8 @@ def process_video_reframe(
         if logo_data:
             print(f"[VideoReframe] Logo prepared: {logo_data['image'].shape[1]}x{logo_data['image'].shape[0]}")
 
-    # Initialize blur effects
-    effects = BlurEffects()
-
     # Random generator with seed for reproducibility
     rng = random.Random(video_index + 42)
-
-    # Generate initial blur parameters
     blur_params = _generate_blur_params(rng)
 
     # Start FFmpeg process for output
@@ -249,11 +448,11 @@ def process_video_reframe(
     # Pre-allocate output frame buffer
     output_frame = np.zeros((final_h, final_w, 3), dtype=np.uint8)
 
-    # Blur cache (only used between blur updates)
+    # Blur cache
     cache_blur_top = None
     cache_blur_bottom = None
 
-    # Extract layout values
+    # Layout values
     scaled_w = layout['scaled_w']
     scaled_h = layout['scaled_h']
     content_x = layout['content_x']
@@ -261,12 +460,8 @@ def process_video_reframe(
     blur_top_h = layout['blur_top']
     blur_bottom_h = layout['blur_bottom']
 
-    # Pre-compute rotation matrices if tilt is used
-    rot_matrix_top = None
-    rot_matrix_bottom = None
-
     frame_idx = 0
-    encoder_used = 'NVENC'  # Will be updated if fallback
+    encoder_used = 'NVENC' if use_gpu else 'CPU'
 
     try:
         while True:
@@ -274,52 +469,77 @@ def process_video_reframe(
             if not ret:
                 break
 
-            # Check if we need to update blur (every blur_update_interval frames)
+            # Check if we need to update blur
             update_blur = (frame_idx % blur_update_interval == 0)
 
             if update_blur:
-                # Generate new random parameters for animated blur effect
                 blur_params = _generate_blur_params(rng)
 
-                # Update rotation matrices
-                if blur_params['tilt_angle'] != 0:
-                    if blur_top_h > 0:
-                        center_top = (final_w // 2, blur_top_h // 2)
-                        rot_matrix_top = cv2.getRotationMatrix2D(center_top, blur_params['tilt_angle'], 1.0)
-                    if blur_bottom_h > 0:
-                        center_bottom = (final_w // 2, blur_bottom_h // 2)
-                        rot_matrix_bottom = cv2.getRotationMatrix2D(center_bottom, -blur_params['tilt_angle'], 1.0)
-                else:
-                    rot_matrix_top = None
-                    rot_matrix_bottom = None
+            # Process frame
+            if use_gpu:
+                # Transfer frame to GPU
+                gpu_frame = gpu.to_gpu(frame)
 
-            # Scale content to fit width
-            content = cv2.resize(frame, (scaled_w, scaled_h), interpolation=cv2.INTER_LANCZOS4)
+                # Resize content on GPU
+                content = gpu.resize(gpu_frame, (scaled_w, scaled_h), interpolation='cubic')
 
-            # Apply color adjustments to content if specified
-            if brightness_adj != 0 or contrast_adj != 0 or saturation_adj != 0:
-                content = _apply_color_adjustments(content, brightness_adj, saturation_adj, contrast_adj)
+                # Apply color adjustments on GPU
+                if brightness_adj != 0 or saturation_adj != 0:
+                    br_mult = 1.0 + (brightness_adj / 100.0)
+                    sat_mult = 1.0 + (saturation_adj / 100.0)
+                    content = effects.adjust_saturation_brightness(content, sat_mult, br_mult)
 
-            # Generate blur zones FROM the video content
-            if blur_top_h > 0:
-                if update_blur or cache_blur_top is None:
-                    cache_blur_top = _create_blur_zone(
-                        effects, content, final_w, blur_top_h, 'top',
-                        blur_intensity, blur_params, rot_matrix_top
-                    )
-                output_frame[0:blur_top_h, :] = cache_blur_top
+                if contrast_adj != 0:
+                    ct_mult = 1.0 + (contrast_adj / 100.0)
+                    content = effects.adjust_contrast(content, ct_mult)
 
-            # Place main content in center
-            output_frame[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content
+                # Convert content back to CPU for blur zone creation and output
+                content_cpu = gpu.to_cpu(content)
 
-            # Bottom blur zone
-            if blur_bottom_h > 0:
-                if update_blur or cache_blur_bottom is None:
-                    cache_blur_bottom = _create_blur_zone(
-                        effects, content, final_w, blur_bottom_h, 'bottom',
-                        blur_intensity, blur_params, rot_matrix_bottom
-                    )
-                output_frame[content_y + scaled_h:, :] = cache_blur_bottom
+                # Generate blur zones
+                if blur_top_h > 0:
+                    if update_blur or cache_blur_top is None:
+                        cache_blur_top = _create_blur_zone_gpu(
+                            gpu, effects, content_cpu, final_w, blur_top_h, 'top',
+                            blur_intensity, blur_params
+                        )
+                    output_frame[0:blur_top_h, :] = cache_blur_top
+
+                # Place content
+                output_frame[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content_cpu
+
+                # Bottom blur zone
+                if blur_bottom_h > 0:
+                    if update_blur or cache_blur_bottom is None:
+                        cache_blur_bottom = _create_blur_zone_gpu(
+                            gpu, effects, content_cpu, final_w, blur_bottom_h, 'bottom',
+                            blur_intensity, blur_params
+                        )
+                    output_frame[content_y + scaled_h:, :] = cache_blur_bottom
+            else:
+                # CPU processing
+                content = cv2.resize(frame, (scaled_w, scaled_h), interpolation=cv2.INTER_LANCZOS4)
+
+                if brightness_adj != 0 or contrast_adj != 0 or saturation_adj != 0:
+                    content = _apply_color_adjustments(content, brightness_adj, saturation_adj, contrast_adj)
+
+                if blur_top_h > 0:
+                    if update_blur or cache_blur_top is None:
+                        cache_blur_top = _create_blur_zone_cpu(
+                            effects, content, final_w, blur_top_h, 'top',
+                            blur_intensity, blur_params
+                        )
+                    output_frame[0:blur_top_h, :] = cache_blur_top
+
+                output_frame[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content
+
+                if blur_bottom_h > 0:
+                    if update_blur or cache_blur_bottom is None:
+                        cache_blur_bottom = _create_blur_zone_cpu(
+                            effects, content, final_w, blur_bottom_h, 'bottom',
+                            blur_intensity, blur_params
+                        )
+                    output_frame[content_y + scaled_h:, :] = cache_blur_bottom
 
             # Apply logo overlay
             if logo_data is not None:
@@ -344,6 +564,10 @@ def process_video_reframe(
         ffmpeg_process.stdin.close()
         ffmpeg_process.wait()
 
+        # Free GPU memory
+        if use_gpu:
+            gpu.free_memory()
+
     if progress_callback:
         progress_callback(1.0, "Complete")
 
@@ -351,15 +575,309 @@ def process_video_reframe(
 
     return {
         "status": "completed",
+        "type": "video",
         "outputPath": str(output_path),
         "outputSize": output_size,
         "dimensions": f"{final_w}x{final_h}",
         "encoder": encoder_used,
+        "processor": "GPU" if use_gpu else "CPU",
         "fps": fps,
         "duration": duration,
         "framesProcessed": frame_idx
     }
 
+
+# =============================================================================
+# FRAME PROCESSING HELPERS
+# =============================================================================
+
+def _process_frame_gpu(
+    gpu: 'GPUProcessor',
+    effects: 'GPUBlurEffects',
+    frame: np.ndarray,
+    layout: dict,
+    final_w: int,
+    final_h: int,
+    blur_intensity: int,
+    blur_params: dict,
+    brightness_adj: int,
+    saturation_adj: int,
+    contrast_adj: int,
+    logo_data: Optional[dict]
+) -> np.ndarray:
+    """Process a single frame using GPU."""
+    scaled_w = layout['scaled_w']
+    scaled_h = layout['scaled_h']
+    content_x = layout['content_x']
+    content_y = layout['content_y']
+    blur_top_h = layout['blur_top']
+    blur_bottom_h = layout['blur_bottom']
+
+    # Allocate output
+    output_frame = np.zeros((final_h, final_w, 3), dtype=np.uint8)
+
+    # Transfer frame to GPU
+    gpu_frame = gpu.to_gpu(frame)
+
+    # Resize content on GPU
+    content = gpu.resize(gpu_frame, (scaled_w, scaled_h), interpolation='cubic')
+
+    # Apply color adjustments on GPU
+    if brightness_adj != 0 or saturation_adj != 0:
+        br_mult = 1.0 + (brightness_adj / 100.0)
+        sat_mult = 1.0 + (saturation_adj / 100.0)
+        content = effects.adjust_saturation_brightness(content, sat_mult, br_mult)
+
+    if contrast_adj != 0:
+        ct_mult = 1.0 + (contrast_adj / 100.0)
+        content = effects.adjust_contrast(content, ct_mult)
+
+    # Convert to CPU for final composition
+    content_cpu = gpu.to_cpu(content)
+
+    # Generate blur zones
+    if blur_top_h > 0:
+        blur_top = _create_blur_zone_gpu(
+            gpu, effects, content_cpu, final_w, blur_top_h, 'top',
+            blur_intensity, blur_params
+        )
+        output_frame[0:blur_top_h, :] = blur_top
+
+    # Place content
+    output_frame[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content_cpu
+
+    # Bottom blur zone
+    if blur_bottom_h > 0:
+        blur_bottom = _create_blur_zone_gpu(
+            gpu, effects, content_cpu, final_w, blur_bottom_h, 'bottom',
+            blur_intensity, blur_params
+        )
+        output_frame[content_y + scaled_h:, :] = blur_bottom
+
+    # Apply logo
+    if logo_data is not None:
+        _apply_logo(output_frame, logo_data, final_w, final_h)
+
+    return output_frame
+
+
+def _process_frame_cpu(
+    effects: BlurEffects,
+    frame: np.ndarray,
+    layout: dict,
+    final_w: int,
+    final_h: int,
+    blur_intensity: int,
+    blur_params: dict,
+    brightness_adj: int,
+    saturation_adj: int,
+    contrast_adj: int,
+    logo_data: Optional[dict]
+) -> np.ndarray:
+    """Process a single frame using CPU."""
+    scaled_w = layout['scaled_w']
+    scaled_h = layout['scaled_h']
+    content_x = layout['content_x']
+    content_y = layout['content_y']
+    blur_top_h = layout['blur_top']
+    blur_bottom_h = layout['blur_bottom']
+
+    # Allocate output
+    output_frame = np.zeros((final_h, final_w, 3), dtype=np.uint8)
+
+    # Resize content
+    content = cv2.resize(frame, (scaled_w, scaled_h), interpolation=cv2.INTER_LANCZOS4)
+
+    # Apply color adjustments
+    if brightness_adj != 0 or contrast_adj != 0 or saturation_adj != 0:
+        content = _apply_color_adjustments(content, brightness_adj, saturation_adj, contrast_adj)
+
+    # Generate blur zones
+    if blur_top_h > 0:
+        blur_top = _create_blur_zone_cpu(
+            effects, content, final_w, blur_top_h, 'top',
+            blur_intensity, blur_params
+        )
+        output_frame[0:blur_top_h, :] = blur_top
+
+    # Place content
+    output_frame[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content
+
+    # Bottom blur zone
+    if blur_bottom_h > 0:
+        blur_bottom = _create_blur_zone_cpu(
+            effects, content, final_w, blur_bottom_h, 'bottom',
+            blur_intensity, blur_params
+        )
+        output_frame[content_y + scaled_h:, :] = blur_bottom
+
+    # Apply logo
+    if logo_data is not None:
+        _apply_logo(output_frame, logo_data, final_w, final_h)
+
+    return output_frame
+
+
+# =============================================================================
+# BLUR ZONE CREATION
+# =============================================================================
+
+def _create_blur_zone_gpu(
+    gpu: 'GPUProcessor',
+    effects: 'GPUBlurEffects',
+    content: np.ndarray,
+    target_w: int,
+    target_h: int,
+    position: str,
+    blur_strength: int,
+    params: dict
+) -> np.ndarray:
+    """Create blur zone using GPU operations."""
+    if target_h <= 0:
+        return np.zeros((0, target_w, 3), dtype=np.uint8)
+
+    content_h, content_w = content.shape[:2]
+
+    # Extract source region
+    source_ratio = 0.65
+    source_h = max(int(content_h * source_ratio), min(content_h, max(target_h * 2, 100)))
+    source_h = max(10, min(source_h, content_h))
+
+    if position == 'top':
+        source = content[0:source_h, :].copy()
+    else:
+        start_y = max(0, content_h - source_h)
+        source = content[start_y:, :].copy()
+
+    # Transfer to GPU
+    gpu_source = gpu.to_gpu(source)
+
+    # Apply zoom
+    zoom = max(target_w / source.shape[1], target_h / source.shape[0]) * params['zoom']
+    zoomed_w = int(source.shape[1] * zoom)
+    zoomed_h = int(source.shape[0] * zoom)
+
+    if zoomed_w <= 0 or zoomed_h <= 0:
+        return np.zeros((target_h, target_w, 3), dtype=np.uint8)
+
+    gpu_source = gpu.resize(gpu_source, (zoomed_w, zoomed_h), interpolation='linear')
+
+    # Crop to target size (center crop)
+    crop_x = max(0, (zoomed_w - target_w) // 2)
+    crop_y = max(0, (zoomed_h - target_h) // 2)
+
+    # Need to get back to CPU for slicing, then back to GPU
+    source_cpu = gpu.to_cpu(gpu_source)
+    blur_section = source_cpu[crop_y:crop_y + target_h, crop_x:crop_x + target_w].copy()
+
+    # Ensure exact dimensions
+    if blur_section.shape[0] != target_h or blur_section.shape[1] != target_w:
+        blur_section = cv2.resize(blur_section, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+    # Transfer back to GPU for effects
+    gpu_blur = gpu.to_gpu(blur_section)
+
+    # Apply effects on GPU
+    if params['hflip']:
+        gpu_blur = effects.flip_horizontal(gpu_blur)
+
+    if position == 'top' and params['vflip']:
+        gpu_blur = effects.flip_vertical(gpu_blur)
+
+    if params['color_shift'] != 0:
+        gpu_blur = effects.color_shift(gpu_blur, params['color_shift'])
+
+    if params['saturation'] != 1.0 or params['brightness'] != 1.0:
+        gpu_blur = effects.adjust_saturation_brightness(
+            gpu_blur, params['saturation'], params['brightness']
+        )
+
+    if params['tilt_angle'] != 0:
+        gpu_blur = effects.tilt(gpu_blur, params['tilt_angle'])
+
+    gpu_blur = effects.darken(gpu_blur, params['darken'])
+
+    # Apply Gaussian blur
+    if blur_strength > 0:
+        gpu_blur = effects.gaussian_blur(gpu_blur, blur_strength)
+
+    return gpu.to_cpu(gpu_blur)
+
+
+def _create_blur_zone_cpu(
+    effects: BlurEffects,
+    content: np.ndarray,
+    target_w: int,
+    target_h: int,
+    position: str,
+    blur_strength: int,
+    params: dict
+) -> np.ndarray:
+    """Create blur zone using CPU operations (fallback)."""
+    if target_h <= 0:
+        return np.zeros((0, target_w, 3), dtype=np.uint8)
+
+    content_h, content_w = content.shape[:2]
+
+    # Extract source region
+    source_ratio = 0.65
+    source_h = max(int(content_h * source_ratio), min(content_h, max(target_h * 2, 100)))
+    source_h = max(10, min(source_h, content_h))
+
+    if position == 'top':
+        source = content[0:source_h, :].copy()
+    else:
+        start_y = max(0, content_h - source_h)
+        source = content[start_y:, :].copy()
+
+    # Apply zoom
+    zoom = max(target_w / source.shape[1], target_h / source.shape[0]) * params['zoom']
+    zoomed_w = int(source.shape[1] * zoom)
+    zoomed_h = int(source.shape[0] * zoom)
+
+    if zoomed_w <= 0 or zoomed_h <= 0:
+        return np.zeros((target_h, target_w, 3), dtype=np.uint8)
+
+    source = cv2.resize(source, (zoomed_w, zoomed_h), interpolation=cv2.INTER_LINEAR)
+
+    # Crop to target size
+    crop_x = max(0, (zoomed_w - target_w) // 2)
+    crop_y = max(0, (zoomed_h - target_h) // 2)
+    blur_section = source[crop_y:crop_y + target_h, crop_x:crop_x + target_w]
+
+    # Ensure exact dimensions
+    if blur_section.shape[0] != target_h or blur_section.shape[1] != target_w:
+        blur_section = cv2.resize(blur_section, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+    # Apply effects
+    if params['hflip']:
+        blur_section = effects.flip_horizontal(blur_section)
+
+    if position == 'top' and params['vflip']:
+        blur_section = effects.flip_vertical(blur_section)
+
+    if params['color_shift'] != 0:
+        blur_section = effects.color_shift(blur_section, params['color_shift'])
+
+    if params['saturation'] != 1.0 or params['brightness'] != 1.0:
+        blur_section = effects.adjust_saturation_brightness(
+            blur_section, params['saturation'], params['brightness']
+        )
+
+    if params['tilt_angle'] != 0:
+        blur_section = effects.tilt(blur_section, params['tilt_angle'])
+
+    blur_section = effects.darken(blur_section, params['darken'])
+
+    if blur_strength > 0:
+        blur_section = effects.gaussian_blur(blur_section, blur_strength)
+
+    return blur_section
+
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
 
 def _check_audio(video_path: str) -> bool:
     """Check if video has audio stream using ffprobe."""
@@ -374,7 +892,7 @@ def _check_audio(video_path: str) -> bool:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         return 'audio' in result.stdout.lower()
     except:
-        return True  # Assume audio exists
+        return True
 
 
 def _get_output_dimensions(aspect_str: str) -> tuple:
@@ -391,47 +909,46 @@ def _get_output_dimensions(aspect_str: str) -> tuple:
     if aspect_str in aspect_map:
         return aspect_map[aspect_str]
 
-    # Parse custom aspect ratio
     try:
         if ':' in aspect_str:
             w, h = map(int, aspect_str.split(':'))
             final_w = 1080
             final_h = int(1080 * h / w)
-            final_h = final_h - (final_h % 2)  # Ensure even
+            final_h = final_h - (final_h % 2)
             return (final_w, final_h)
     except:
         pass
 
-    return (1080, 1920)  # Default to 9:16
+    return (1080, 1920)
 
 
-def _calculate_layout(orig_w: int, orig_h: int, final_w: int, final_h: int) -> dict:
-    """
-    Calculate layout for content and blur zones.
-
-    KEY PRINCIPLE: Content fills the WIDTH, blur zones on TOP and BOTTOM.
-    """
-    # Scale content to fill the full width
+def _calculate_layout(orig_w: int, orig_h: int, final_w: int, final_h: int, force_blur_percent: float = 0) -> dict:
+    """Calculate layout for content and blur zones."""
     scale = final_w / orig_w
     scaled_w = final_w
     scaled_h = int(orig_h * scale)
-
-    # Ensure even dimensions
     scaled_h = scaled_h - (scaled_h % 2)
 
-    # If scaled height exceeds final height, scale down to fit height
     if scaled_h > final_h:
         scale = final_h / orig_h
         scaled_h = final_h
         scaled_w = int(orig_w * scale)
         scaled_w = scaled_w - (scaled_w % 2)
 
-    # Calculate blur zones (vertical space above and below content)
     blur_space = final_h - scaled_h
     blur_top = blur_space // 2
     blur_bottom = blur_space - blur_top
 
-    # Content position (centered)
+    if force_blur_percent > 0 and blur_space == 0:
+        blur_percent = min(force_blur_percent, 40)
+        content_percent = 1.0 - (2 * blur_percent / 100)
+        scaled_h = int(final_h * content_percent)
+        scaled_h = scaled_h - (scaled_h % 2)
+        blur_space = final_h - scaled_h
+        blur_top = blur_space // 2
+        blur_bottom = blur_space - blur_top
+        print(f"[Reframe] Force blur: {blur_percent}% top/bottom, content={scaled_w}x{scaled_h}")
+
     content_x = (final_w - scaled_w) // 2
     content_y = blur_top
 
@@ -449,99 +966,15 @@ def _calculate_layout(orig_w: int, orig_h: int, final_w: int, final_h: int) -> d
 def _generate_blur_params(rng: random.Random) -> dict:
     """Generate random parameters for animated blur effect."""
     return {
-        'hflip': rng.random() < 0.3,  # 30% chance horizontal flip
-        'vflip': rng.random() < 0.2,  # 20% chance vertical flip (for mirror effect)
-        'color_shift': rng.randint(-15, 15),  # Hue shift
-        'saturation': rng.uniform(0.7, 1.2),  # Saturation multiplier
-        'brightness': rng.uniform(0.6, 0.9),  # Slightly darker blur
-        'tilt_angle': rng.uniform(-8, 8),  # Rotation angle
-        'zoom': rng.uniform(1.2, 1.5),  # Zoom factor for blur source
-        'darken': rng.uniform(0.5, 0.8),  # Darken factor
+        'hflip': rng.random() < 0.3,
+        'vflip': rng.random() < 0.2,
+        'color_shift': rng.randint(-15, 15),
+        'saturation': rng.uniform(0.7, 1.2),
+        'brightness': rng.uniform(0.6, 0.9),
+        'tilt_angle': rng.uniform(-8, 8),
+        'zoom': rng.uniform(1.2, 1.5),
+        'darken': rng.uniform(0.5, 0.8),
     }
-
-
-def _create_blur_zone(
-    effects: BlurEffects,
-    content: np.ndarray,
-    target_w: int,
-    target_h: int,
-    position: str,  # 'top' or 'bottom'
-    blur_strength: int,
-    params: dict,
-    rotation_matrix: np.ndarray = None
-) -> np.ndarray:
-    """
-    Create a blur zone from video content.
-
-    The blur is generated FROM the actual video content, not from a separate
-    background layer. This creates a cohesive look where blur matches the video.
-    """
-    if target_h <= 0:
-        return np.zeros((0, target_w, 3), dtype=np.uint8)
-
-    content_h, content_w = content.shape[:2]
-
-    # Extract source region from content (take 60-70% of content height)
-    source_ratio = 0.65
-    source_h = max(int(content_h * source_ratio), min(content_h, max(target_h * 2, 100)))
-    source_h = max(10, min(source_h, content_h))
-
-    if position == 'top':
-        # For top blur, take from the top portion of content
-        source = content[0:source_h, :].copy()
-    else:
-        # For bottom blur, take from the bottom portion of content
-        start_y = max(0, content_h - source_h)
-        source = content[start_y:, :].copy()
-
-    # Apply zoom to fill blur zone with some overshoot
-    zoom = max(target_w / source.shape[1], target_h / source.shape[0]) * params['zoom']
-    zoomed_w = int(source.shape[1] * zoom)
-    zoomed_h = int(source.shape[0] * zoom)
-
-    if zoomed_w <= 0 or zoomed_h <= 0:
-        return np.zeros((target_h, target_w, 3), dtype=np.uint8)
-
-    source = cv2.resize(source, (zoomed_w, zoomed_h), interpolation=cv2.INTER_LINEAR)
-
-    # Crop to target size (center crop)
-    crop_x = max(0, (zoomed_w - target_w) // 2)
-    crop_y = max(0, (zoomed_h - target_h) // 2)
-    blur_section = source[crop_y:crop_y + target_h, crop_x:crop_x + target_w]
-
-    # Ensure exact dimensions
-    if blur_section.shape[0] != target_h or blur_section.shape[1] != target_w:
-        blur_section = cv2.resize(blur_section, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-
-    # Apply horizontal flip for variety
-    if params['hflip']:
-        blur_section = effects.flip_horizontal(blur_section)
-
-    # Apply vertical flip (mirror effect) for top zone
-    if position == 'top' and params['vflip']:
-        blur_section = effects.flip_vertical(blur_section)
-
-    # Apply color adjustments
-    if params['color_shift'] != 0:
-        blur_section = effects.color_shift(blur_section, params['color_shift'])
-
-    if params['saturation'] != 1.0 or params['brightness'] != 1.0:
-        blur_section = effects.adjust_saturation_brightness(
-            blur_section, params['saturation'], params['brightness']
-        )
-
-    # Apply rotation/tilt
-    if params['tilt_angle'] != 0 and rotation_matrix is not None:
-        blur_section = effects.tilt(blur_section, params['tilt_angle'], rotation_matrix)
-
-    # Darken the blur to make content stand out
-    blur_section = effects.darken(blur_section, params['darken'])
-
-    # Apply the main blur effect
-    if blur_strength > 0:
-        blur_section = effects.gaussian_blur(blur_section, blur_strength)
-
-    return blur_section
 
 
 def _apply_color_adjustments(
@@ -550,10 +983,9 @@ def _apply_color_adjustments(
     saturation: int,
     contrast: int
 ) -> np.ndarray:
-    """Apply brightness, saturation, and contrast adjustments."""
+    """Apply brightness, saturation, and contrast adjustments (CPU)."""
     result = image
 
-    # Convert percentages to multipliers
     if brightness != 0 or saturation != 0:
         hsv = cv2.cvtColor(result, cv2.COLOR_BGR2HSV).astype(np.float32)
 
@@ -574,15 +1006,70 @@ def _apply_color_adjustments(
     return result
 
 
+# =============================================================================
+# LOGO FUNCTIONS
+# =============================================================================
+
+def _svg_to_pil(svg_path: str, video_width: int, size_percent: float):
+    """Convert SVG to PIL Image."""
+    from PIL import Image
+
+    target_width = max(int(video_width * size_percent / 100), 80)
+
+    try:
+        import cairosvg
+        import io
+        png_data = cairosvg.svg2png(url=svg_path, output_width=target_width * 2)
+        return Image.open(io.BytesIO(png_data)).convert('RGBA')
+    except Exception as e:
+        print(f"[Reframe] cairosvg failed: {e}")
+
+    try:
+        from svglib.svglib import svg2rlg
+        from reportlab.graphics import renderPM
+        import io
+        drawing = svg2rlg(svg_path)
+        if drawing:
+            scale = (target_width * 2) / drawing.width
+            drawing.width *= scale
+            drawing.height *= scale
+            drawing.scale(scale, scale)
+            png_data = io.BytesIO()
+            renderPM.drawToFile(drawing, png_data, fmt='PNG')
+            png_data.seek(0)
+            return Image.open(png_data).convert('RGBA')
+    except Exception as e:
+        print(f"[Reframe] svglib failed: {e}")
+
+    print(f"[Reframe] Using placeholder logo")
+    from PIL import ImageDraw, ImageFont
+
+    logo_h = int(target_width * 0.3)
+    logo = Image.new('RGBA', (target_width, logo_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(logo)
+
+    try:
+        font = ImageFont.truetype("arial.ttf", logo_h // 2)
+    except:
+        font = ImageFont.load_default()
+
+    text = "FARMIUM"
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w = bbox[2] - bbox[0]
+    text_h = bbox[3] - bbox[1]
+    x = (target_width - text_w) // 2
+    y = (logo_h - text_h) // 2
+
+    draw.text((x, y), text, fill=(255, 255, 255, 230), font=font)
+
+    return logo
+
+
 def _prepare_logo(logo_name: str, video_width: int, size_percent: float) -> Optional[dict]:
-    """
-    Prepare logo for overlay.
-    Returns dict with 'image' (BGR), 'alpha' (float mask), and dimensions.
-    """
+    """Prepare logo for overlay."""
     try:
         from PIL import Image
 
-        # Multiple search paths for logos
         workspace = os.environ.get('WORKSPACE', '/workspace')
         script_dir = Path(__file__).parent.resolve()
 
@@ -597,39 +1084,54 @@ def _prepare_logo(logo_name: str, video_width: int, size_percent: float) -> Opti
         ]
 
         logo_source = None
+        is_svg = False
 
         if logo_name in ['farmium_icon', 'farmium_full']:
             for search_path in search_paths:
                 png_path = search_path / f'{logo_name}.png'
                 if png_path.exists():
                     logo_source = str(png_path)
+                    print(f"[Reframe] Found PNG logo: {logo_source}")
+                    break
+                svg_path = search_path / f'{logo_name}.svg'
+                if svg_path.exists():
+                    logo_source = str(svg_path)
+                    is_svg = True
+                    print(f"[Reframe] Found SVG logo: {logo_source}")
                     break
 
         elif logo_name.startswith('http://') or logo_name.startswith('https://'):
             import requests
             response = requests.get(logo_name, timeout=30)
             response.raise_for_status()
-            temp_logo = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+            suffix = '.svg' if '.svg' in logo_name.lower() else '.png'
+            temp_logo = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
             temp_logo.write(response.content)
             temp_logo.close()
             logo_source = temp_logo.name
+            is_svg = suffix == '.svg'
 
         elif Path(logo_name).exists():
             logo_source = logo_name
+            is_svg = logo_name.lower().endswith('.svg')
 
         if not logo_source:
-            print(f"[VideoReframe] Logo not found: {logo_name}")
+            print(f"[Reframe] Logo not found: {logo_name}")
             return None
 
-        # Load and resize logo
-        pil_logo = Image.open(logo_source).convert('RGBA')
+        if is_svg:
+            pil_logo = _svg_to_pil(logo_source, video_width, size_percent)
+            if pil_logo is None:
+                print(f"[Reframe] Failed to convert SVG: {logo_source}")
+                return None
+        else:
+            pil_logo = Image.open(logo_source).convert('RGBA')
 
         logo_w = max(int(video_width * size_percent / 100), 80)
         logo_h = int(logo_w * pil_logo.height / pil_logo.width)
 
         pil_logo = pil_logo.resize((logo_w, logo_h), Image.Resampling.LANCZOS)
 
-        # Convert to numpy
         logo_array = np.array(pil_logo)
         logo_bgr = cv2.cvtColor(logo_array[:, :, :3], cv2.COLOR_RGB2BGR)
         logo_alpha = logo_array[:, :, 3].astype(np.float32) / 255.0
@@ -641,30 +1143,31 @@ def _prepare_logo(logo_name: str, video_width: int, size_percent: float) -> Opti
         }
 
     except Exception as e:
-        print(f"[VideoReframe] Error preparing logo: {e}")
+        print(f"[Reframe] Error preparing logo: {e}")
         return None
 
 
 def _apply_logo(frame: np.ndarray, logo_data: dict, frame_w: int, frame_h: int):
-    """Apply logo overlay to frame (bottom center with 5% margin)."""
+    """Apply logo overlay to frame."""
     logo = logo_data['image']
     alpha_3d = logo_data['alpha_3d']
     lh, lw = logo.shape[:2]
 
-    # Position: bottom center, 5% from bottom
     margin = int(frame_h * 0.05)
     x = (frame_w - lw) // 2
     y = frame_h - lh - margin
 
-    # Ensure within bounds
     x = max(0, min(frame_w - lw, x))
     y = max(0, min(frame_h - lh, y))
 
-    # Blend logo with frame using alpha
     roi = frame[y:y + lh, x:x + lw]
     blended = (alpha_3d * logo + (1 - alpha_3d) * roi).astype(np.uint8)
     frame[y:y + lh, x:x + lw] = blended
 
+
+# =============================================================================
+# FFMPEG WRITER
+# =============================================================================
 
 def _start_ffmpeg_writer(
     output_path: str,
@@ -674,16 +1177,11 @@ def _start_ffmpeg_writer(
     audio_source: str = None,
     gpu_id: int = 0
 ) -> subprocess.Popen:
-    """
-    Start FFmpeg subprocess for writing video frames.
-    Tries NVENC first, falls back to libx264.
-    """
+    """Start FFmpeg subprocess for writing video frames."""
     import platform
 
-    # Determine encoder based on platform
     system_os = platform.system()
 
-    # Build command
     cmd = [
         'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',
         '-f', 'rawvideo',
@@ -692,20 +1190,17 @@ def _start_ffmpeg_writer(
         '-pix_fmt', 'bgr24',
         '-r', str(min(fps, 60)),
         '-thread_queue_size', '512',
-        '-i', '-',  # Video from stdin
+        '-i', '-',
     ]
 
-    # Add audio input if available
     if audio_source:
         cmd.extend(['-i', audio_source])
 
-    # Video encoding settings - try NVENC first on Linux/Windows
     if system_os in ['Linux', 'Windows']:
-        # Try NVENC
         cmd.extend([
             '-c:v', 'h264_nvenc',
             '-gpu', str(gpu_id),
-            '-preset', 'p4',  # Balanced preset
+            '-preset', 'p4',
             '-rc', 'vbr',
             '-cq', '23',
             '-b:v', '8000k',
@@ -713,14 +1208,12 @@ def _start_ffmpeg_writer(
             '-bufsize', '16000k',
         ])
     elif system_os == 'Darwin':
-        # macOS - use VideoToolbox
         cmd.extend([
             '-c:v', 'h264_videotoolbox',
             '-b:v', '8000k',
             '-allow_sw', '1',
         ])
     else:
-        # Fallback to CPU
         cmd.extend([
             '-c:v', 'libx264',
             '-preset', 'fast',
@@ -728,8 +1221,6 @@ def _start_ffmpeg_writer(
         ])
 
     cmd.extend(['-pix_fmt', 'yuv420p'])
-
-    # Map streams
     cmd.extend(['-map', '0:v'])
 
     if audio_source:
@@ -747,7 +1238,7 @@ def _start_ffmpeg_writer(
         output_path
     ])
 
-    print(f"[VideoReframe] Starting FFmpeg: {' '.join(cmd[:15])}...")
+    print(f"[Reframe] Starting FFmpeg: {' '.join(cmd[:15])}...")
 
     try:
         process = subprocess.Popen(
@@ -758,9 +1249,8 @@ def _start_ffmpeg_writer(
         )
         return process
     except Exception as e:
-        print(f"[VideoReframe] FFmpeg start failed, trying CPU fallback: {e}")
+        print(f"[Reframe] FFmpeg start failed, trying CPU fallback: {e}")
 
-        # Fallback to CPU encoder
         cmd_cpu = [
             'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',
             '-f', 'rawvideo', '-vcodec', 'rawvideo',
@@ -807,29 +1297,25 @@ def process_video_reframe_batch(
     progress_callback: Optional[Callable] = None,
     gpu_id: int = 0
 ) -> list:
-    """
-    Process multiple videos with reframe.
-
-    Args:
-        input_paths: List of input video paths
-        output_dir: Directory for output files
-        config: Shared config for all videos
-        progress_callback: Progress callback
-        gpu_id: GPU to use
-
-    Returns:
-        List of result dicts
-    """
+    """Process multiple videos/images with reframe."""
     results = []
     total = len(input_paths)
 
     for i, input_path in enumerate(input_paths):
         if progress_callback:
             base_progress = i / total
-            progress_callback(base_progress, f"Processing video {i+1}/{total}")
+            progress_callback(base_progress, f"Processing {i+1}/{total}")
 
         input_name = Path(input_path).stem
-        output_path = Path(output_dir) / f"{input_name}_reframed.mp4"
+        input_ext = Path(input_path).suffix.lower()
+
+        # Determine output extension based on input type
+        if input_ext in IMAGE_EXTENSIONS:
+            output_ext = '.jpg'
+        else:
+            output_ext = '.mp4'
+
+        output_path = Path(output_dir) / f"{input_name}_reframed{output_ext}"
 
         try:
             def sub_progress(p, msg):
@@ -848,7 +1334,7 @@ def process_video_reframe_batch(
             results.append(result)
 
         except Exception as e:
-            print(f"[VideoReframe] Error processing {input_path}: {e}")
+            print(f"[Reframe] Error processing {input_path}: {e}")
             import traceback
             traceback.print_exc()
             results.append({
@@ -868,15 +1354,19 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 3:
-        print("Usage: python processor.py <input.mp4> <output.mp4> [aspect_ratio] [logo_name]")
-        print("Example: python processor.py video.mp4 out.mp4 9:16")
-        print("Example with logo: python processor.py video.mp4 out.mp4 9:16 farmium_full")
+        print("Usage: python processor.py <input> <output> [aspect_ratio] [logo_name]")
+        print("")
+        print("Supports both VIDEO and IMAGE inputs:")
+        print("  - Image input (jpg, png, webp) -> Image output")
+        print("  - Video input (mp4, mov, etc.) -> Video output")
+        print("")
+        print("Examples:")
+        print("  python processor.py video.mp4 out.mp4 9:16")
+        print("  python processor.py image.jpg out.jpg 9:16 farmium_full")
         print("")
         print("Logo options: farmium_icon, farmium_full, none, or URL")
         print("")
-        print("This processor creates blur zones on TOP and BOTTOM of the video,")
-        print("with the video content filling the width and centered vertically.")
-        print("Blur animates every 20 frames for visual interest.")
+        print(f"GPU acceleration: {'AVAILABLE' if is_gpu_available() else 'NOT AVAILABLE (using CPU)'}")
         sys.exit(1)
 
     input_file = sys.argv[1]
@@ -889,14 +1379,14 @@ if __name__ == "__main__":
         'logoName': logo,
         'logoSize': 15,
         'blurIntensity': 25,
-        'blurUpdateInterval': 20,  # Update blur every 20 frames (~0.66s at 30fps)
+        'blurUpdateInterval': 20,
     }
 
     print(f"[CLI] Input: {input_file}")
     print(f"[CLI] Output: {output_file}")
     print(f"[CLI] Aspect: {aspect}")
     print(f"[CLI] Logo: {logo}")
-    print(f"[CLI] Blur update interval: {config['blurUpdateInterval']} frames")
+    print(f"[CLI] GPU: {'ENABLED' if is_gpu_available() else 'DISABLED (CPU fallback)'}")
 
     def progress(p, msg):
         print(f"[{int(p*100):3d}%] {msg}")

@@ -333,21 +333,48 @@ def _check_video_audio(video_path: str) -> bool:
 def _apply_rotation_with_zoom(frame: np.ndarray, angle_deg: float) -> np.ndarray:
     """Apply rotation with zoom compensation to eliminate black borders."""
     h, w = frame.shape[:2]
-    center = (w // 2, h // 2)
 
-    # Calculate zoom factor to eliminate black borders
+    # Calculate the expanded canvas size after rotation
     angle_rad = abs(angle_deg) * math.pi / 180
     cos_a = math.cos(angle_rad)
     sin_a = math.sin(angle_rad)
 
-    # Zoom factor calculation
-    zoom = 1.0 / (cos_a - sin_a * (h / w) if cos_a > sin_a * (h / w) else 1.0)
-    zoom = max(1.0, min(zoom, 1.5))
+    # New bounding box after rotation
+    new_w = int(w * cos_a + h * sin_a) + 2
+    new_h = int(w * sin_a + h * cos_a) + 2
 
-    # Rotation matrix with zoom
-    M = cv2.getRotationMatrix2D(center, angle_deg, zoom)
+    # Create rotation matrix for expanded canvas
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
 
-    return cv2.warpAffine(frame, M, (w, h), flags=cv2.INTER_LANCZOS4)
+    # Adjust translation for new canvas center
+    M[0, 2] += (new_w - w) / 2
+    M[1, 2] += (new_h - h) / 2
+
+    # Rotate into expanded canvas (no black corners)
+    rotated = cv2.warpAffine(frame, M, (new_w, new_h), flags=cv2.INTER_LANCZOS4)
+
+    # Calculate inscribed rectangle (largest rect without black borders)
+    if sin_a < 0.001:  # Nearly zero rotation
+        return frame
+
+    # Scale factor for inscribed rectangle
+    scale = min(
+        1.0 / (cos_a + sin_a * h / w),
+        1.0 / (cos_a + sin_a * w / h)
+    )
+
+    crop_w = int(w * scale)
+    crop_h = int(h * scale)
+
+    # Center crop from rotated image
+    left = (new_w - crop_w) // 2
+    top = (new_h - crop_h) // 2
+
+    cropped = rotated[top:top+crop_h, left:left+crop_w]
+
+    # Resize back to original dimensions
+    return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LANCZOS4)
 
 
 def _apply_spoofer_color_adj(frame: np.ndarray, brightness: float, saturation: float, contrast: float) -> np.ndarray:
@@ -1650,12 +1677,43 @@ def apply_micro_resize(img: Image.Image, strength: float, py_rng: random.Random)
 
 
 def apply_micro_rotation(img: Image.Image, strength: float, py_rng: random.Random) -> Image.Image:
-    """Micro rotation - very small rotation angles."""
+    """Micro rotation with zoom compensation to eliminate black borders."""
     if strength <= 0:
         return img
 
     angle = py_rng.uniform(-strength, strength)
-    return img.rotate(angle, expand=False, fillcolor=(0, 0, 0), resample=Image.BICUBIC)
+    orig_w, orig_h = img.size
+
+    # Rotate with expand=True to avoid black corners
+    rotated_img = img.rotate(angle, expand=True, resample=Image.BICUBIC)
+    rot_w, rot_h = rotated_img.size
+
+    # Calculate the largest rectangle that fits inside the rotated image
+    angle_rad = abs(angle) * math.pi / 180
+    cos_a = math.cos(angle_rad)
+    sin_a = math.sin(angle_rad)
+
+    if sin_a < 0.001:  # Nearly zero rotation
+        return img
+
+    # Scale factor for inscribed rectangle
+    scale = min(
+        1.0 / (cos_a + sin_a * orig_h / orig_w),
+        1.0 / (cos_a + sin_a * orig_w / orig_h)
+    )
+
+    # The inscribed rectangle dimensions
+    crop_w = int(orig_w * scale)
+    crop_h = int(orig_h * scale)
+
+    # Center crop from rotated image
+    left = (rot_w - crop_w) // 2
+    top = (rot_h - crop_h) // 2
+
+    cropped = rotated_img.crop((left, top, left + crop_w, top + crop_h))
+
+    # Resize back to original dimensions
+    return cropped.resize((orig_w, orig_h), Image.LANCZOS)
 
 
 def apply_subpixel_shift(img: Image.Image, strength: float, py_rng: random.Random) -> Image.Image:

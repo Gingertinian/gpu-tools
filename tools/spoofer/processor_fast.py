@@ -25,6 +25,7 @@ import random
 import time
 import hashlib
 import zipfile
+import math
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from typing import Callable, Optional, Dict, Any, List, Tuple
@@ -116,35 +117,50 @@ def fast_rotate(img: Image.Image, strength: float, rng: random.Random) -> Image.
     angle = rng.uniform(-strength, strength)
     orig_w, orig_h = img.size
 
-    # Calculate zoom factor to compensate for black borders
-    # Formula: zoom = 1 / cos(|angle|) ensures no black borders appear
+    # Rotate with expand=True to avoid black corners
+    rotated_img = img.rotate(angle, expand=True, resample=Image.BILINEAR)
+    rot_w, rot_h = rotated_img.size
+
+    # Calculate the largest rectangle that fits inside the rotated image
+    # without any black borders (the inscribed rectangle)
     angle_rad = abs(angle) * math.pi / 180
-    cos_angle = math.cos(angle_rad)
+    cos_a = math.cos(angle_rad)
+    sin_a = math.sin(angle_rad)
 
-    if cos_angle > 0.001:
-        zoom_factor = 1.0 / cos_angle
-        # Clamp zoom to reasonable range
-        zoom_factor = max(1.0, min(zoom_factor, 1.5))
+    if sin_a < 0.001:  # Nearly zero rotation
+        return img
 
-        # Scale up, rotate, then crop back to original size
-        scaled_w = int(orig_w * zoom_factor)
-        scaled_h = int(orig_h * zoom_factor)
-
-        # Scale up the image
-        scaled_img = img.resize((scaled_w, scaled_h), Image.BILINEAR)
-
-        # Rotate (no expand needed since we've already scaled up)
-        rotated_img = scaled_img.rotate(angle, expand=False, resample=Image.BILINEAR)
-
-        # Center crop back to original dimensions
-        left = (scaled_w - orig_w) // 2
-        top = (scaled_h - orig_h) // 2
-        right = left + orig_w
-        bottom = top + orig_h
-        return rotated_img.crop((left, top, right, bottom))
+    # For the inscribed rectangle, we need to find the scale factor
+    # The rotated bounding box is: new_w = w*cos + h*sin, new_h = w*sin + h*cos
+    # To inscribe original aspect ratio rectangle, scale is:
+    # scale = 1 / (cos + sin * aspect) for width direction
+    # scale = 1 / (cos + sin / aspect) for height direction
+    # Take the minimum to ensure we fit
+    if orig_w >= orig_h:
+        scale = min(
+            1.0 / (cos_a + sin_a * orig_h / orig_w),
+            1.0 / (cos_a + sin_a * orig_w / orig_h)
+        )
     else:
-        # Fallback for extremely small angles
-        return img.rotate(angle, expand=False, fillcolor=(0, 0, 0), resample=Image.BILINEAR)
+        scale = min(
+            1.0 / (cos_a + sin_a * orig_w / orig_h),
+            1.0 / (cos_a + sin_a * orig_h / orig_w)
+        )
+
+    # The inscribed rectangle dimensions
+    crop_w = int(orig_w * scale)
+    crop_h = int(orig_h * scale)
+
+    # Center crop from rotated image
+    left = (rot_w - crop_w) // 2
+    top = (rot_h - crop_h) // 2
+    right = left + crop_w
+    bottom = top + crop_h
+
+    cropped = rotated_img.crop((left, top, right, bottom))
+
+    # Resize back to original dimensions
+    return cropped.resize((orig_w, orig_h), Image.BILINEAR)
 
 
 def fast_brightness(img: Image.Image, strength: float, rng: random.Random) -> Image.Image:

@@ -327,20 +327,16 @@ def _build_gpu_filter_complex(
 
         parts = [content_filter]
 
-        # Create blurred version scaled to full output size
+        # Create blurred background (scale to full output size, then blur)
         parts.append(
             f"[blur_src]scale={final_w}:{final_h}:flags=fast_bilinear,"
             f"gblur=sigma={blur_sigma}[blurred]"
         )
 
-        # Pad content to final size (centered) with transparent/black
+        # Overlay content directly on blurred background (no pad needed)
+        # Content is placed at content_x, content_y position
         parts.append(
-            f"[content]pad={final_w}:{final_h}:{content_x}:{content_y}:black[padded]"
-        )
-
-        # Overlay padded content on blurred background
-        parts.append(
-            "[blurred][padded]overlay=0:0:format=yuv420[composited]"
+            f"[blurred][content]overlay={content_x}:{content_y}:format=yuv420[composited]"
         )
 
         current_output = "[composited]"

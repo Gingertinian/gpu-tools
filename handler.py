@@ -150,11 +150,16 @@ try:
 except ImportError:
     process_video_gen = None
 
-# Video Reframe
+# Video Reframe - Use GPU-optimized processor
 try:
-    from video_reframe.processor import process_video_reframe
+    from video_reframe.processor_gpu import process_video_reframe
+    print("[Handler] Using GPU-optimized video_reframe processor")
 except ImportError:
-    process_video_reframe = None
+    try:
+        from video_reframe.processor import process_video_reframe
+        print("[Handler] Using standard video_reframe processor")
+    except ImportError:
+        process_video_reframe = None
 
 
 # ==================== Helper Functions ====================

@@ -328,24 +328,35 @@ def _build_gpu_filter_complex(
         parts = [content_filter]
 
         # Random variations for blur background
-        extra_zoom = 1.0 + random.uniform(0.05, 0.25)  # 1.05x - 1.25x extra zoom
-        rotation_deg = random.uniform(-8, 8)  # -8 to +8 degrees rotation
-        crop_offset_x = random.randint(-50, 50)  # Horizontal offset
-        crop_offset_y = random.randint(-50, 50)  # Vertical offset
+        extra_zoom = 1.0 + random.uniform(0.1, 0.3)  # 1.1x - 1.3x extra zoom (more margin)
+        rotation_deg = random.uniform(-5, 5)  # -5 to +5 degrees (reduced for safety)
 
         # Calculate scaled size with extra zoom
         blur_scale_w = int(final_w * extra_zoom)
         blur_scale_h = int(final_h * extra_zoom)
 
+        # Calculate safe crop offset range (ensure we stay within bounds)
+        max_offset_x = (blur_scale_w - final_w) // 2 - 10  # 10px safety margin
+        max_offset_y = (blur_scale_h - final_h) // 2 - 10
+        max_offset_x = max(0, max_offset_x)
+        max_offset_y = max(0, max_offset_y)
+
+        crop_offset_x = random.randint(-max_offset_x, max_offset_x) if max_offset_x > 0 else 0
+        crop_offset_y = random.randint(-max_offset_y, max_offset_y) if max_offset_y > 0 else 0
+
+        # Calculate final crop position (always positive)
+        crop_x = max(0, (blur_scale_w - final_w) // 2 + crop_offset_x)
+        crop_y = max(0, (blur_scale_h - final_h) // 2 + crop_offset_y)
+
         # Build blur filter chain:
         # 1. Scale up (maintain aspect ratio + extra zoom)
         # 2. Rotate slightly
-        # 3. Crop with offset to final size
+        # 3. Crop to final size
         # 4. Apply blur
         blur_filters = [
             f"scale={blur_scale_w}:{blur_scale_h}:force_original_aspect_ratio=increase",
             f"rotate={rotation_deg}*PI/180:fillcolor=black:ow={blur_scale_w}:oh={blur_scale_h}",
-            f"crop={final_w}:{final_h}:{crop_offset_x + (blur_scale_w - final_w)//2}:{crop_offset_y + (blur_scale_h - final_h)//2}",
+            f"crop={final_w}:{final_h}:{crop_x}:{crop_y}",
             f"gblur=sigma={blur_sigma}"
         ]
         parts.append(f"[blur_src]{','.join(blur_filters)}[blurred]")

@@ -491,11 +491,13 @@ def _process_image_cupy(
 ) -> np.ndarray:
     """
     Process image entirely on GPU using CuPy.
+    Creates full blurred background first, then overlays content.
 
     Single transfer in, single transfer out.
     """
     scaled_w = layout['scaled_w']
     scaled_h = layout['scaled_h']
+    content_x = layout['content_x']
     content_y = layout['content_y']
     blur_top_h = layout['blur_top']
     blur_bottom_h = layout['blur_bottom']
@@ -524,32 +526,25 @@ def _process_image_cupy(
     # Clamp values
     content = cp.clip(content, 0, 255)
 
-    # Create output canvas on GPU
-    output = cp.zeros((final_h, final_w, 3), dtype=cp.float32)
-
-    # Create blur zones on GPU
     blur_sigma = 5 + (blur_intensity / 100) * 25
 
-    if blur_top_h > 0:
-        # Scale content to blur zone size
-        blur_zoom = (blur_top_h / content.shape[0], final_w / content.shape[1], 1)
-        blur_top = gpu_ndimage.zoom(content, blur_zoom, order=1)
-        # Apply gaussian blur
-        for c in range(3):
-            blur_top[:, :, c] = gpu_ndimage.gaussian_filter(blur_top[:, :, c], sigma=blur_sigma)
-        output[0:blur_top_h, :] = blur_top[:blur_top_h, :final_w]
+    # Check if we need blur zones (either top/bottom or sides)
+    needs_blur = blur_top_h > 0 or blur_bottom_h > 0 or content_x > 0
 
-    # Place content (centered)
-    content_x = layout['content_x']
+    if needs_blur:
+        # Create full-frame blurred background first (like video processing)
+        bg_zoom = (final_h / img.shape[0], final_w / img.shape[1], 1)
+        blurred_bg = gpu_ndimage.zoom(gpu_img, bg_zoom, order=1)
+        # Apply gaussian blur to background
+        for c in range(3):
+            blurred_bg[:, :, c] = gpu_ndimage.gaussian_filter(blurred_bg[:, :, c], sigma=blur_sigma)
+        output = blurred_bg
+    else:
+        # No blur needed - just create black canvas
+        output = cp.zeros((final_h, final_w, 3), dtype=cp.float32)
+
+    # Overlay content on top of blurred background
     output[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content[:scaled_h, :scaled_w]
-
-    if blur_bottom_h > 0:
-        blur_zoom = (blur_bottom_h / content.shape[0], final_w / content.shape[1], 1)
-        blur_bottom = gpu_ndimage.zoom(content, blur_zoom, order=1)
-        for c in range(3):
-            blur_bottom[:, :, c] = gpu_ndimage.gaussian_filter(blur_bottom[:, :, c], sigma=blur_sigma)
-        bottom_y = content_y + scaled_h
-        output[bottom_y:bottom_y + blur_bottom_h, :] = blur_bottom[:blur_bottom_h, :final_w]
 
     # Transfer back to CPU (single transfer)
     output_cpu = cp.asnumpy(output).astype(np.uint8)
@@ -575,6 +570,7 @@ def _process_image_cpu(
 ) -> np.ndarray:
     """
     CPU fallback for image processing using OpenCV.
+    Creates full blurred background first, then overlays content.
     """
     scaled_w = layout['scaled_w']
     scaled_h = layout['scaled_h']
@@ -603,24 +599,23 @@ def _process_image_cpu(
 
     content = np.clip(content, 0, 255).astype(np.uint8)
 
-    # Create output
-    output = np.zeros((final_h, final_w, 3), dtype=np.uint8)
-
     blur_sigma = 5 + (blur_intensity / 100) * 25
     blur_ksize = int(blur_sigma * 6) | 1  # Ensure odd
 
-    if blur_top_h > 0:
-        blur_top = cv2.resize(content, (final_w, blur_top_h), interpolation=cv2.INTER_LINEAR)
-        blur_top = cv2.GaussianBlur(blur_top, (blur_ksize, blur_ksize), blur_sigma)
-        output[0:blur_top_h, :] = blur_top
+    # Check if we need blur zones (either top/bottom or sides)
+    needs_blur = blur_top_h > 0 or blur_bottom_h > 0 or content_x > 0
 
+    if needs_blur:
+        # Create full-frame blurred background first (like video processing)
+        blurred_bg = cv2.resize(img, (final_w, final_h), interpolation=cv2.INTER_LINEAR)
+        blurred_bg = cv2.GaussianBlur(blurred_bg, (blur_ksize, blur_ksize), blur_sigma)
+        output = blurred_bg
+    else:
+        # No blur needed - just create black canvas
+        output = np.zeros((final_h, final_w, 3), dtype=np.uint8)
+
+    # Overlay content on top of blurred background
     output[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content
-
-    if blur_bottom_h > 0:
-        blur_bottom = cv2.resize(content, (final_w, blur_bottom_h), interpolation=cv2.INTER_LINEAR)
-        blur_bottom = cv2.GaussianBlur(blur_bottom, (blur_ksize, blur_ksize), blur_sigma)
-        bottom_y = content_y + scaled_h
-        output[bottom_y:bottom_y + blur_bottom_h, :] = blur_bottom
 
     # Apply logo
     logo_path = _get_logo_path(logo_name)

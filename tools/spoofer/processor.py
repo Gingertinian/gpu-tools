@@ -25,6 +25,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
 from collections import deque
 import threading
+import cv2
+import tempfile
+from pathlib import Path
 
 # Import gpu_utils for FFmpeg command building (optional - graceful fallback)
 try:
@@ -124,6 +127,444 @@ def extract_videos_from_zip(zip_path: str, extract_dir: str) -> List[str]:
     return video_paths
 
 
+# =============================================================================
+# FRAME-BY-FRAME VIDEO PROCESSING WITH BLUR + LOGO
+# =============================================================================
+
+def process_video_with_blur_logo(
+    input_path: str,
+    output_path: str,
+    config: dict,
+    py_rng: random.Random,
+    gpu_id: int = 0
+) -> dict:
+    """
+    Process video frame-by-frame with blur background and logo overlay.
+    Used when blur or logo is requested in spoofer config.
+
+    Features:
+    - Blur background zones (top/bottom) from video content
+    - Logo overlay
+    - All spoofer spatial/tonal transforms
+    """
+    input_path = Path(input_path)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Open video
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video: {input_path}")
+
+    # Get video properties
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # Check for audio
+    has_audio = _check_video_audio(str(input_path))
+
+    print(f"[Spoofer+Blur] Input: {orig_w}x{orig_h} @ {fps:.2f} fps, {total_frames} frames")
+
+    # Parse config
+    spatial = config.get('spatial', {})
+    tonal = config.get('tonal', {})
+    visual = config.get('visual', {})
+    video_cfg = config.get('video', {})
+
+    # Blur config
+    blur_enabled = config.get('blurBackground', True)
+    blur_intensity = config.get('blurIntensity', 25)
+
+    # Logo config
+    logo_name = config.get('logoName', 'farmium_full')
+    logo_size = config.get('logoSize', 15)
+
+    # Output dimensions (9:16 by default for spoofer)
+    final_w, final_h = 1080, 1920
+
+    # Calculate layout
+    scale = final_w / orig_w
+    scaled_w = final_w
+    scaled_h = int(orig_h * scale)
+    scaled_h = scaled_h - (scaled_h % 2)
+
+    if scaled_h > final_h:
+        scale = final_h / orig_h
+        scaled_h = final_h
+        scaled_w = int(orig_w * scale)
+        scaled_w = scaled_w - (scaled_w % 2)
+
+    blur_space = final_h - scaled_h
+    blur_top = blur_space // 2
+    blur_bottom = blur_space - blur_top
+    content_x = (final_w - scaled_w) // 2
+    content_y = blur_top
+
+    print(f"[Spoofer+Blur] Output: {final_w}x{final_h}, blur_top={blur_top}, blur_bottom={blur_bottom}")
+
+    # Prepare logo
+    logo_data = None
+    if logo_name and logo_name != 'none':
+        logo_data = _prepare_spoofer_logo(logo_name, final_w, logo_size)
+
+    # Get spoofer transforms
+    rotation_angle = 0
+    if spatial.get('rotation', 0) > 0:
+        rotation_angle = py_rng.uniform(-spatial['rotation'], spatial['rotation'])
+
+    brightness_adj = 0
+    if tonal.get('brightness', 0) > 0:
+        brightness_adj = py_rng.uniform(-tonal['brightness'], tonal['brightness']) * 0.4
+
+    contrast_adj = 1.0
+    if tonal.get('contrast', 0) > 0:
+        contrast_adj = 1 + py_rng.uniform(-tonal['contrast'], tonal['contrast'])
+
+    saturation_adj = 1.0
+    if tonal.get('saturation', 0) > 0:
+        saturation_adj = 1 + py_rng.uniform(-tonal['saturation'], tonal['saturation'])
+
+    # Start FFmpeg writer
+    ffmpeg_process = _start_spoofer_ffmpeg(
+        str(output_path), final_w, final_h, fps,
+        str(input_path) if has_audio else None,
+        gpu_id
+    )
+
+    # Pre-allocate buffers
+    output_frame = np.zeros((final_h, final_w, 3), dtype=np.uint8)
+
+    # Blur params (animate every 20 frames)
+    blur_update_interval = 20
+    blur_params = _generate_spoofer_blur_params(py_rng)
+
+    frame_idx = 0
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Update blur params periodically
+            if frame_idx % blur_update_interval == 0:
+                blur_params = _generate_spoofer_blur_params(py_rng)
+
+            # Apply rotation with zoom compensation
+            if rotation_angle != 0:
+                frame = _apply_rotation_with_zoom(frame, rotation_angle)
+
+            # Apply color adjustments
+            if brightness_adj != 0 or contrast_adj != 1.0 or saturation_adj != 1.0:
+                frame = _apply_spoofer_color_adj(frame, brightness_adj, saturation_adj, contrast_adj)
+
+            # Scale content
+            content = cv2.resize(frame, (scaled_w, scaled_h), interpolation=cv2.INTER_LANCZOS4)
+
+            # Create blur zones if needed
+            if blur_enabled and blur_top > 0:
+                blur_zone_top = _create_spoofer_blur_zone(
+                    content, final_w, blur_top, 'top', blur_intensity, blur_params
+                )
+                output_frame[0:blur_top, :] = blur_zone_top
+
+            # Place main content
+            output_frame[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content
+
+            # Bottom blur zone
+            if blur_enabled and blur_bottom > 0:
+                blur_zone_bottom = _create_spoofer_blur_zone(
+                    content, final_w, blur_bottom, 'bottom', blur_intensity, blur_params
+                )
+                output_frame[content_y + scaled_h:, :] = blur_zone_bottom
+
+            # Apply logo
+            if logo_data is not None:
+                _apply_spoofer_logo(output_frame, logo_data, final_w, final_h)
+
+            # Write frame
+            try:
+                ffmpeg_process.stdin.write(output_frame.tobytes())
+            except BrokenPipeError:
+                break
+
+            frame_idx += 1
+
+    finally:
+        cap.release()
+        ffmpeg_process.stdin.close()
+        ffmpeg_process.wait()
+
+    output_size = os.path.getsize(output_path) if output_path.exists() else 0
+    duration = frame_idx / fps if fps > 0 else 0
+
+    return {
+        "status": "completed",
+        "outputPath": str(output_path),
+        "outputSize": output_size,
+        "framesProcessed": frame_idx,
+        "duration": duration
+    }
+
+
+def _check_video_audio(video_path: str) -> bool:
+    """Check if video has audio."""
+    try:
+        cmd = ['ffprobe', '-v', 'quiet', '-select_streams', 'a',
+               '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', video_path]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return 'audio' in result.stdout.lower()
+    except:
+        return True
+
+
+def _apply_rotation_with_zoom(frame: np.ndarray, angle_deg: float) -> np.ndarray:
+    """Apply rotation with zoom compensation to eliminate black borders."""
+    h, w = frame.shape[:2]
+    center = (w // 2, h // 2)
+
+    # Calculate zoom factor to eliminate black borders
+    angle_rad = abs(angle_deg) * math.pi / 180
+    cos_a = math.cos(angle_rad)
+    sin_a = math.sin(angle_rad)
+
+    # Zoom factor calculation
+    zoom = 1.0 / (cos_a - sin_a * (h / w) if cos_a > sin_a * (h / w) else 1.0)
+    zoom = max(1.0, min(zoom, 1.5))
+
+    # Rotation matrix with zoom
+    M = cv2.getRotationMatrix2D(center, angle_deg, zoom)
+
+    return cv2.warpAffine(frame, M, (w, h), flags=cv2.INTER_LANCZOS4)
+
+
+def _apply_spoofer_color_adj(frame: np.ndarray, brightness: float, saturation: float, contrast: float) -> np.ndarray:
+    """Apply color adjustments to frame."""
+    if brightness != 0 or saturation != 1.0:
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
+        if saturation != 1.0:
+            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * saturation, 0, 255)
+        if brightness != 0:
+            hsv[:, :, 2] = np.clip(hsv[:, :, 2] * (1 + brightness), 0, 255)
+        frame = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+    if contrast != 1.0:
+        frame = cv2.convertScaleAbs(frame, alpha=contrast, beta=(1 - contrast) * 128)
+
+    return frame
+
+
+def _generate_spoofer_blur_params(rng: random.Random) -> dict:
+    """Generate random blur parameters."""
+    return {
+        'hflip': rng.random() < 0.3,
+        'vflip': rng.random() < 0.2,
+        'color_shift': rng.randint(-15, 15),
+        'saturation': rng.uniform(0.7, 1.2),
+        'brightness': rng.uniform(0.6, 0.9),
+        'tilt_angle': rng.uniform(-8, 8),
+        'zoom': rng.uniform(1.2, 1.5),
+        'darken': rng.uniform(0.5, 0.8),
+    }
+
+
+def _create_spoofer_blur_zone(
+    content: np.ndarray,
+    target_w: int,
+    target_h: int,
+    position: str,
+    blur_strength: int,
+    params: dict
+) -> np.ndarray:
+    """Create blur zone from video content."""
+    if target_h <= 0:
+        return np.zeros((0, target_w, 3), dtype=np.uint8)
+
+    content_h, content_w = content.shape[:2]
+    source_ratio = 0.65
+    source_h = max(int(content_h * source_ratio), min(content_h, max(target_h * 2, 100)))
+    source_h = max(10, min(source_h, content_h))
+
+    if position == 'top':
+        source = content[0:source_h, :].copy()
+    else:
+        start_y = max(0, content_h - source_h)
+        source = content[start_y:, :].copy()
+
+    # Zoom to fill
+    zoom = max(target_w / source.shape[1], target_h / source.shape[0]) * params['zoom']
+    zoomed_w = int(source.shape[1] * zoom)
+    zoomed_h = int(source.shape[0] * zoom)
+
+    if zoomed_w <= 0 or zoomed_h <= 0:
+        return np.zeros((target_h, target_w, 3), dtype=np.uint8)
+
+    source = cv2.resize(source, (zoomed_w, zoomed_h), interpolation=cv2.INTER_LINEAR)
+
+    # Center crop
+    crop_x = max(0, (zoomed_w - target_w) // 2)
+    crop_y = max(0, (zoomed_h - target_h) // 2)
+    blur_section = source[crop_y:crop_y + target_h, crop_x:crop_x + target_w]
+
+    if blur_section.shape[0] != target_h or blur_section.shape[1] != target_w:
+        blur_section = cv2.resize(blur_section, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+    # Flip for variety
+    if params['hflip']:
+        blur_section = cv2.flip(blur_section, 1)
+    if position == 'top' and params['vflip']:
+        blur_section = cv2.flip(blur_section, 0)
+
+    # Darken
+    blur_section = (blur_section.astype(np.float32) * params['darken']).astype(np.uint8)
+
+    # Apply blur
+    if blur_strength > 0:
+        k = int(blur_strength) | 1
+        blur_section = cv2.GaussianBlur(blur_section, (k, k), 0)
+
+    return blur_section
+
+
+def _prepare_spoofer_logo(logo_name: str, video_width: int, size_percent: float):
+    """Prepare logo for overlay."""
+    try:
+        script_dir = Path(__file__).parent.resolve()
+        search_paths = [
+            Path('/workspace/assets/logos'),
+            script_dir / 'assets' / 'logos',
+            script_dir.parent / 'assets' / 'logos',
+            script_dir.parent.parent / 'assets' / 'logos',
+        ]
+
+        logo_source = None
+        if logo_name in ['farmium_icon', 'farmium_full']:
+            for search_path in search_paths:
+                png_path = search_path / f'{logo_name}.png'
+                if png_path.exists():
+                    logo_source = str(png_path)
+                    break
+
+        if not logo_source:
+            print(f"[Spoofer] Logo not found: {logo_name}")
+            return None
+
+        # Load logo
+        logo_img = cv2.imread(logo_source, cv2.IMREAD_UNCHANGED)
+        if logo_img is None:
+            return None
+
+        # Resize
+        logo_w = max(int(video_width * size_percent / 100), 80)
+        logo_h = int(logo_w * logo_img.shape[0] / logo_img.shape[1])
+        logo_img = cv2.resize(logo_img, (logo_w, logo_h), interpolation=cv2.INTER_LANCZOS4)
+
+        # Split alpha
+        if logo_img.shape[2] == 4:
+            logo_bgr = logo_img[:, :, :3]
+            logo_alpha = logo_img[:, :, 3].astype(np.float32) / 255.0
+        else:
+            logo_bgr = logo_img
+            logo_alpha = np.ones((logo_h, logo_w), dtype=np.float32)
+
+        return {
+            'image': logo_bgr,
+            'alpha': logo_alpha,
+            'alpha_3d': logo_alpha[:, :, np.newaxis]
+        }
+    except Exception as e:
+        print(f"[Spoofer] Error preparing logo: {e}")
+        return None
+
+
+def _apply_spoofer_logo(frame: np.ndarray, logo_data: dict, frame_w: int, frame_h: int):
+    """Apply logo overlay to frame."""
+    logo = logo_data['image']
+    alpha_3d = logo_data['alpha_3d']
+    lh, lw = logo.shape[:2]
+
+    margin = int(frame_h * 0.05)
+    x = (frame_w - lw) // 2
+    y = frame_h - lh - margin
+
+    x = max(0, min(frame_w - lw, x))
+    y = max(0, min(frame_h - lh, y))
+
+    roi = frame[y:y + lh, x:x + lw]
+    blended = (alpha_3d * logo + (1 - alpha_3d) * roi).astype(np.uint8)
+    frame[y:y + lh, x:x + lw] = blended
+
+
+def _start_spoofer_ffmpeg(
+    output_path: str,
+    width: int,
+    height: int,
+    fps: float,
+    audio_source: str = None,
+    gpu_id: int = 0
+) -> subprocess.Popen:
+    """Start FFmpeg for frame-by-frame video writing."""
+    cmd = [
+        'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',
+        '-f', 'rawvideo', '-vcodec', 'rawvideo',
+        '-s', f'{width}x{height}',
+        '-pix_fmt', 'bgr24',
+        '-r', str(min(fps, 60)),
+        '-thread_queue_size', '512',
+        '-i', '-',
+    ]
+
+    if audio_source:
+        cmd.extend(['-i', audio_source])
+
+    # Try NVENC
+    cmd.extend([
+        '-c:v', 'h264_nvenc',
+        '-gpu', str(gpu_id),
+        '-preset', 'p4',
+        '-rc', 'vbr',
+        '-cq', '23',
+        '-b:v', '8000k',
+        '-maxrate', '12000k',
+        '-bufsize', '16000k',
+        '-pix_fmt', 'yuv420p',
+        '-map', '0:v',
+    ])
+
+    if audio_source:
+        cmd.extend(['-map', '1:a?', '-c:a', 'aac', '-b:a', '128k', '-shortest'])
+    else:
+        cmd.append('-an')
+
+    cmd.extend(['-movflags', '+faststart', output_path])
+
+    try:
+        return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except:
+        # CPU fallback
+        cmd_cpu = [
+            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',
+            '-f', 'rawvideo', '-vcodec', 'rawvideo',
+            '-s', f'{width}x{height}', '-pix_fmt', 'bgr24',
+            '-r', str(min(fps, 60)), '-i', '-',
+        ]
+        if audio_source:
+            cmd_cpu.extend(['-i', audio_source])
+        cmd_cpu.extend(['-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p', '-map', '0:v'])
+        if audio_source:
+            cmd_cpu.extend(['-map', '1:a?', '-c:a', 'aac', '-b:a', '128k', '-shortest'])
+        else:
+            cmd_cpu.append('-an')
+        cmd_cpu.extend(['-movflags', '+faststart', output_path])
+        return subprocess.Popen(cmd_cpu, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+# =============================================================================
+# PARALLEL VIDEO PROCESSING
+# =============================================================================
+
 def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
     """
     Worker function for parallel video processing.
@@ -151,6 +592,37 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
         # Use nanosecond timestamp + pid + index for unique seed (prevents collisions)
         seed = int(time.time_ns()) ^ (os.getpid() << 16) ^ (video_index * 997)
         py_rng = random.Random(seed)
+
+        # Check if blur/logo is requested - use frame-by-frame processing for these
+        blur_enabled = config.get('blurBackground', False)
+        logo_name = config.get('logoName', None)
+
+        if blur_enabled or logo_name:
+            print(f"[Spoofer Worker {video_index}] Using frame-by-frame processing (blur={blur_enabled}, logo={logo_name})")
+            try:
+                result = process_video_with_blur_logo(
+                    input_path=input_path,
+                    output_path=output_path,
+                    config=config,
+                    py_rng=py_rng,
+                    gpu_id=gpu_id
+                )
+                elapsed = time.time() - start_time
+                return {
+                    'status': 'completed',
+                    'index': video_index,
+                    'output_path': output_path,
+                    'duration': result.get('duration', 0),
+                    'processing_time': elapsed
+                }
+            except Exception as blur_err:
+                elapsed = time.time() - start_time
+                print(f"[Spoofer Worker {video_index}] Blur+logo processing failed: {blur_err}")
+                return {
+                    'status': 'failed',
+                    'index': video_index,
+                    'error': f"Blur+logo processing failed: {str(blur_err)}"
+                }
 
         # Get video info
         try:

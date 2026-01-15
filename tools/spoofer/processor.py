@@ -184,25 +184,31 @@ def process_video_with_blur_logo(
     # Output dimensions (9:16 by default for spoofer)
     final_w, final_h = 1080, 1920
 
-    # Calculate layout
+    # Calculate layout - ALWAYS use 25% top and 25% bottom blur zones
+    # This ensures blur is visible regardless of original aspect ratio
+    blur_top = int(final_h * 0.25)  # 480 pixels
+    blur_bottom = int(final_h * 0.25)  # 480 pixels
+    content_h = final_h - blur_top - blur_bottom  # 960 pixels (50% of frame)
+
+    # Scale content to fit in the middle 50% section
+    # First try scaling by width
     scale = final_w / orig_w
     scaled_w = final_w
     scaled_h = int(orig_h * scale)
-    scaled_h = scaled_h - (scaled_h % 2)
+    scaled_h = scaled_h - (scaled_h % 2)  # Ensure even
 
-    if scaled_h > final_h:
-        scale = final_h / orig_h
-        scaled_h = final_h
+    # If scaled height exceeds content area, scale by height instead
+    if scaled_h > content_h:
+        scale = content_h / orig_h
+        scaled_h = content_h
         scaled_w = int(orig_w * scale)
-        scaled_w = scaled_w - (scaled_w % 2)
+        scaled_w = scaled_w - (scaled_w % 2)  # Ensure even
 
-    blur_space = final_h - scaled_h
-    blur_top = blur_space // 2
-    blur_bottom = blur_space - blur_top
+    # Center content horizontally and vertically within content area
     content_x = (final_w - scaled_w) // 2
-    content_y = blur_top
+    content_y = blur_top + (content_h - scaled_h) // 2
 
-    print(f"[Spoofer+Blur] Output: {final_w}x{final_h}, blur_top={blur_top}, blur_bottom={blur_bottom}")
+    print(f"[Spoofer+Blur] Output: {final_w}x{final_h}, blur_top={blur_top}, blur_bottom={blur_bottom}, content_h={content_h}")
 
     # Prepare logo
     logo_data = None
@@ -267,22 +273,22 @@ def process_video_with_blur_logo(
             # Scale content
             content = cv2.resize(frame, (scaled_w, scaled_h), interpolation=cv2.INTER_LANCZOS4)
 
-            # Create blur zones if needed
-            if blur_enabled and blur_top > 0:
+            # Create blur zones from CENTER of content (always visible with 25% top/bottom)
+            if blur_enabled:
+                # Top blur zone - uses center of content
                 blur_zone_top = _create_spoofer_blur_zone(
-                    content, final_w, blur_top, 'top', blur_intensity, blur_params
+                    content, final_w, blur_top, 'center', blur_intensity, blur_params
                 )
                 output_frame[0:blur_top, :] = blur_zone_top
 
-            # Place main content
-            output_frame[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content
-
-            # Bottom blur zone
-            if blur_enabled and blur_bottom > 0:
+                # Bottom blur zone - uses center of content
                 blur_zone_bottom = _create_spoofer_blur_zone(
-                    content, final_w, blur_bottom, 'bottom', blur_intensity, blur_params
+                    content, final_w, blur_bottom, 'center', blur_intensity, blur_params
                 )
-                output_frame[content_y + scaled_h:, :] = blur_zone_bottom
+                output_frame[final_h - blur_bottom:final_h, :] = blur_zone_bottom
+
+            # Place main content in the middle section
+            output_frame[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content
 
             # Apply logo
             if logo_data is not None:
@@ -345,19 +351,51 @@ def _apply_rotation_with_zoom(frame: np.ndarray, angle_deg: float) -> np.ndarray
 
 
 def _apply_spoofer_color_adj(frame: np.ndarray, brightness: float, saturation: float, contrast: float) -> np.ndarray:
-    """Apply color adjustments to frame."""
+    """Apply color adjustments to frame.
+
+    Args:
+        frame: BGR image (uint8)
+        brightness: Brightness adjustment (-1.0 to 1.0, 0 = no change)
+        saturation: Saturation multiplier (1.0 = no change)
+        contrast: Contrast multiplier (1.0 = no change)
+
+    Returns:
+        Adjusted BGR image (uint8)
+    """
+    result = frame.copy()
+
+    # Apply brightness and saturation in HSV space
     if brightness != 0 or saturation != 1.0:
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
+        # Use HSV_FULL for full 8-bit range (H: 0-255 instead of 0-180)
+        # This prevents hue wrapping issues that can cause color inversion
+        hsv = cv2.cvtColor(result, cv2.COLOR_BGR2HSV_FULL)
+
+        # Work with float for precision
+        h, s, v = cv2.split(hsv)
+        s = s.astype(np.float32)
+        v = v.astype(np.float32)
+
+        # Apply saturation adjustment
         if saturation != 1.0:
-            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * saturation, 0, 255)
+            s = np.clip(s * saturation, 0, 255)
+
+        # Apply brightness adjustment (additive for small values, multiplicative causes issues)
         if brightness != 0:
-            hsv[:, :, 2] = np.clip(hsv[:, :, 2] * (1 + brightness), 0, 255)
-        frame = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+            # For small brightness values (±0.05 range), use additive adjustment
+            # brightness of 0.05 = +12.75 to V channel (out of 255)
+            v = np.clip(v + brightness * 255, 0, 255)
 
+        # Merge back and convert
+        hsv = cv2.merge([h, s.astype(np.uint8), v.astype(np.uint8)])
+        result = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR_FULL)
+
+    # Apply contrast adjustment in BGR space
     if contrast != 1.0:
-        frame = cv2.convertScaleAbs(frame, alpha=contrast, beta=(1 - contrast) * 128)
+        # convertScaleAbs: output = |alpha * input + beta|
+        # For contrast, we want to scale around middle gray (128)
+        result = cv2.convertScaleAbs(result, alpha=contrast, beta=128 * (1 - contrast))
 
-    return frame
+    return result
 
 
 def _generate_spoofer_blur_params(rng: random.Random) -> dict:
@@ -382,22 +420,42 @@ def _create_spoofer_blur_zone(
     blur_strength: int,
     params: dict
 ) -> np.ndarray:
-    """Create blur zone from video content."""
+    """Create blur zone from video content.
+
+    Args:
+        content: The scaled video frame
+        target_w: Width of the blur zone (should match output width)
+        target_h: Height of the blur zone
+        position: 'top', 'bottom', or 'center' - where to extract source content from
+        blur_strength: Gaussian blur kernel size
+        params: Random parameters for variety (zoom, flip, darken, etc.)
+    """
     if target_h <= 0:
         return np.zeros((0, target_w, 3), dtype=np.uint8)
 
     content_h, content_w = content.shape[:2]
+
+    # Determine source region based on position
+    # Use 65% of content height as source, taken from the specified position
     source_ratio = 0.65
     source_h = max(int(content_h * source_ratio), min(content_h, max(target_h * 2, 100)))
     source_h = max(10, min(source_h, content_h))
 
     if position == 'top':
+        # Extract from top of content
         source = content[0:source_h, :].copy()
-    else:
+    elif position == 'bottom':
+        # Extract from bottom of content
         start_y = max(0, content_h - source_h)
         source = content[start_y:, :].copy()
+    else:  # 'center' - extract from center of content
+        # Center the source region vertically
+        center_y = content_h // 2
+        start_y = max(0, center_y - source_h // 2)
+        end_y = min(content_h, start_y + source_h)
+        source = content[start_y:end_y, :].copy()
 
-    # Zoom to fill
+    # Zoom to fill the target dimensions
     zoom = max(target_w / source.shape[1], target_h / source.shape[0]) * params['zoom']
     zoomed_w = int(source.shape[1] * zoom)
     zoomed_h = int(source.shape[0] * zoom)
@@ -407,7 +465,7 @@ def _create_spoofer_blur_zone(
 
     source = cv2.resize(source, (zoomed_w, zoomed_h), interpolation=cv2.INTER_LINEAR)
 
-    # Center crop
+    # Center crop to target dimensions
     crop_x = max(0, (zoomed_w - target_w) // 2)
     crop_y = max(0, (zoomed_h - target_h) // 2)
     blur_section = source[crop_y:crop_y + target_h, crop_x:crop_x + target_w]
@@ -418,7 +476,7 @@ def _create_spoofer_blur_zone(
     # Flip for variety
     if params['hflip']:
         blur_section = cv2.flip(blur_section, 1)
-    if position == 'top' and params['vflip']:
+    if params['vflip']:
         blur_section = cv2.flip(blur_section, 0)
 
     # Darken

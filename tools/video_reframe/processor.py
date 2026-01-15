@@ -5,10 +5,17 @@ Converts any aspect ratio video to vertical (9:16) with blur areas and logo over
 This processor uses FFmpeg's hardware acceleration pipeline for maximum throughput:
 - GPU decode: h264_cuvid/hevc_cuvid
 - GPU scaling: scale_cuda/scale_npp
-- GPU blur: FFmpeg gblur filter (efficient CPU) or split+overlay method
+- GPU blur: Dynamic random frame sampling with transformations
 - GPU encode: h264_nvenc with CUDA output
 
 Performance: ~200-500 fps on modern GPUs vs ~5-10 fps with frame-by-frame OpenCV
+
+Blur Zone Feature:
+- Samples random frames from the video at different timestamps
+- Applies random rotation (-15 to +15 degrees)
+- Applies random scale/zoom
+- Applies variable opacity (0.3-0.7)
+- Creates a dynamic, visually interesting blur background
 """
 
 import os
@@ -17,8 +24,9 @@ import tempfile
 import json
 import random
 import math
+import shutil
 from pathlib import Path
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable, Dict, Any, List
 
 # Import GPU utilities
 try:
@@ -119,6 +127,17 @@ def process_video_reframe(
     logo_path = None
     if logo_name and logo_name != 'none':
         logo_path = _prepare_logo_file(logo_name, final_w, logo_size)
+        if logo_path:
+            print(f"[VideoReframe] Logo prepared successfully: {logo_path}")
+            # Verify the logo file exists and has content
+            if os.path.exists(logo_path):
+                logo_size_bytes = os.path.getsize(logo_path)
+                print(f"[VideoReframe] Logo file size: {logo_size_bytes} bytes")
+            else:
+                print(f"[VideoReframe] WARNING: Logo path returned but file does not exist!")
+                logo_path = None
+        else:
+            print(f"[VideoReframe] WARNING: Logo preparation failed for '{logo_name}'")
 
     # Build FFmpeg filter complex
     filter_complex = _build_filter_complex(
@@ -126,7 +145,8 @@ def process_video_reframe(
         layout, blur_intensity,
         brightness, saturation, contrast,
         logo_path, logo_size,
-        video_index
+        video_index,
+        duration  # Pass duration for random time sampling in blur zones
     )
 
     print(f"[VideoReframe] Filter: {filter_complex[:200]}...")
@@ -360,34 +380,55 @@ def _prepare_logo_file(logo_name: str, video_width: int, size_percent: float) ->
     """
     Prepare logo as PNG file for FFmpeg overlay.
     Returns path to temp PNG file or None if failed.
+
+    Search order for logos:
+    1. /workspace/assets/logos/ (Docker runtime)
+    2. ./assets/logos/ (relative to script)
+    3. ../assets/logos/ (one level up)
+    4. Script directory/../assets/logos/
     """
     try:
-        # Check for built-in logos
+        # Multiple search paths for logos (Docker + local development)
         workspace = os.environ.get('WORKSPACE', '/workspace')
-        logos_dir = Path(workspace) / 'assets' / 'logos'
+        script_dir = Path(__file__).parent.resolve()
 
-        logo_map = {
-            'farmium_icon': logos_dir / 'farmium_icon.png',
-            'farmium_full': logos_dir / 'farmium_full.png',
-        }
+        search_paths = [
+            Path(workspace) / 'assets' / 'logos',           # Docker: /workspace/assets/logos
+            Path('/workspace/assets/logos'),                 # Explicit Docker path
+            script_dir / 'assets' / 'logos',                # Same dir as script
+            script_dir.parent / 'assets' / 'logos',         # One level up
+            script_dir.parent.parent / 'assets' / 'logos',  # Two levels up (gpu-tools/assets/logos)
+            Path('./assets/logos'),                          # Current working directory
+            Path('../assets/logos'),                         # One up from cwd
+        ]
 
-        # Also check for SVG versions
-        svg_map = {
-            'farmium_icon': logos_dir / 'farmium_icon.svg',
-            'farmium_full': logos_dir / 'farmium_full.svg',
-        }
+        print(f"[VideoReframe] Searching for logo '{logo_name}' in paths...")
 
         logo_source = None
         is_svg = False
 
-        if logo_name in logo_map and logo_map[logo_name].exists():
-            logo_source = str(logo_map[logo_name])
-        elif logo_name in svg_map and svg_map[logo_name].exists():
-            logo_source = str(svg_map[logo_name])
-            is_svg = True
+        # Check for built-in logo names
+        if logo_name in ['farmium_icon', 'farmium_full']:
+            # Try PNG first, then SVG
+            for search_path in search_paths:
+                png_path = search_path / f'{logo_name}.png'
+                svg_path = search_path / f'{logo_name}.svg'
+
+                if png_path.exists():
+                    logo_source = str(png_path)
+                    is_svg = False
+                    print(f"[VideoReframe] Found PNG logo at: {logo_source}")
+                    break
+                elif svg_path.exists():
+                    logo_source = str(svg_path)
+                    is_svg = True
+                    print(f"[VideoReframe] Found SVG logo at: {logo_source}")
+                    break
+
         elif logo_name.startswith('http://') or logo_name.startswith('https://'):
             # Download from URL
             import requests
+            print(f"[VideoReframe] Downloading logo from URL: {logo_name}")
             response = requests.get(logo_name, timeout=30)
             response.raise_for_status()
 
@@ -397,53 +438,91 @@ def _prepare_logo_file(logo_name: str, video_width: int, size_percent: float) ->
             temp_logo.write(response.content)
             temp_logo.close()
             logo_source = temp_logo.name
+
         elif Path(logo_name).exists():
             logo_source = logo_name
             is_svg = logo_name.lower().endswith('.svg')
+            print(f"[VideoReframe] Using provided logo path: {logo_source}")
 
         if not logo_source:
             print(f"[VideoReframe] Logo not found: {logo_name}")
+            print(f"[VideoReframe] Searched paths: {[str(p) for p in search_paths]}")
             return None
 
-        # Calculate target logo width
-        logo_w = int(video_width * size_percent / 100)
+        # Calculate target logo width (ensure minimum size for visibility)
+        logo_w = max(int(video_width * size_percent / 100), 80)  # At least 80px
+        print(f"[VideoReframe] Target logo width: {logo_w}px (size_percent={size_percent}%)")
 
         # Convert/resize logo using FFmpeg
         temp_output = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
         temp_output.close()
 
         if is_svg:
-            # Use cairosvg if available, otherwise skip
+            # Use cairosvg if available
             try:
                 import cairosvg
-                from io import BytesIO
+                print(f"[VideoReframe] Converting SVG to PNG using cairosvg...")
                 png_data = cairosvg.svg2png(url=logo_source, output_width=logo_w)
                 with open(temp_output.name, 'wb') as f:
                     f.write(png_data)
+                print(f"[VideoReframe] SVG converted successfully: {temp_output.name}")
                 return temp_output.name
             except ImportError:
-                print("[VideoReframe] cairosvg not available, skipping SVG logo")
+                print("[VideoReframe] cairosvg not available, trying rsvg-convert...")
+                # Try rsvg-convert as fallback (available on many Linux systems)
+                try:
+                    cmd = ['rsvg-convert', '-w', str(logo_w), '-o', temp_output.name, logo_source]
+                    result = subprocess.run(cmd, capture_output=True, timeout=30)
+                    if result.returncode == 0:
+                        print(f"[VideoReframe] SVG converted with rsvg-convert: {temp_output.name}")
+                        return temp_output.name
+                except Exception as e:
+                    print(f"[VideoReframe] rsvg-convert failed: {e}")
+
+                # Try Inkscape as last resort
+                try:
+                    cmd = ['inkscape', '--export-type=png', f'--export-width={logo_w}',
+                           f'--export-filename={temp_output.name}', logo_source]
+                    result = subprocess.run(cmd, capture_output=True, timeout=60)
+                    if result.returncode == 0:
+                        print(f"[VideoReframe] SVG converted with Inkscape: {temp_output.name}")
+                        return temp_output.name
+                except Exception as e:
+                    print(f"[VideoReframe] Inkscape failed: {e}")
+
+                print("[VideoReframe] No SVG converter available. Logo will be skipped.")
                 return None
         else:
             # Resize PNG using FFmpeg (maintains alpha)
             cmd = [
-                'ffmpeg', '-y', '-v', 'quiet',
+                'ffmpeg', '-y', '-v', 'warning',
                 '-i', logo_source,
-                '-vf', f'scale={logo_w}:-1',
+                '-vf', f'scale={logo_w}:-1:flags=lanczos',
                 '-c:v', 'png',
                 temp_output.name
             ]
 
+            print(f"[VideoReframe] Resizing PNG logo...")
             result = subprocess.run(cmd, capture_output=True, timeout=30)
 
             if result.returncode == 0:
+                print(f"[VideoReframe] Logo prepared: {temp_output.name}")
                 return temp_output.name
             else:
                 print(f"[VideoReframe] Failed to resize logo: {result.stderr.decode()[:200]}")
-                return None
+                # Try copying as-is if resize fails
+                try:
+                    shutil.copy2(logo_source, temp_output.name)
+                    print(f"[VideoReframe] Using original logo without resize")
+                    return temp_output.name
+                except Exception as e:
+                    print(f"[VideoReframe] Copy fallback also failed: {e}")
+                    return None
 
     except Exception as e:
         print(f"[VideoReframe] Error preparing logo: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -455,21 +534,29 @@ def _build_filter_complex(
     brightness: int, saturation: int, contrast: int,
     logo_path: Optional[str],
     logo_size: float,
-    video_index: int = 0
+    video_index: int = 0,
+    duration: float = 10.0
 ) -> str:
     """
     Build FFmpeg filter_complex string for the entire reframe pipeline.
 
-    Strategy:
-    1. Create blurred background from input (scaled up, blurred)
-       - For 9:16 outputs: apply random transformations to blur background
-    2. Scale content to fit
-    3. Overlay content on blurred background
-    4. Optionally overlay logo
-    5. Apply color adjustments
+    Strategy for 9:16 vertical outputs (ENHANCED BLUR ZONES):
+    1. Create multiple blur layer streams from different time offsets of the video
+    2. Apply random transformations to each layer:
+       - Random rotation (-15 to +15 degrees)
+       - Random scale/zoom
+       - Variable opacity (0.3-0.7)
+       - Random position offset
+    3. Blend layers together for dynamic, visually interesting blur background
+    4. Scale content to fit and overlay
+    5. Optionally overlay logo
+
+    For non-9:16 outputs:
+    - Standard single-layer blurred background
 
     Args:
         video_index: Used as random seed for deterministic randomization per video
+        duration: Video duration in seconds (for calculating time offsets)
     """
     filters = []
 
@@ -482,107 +569,166 @@ def _build_filter_complex(
     content_y = layout['content_y']
 
     # ==========================================================================
-    # DETECT IF OUTPUT IS 9:16 (VERTICAL) FOR RANDOM BLUR TRANSFORMATIONS
+    # DETECT IF OUTPUT IS 9:16 (VERTICAL) FOR DYNAMIC RANDOM BLUR ZONES
     # ==========================================================================
     is_vertical_output = final_w == 1080 and final_h == 1920  # 9:16 format
 
-    # Generate random transformation parameters for 9:16 videos
-    # Use video_index as seed for deterministic but varied results
     if is_vertical_output:
-        rng = random.Random(video_index + 42)  # Seeded random for reproducibility
+        # Use seeded RNG for reproducible but varied results
+        rng = random.Random(video_index + 42)
 
-        # Random rotation angle: -5 to +5 degrees
-        rand_angle = rng.uniform(-5, 5)
-        rand_angle_rad = rand_angle * math.pi / 180  # Convert to radians for FFmpeg
+        # Number of blur layers (3-5 for visual variety)
+        num_blur_layers = 4
 
-        # Random zoom: 1.0 to 1.15 (slight zoom)
-        rand_zoom = rng.uniform(1.0, 1.15)
+        # Generate random parameters for each blur layer
+        blur_layers = []
+        for i in range(num_blur_layers):
+            layer = {
+                # Time offset: sample from different parts of the video
+                'time_offset': rng.uniform(0, max(0.1, duration - 0.5)),
+                # Rotation: -15 to +15 degrees (more aggressive than before)
+                'rotation': rng.uniform(-15, 15),
+                # Scale: 1.2 to 2.0 (zoomed in significantly)
+                'scale': rng.uniform(1.2, 2.0),
+                # Opacity: 0.3 to 0.7
+                'opacity': rng.uniform(0.3, 0.7),
+                # Position offset as percentage of frame
+                'offset_x': rng.uniform(-0.3, 0.3),  # -30% to +30%
+                'offset_y': rng.uniform(-0.3, 0.3),
+                # Horizontal flip: 50% chance
+                'hflip': rng.random() < 0.5,
+                # Color shift for variety
+                'hue_shift': rng.uniform(-0.1, 0.1),
+                'saturation_mult': rng.uniform(0.7, 1.3),
+            }
+            blur_layers.append(layer)
 
-        # Random brightness adjustment: -0.05 to +0.05
-        rand_brightness = rng.uniform(-0.05, 0.05)
+        print(f"[VideoReframe] 9:16 dynamic blur zones: {num_blur_layers} layers")
+        for i, layer in enumerate(blur_layers):
+            print(f"  Layer {i}: time={layer['time_offset']:.2f}s, rot={layer['rotation']:.1f}deg, "
+                  f"scale={layer['scale']:.2f}, opacity={layer['opacity']:.2f}, hflip={layer['hflip']}")
 
-        # Random contrast adjustment: 0.95 to 1.05
-        rand_contrast = rng.uniform(0.95, 1.05)
+        # ======================================================================
+        # BUILD DYNAMIC BLUR BACKGROUND FROM MULTIPLE VIDEO SAMPLES
+        # ======================================================================
 
-        # Random horizontal flip: 50% chance
-        apply_hflip = rng.random() < 0.5
+        # First, create the base black canvas
+        filters.append(f"color=c=black:s={final_w}x{final_h}:r=30[canvas]")
 
-        print(f"[VideoReframe] 9:16 blur transformations: angle={rand_angle:.2f}deg, "
-              f"zoom={rand_zoom:.2f}, brightness={rand_brightness:.3f}, "
-              f"contrast={rand_contrast:.3f}, hflip={apply_hflip}")
+        # Split input into N+1 streams (N for blur layers + 1 for foreground)
+        split_count = num_blur_layers + 1
+        split_outputs = "".join([f"[s{i}]" for i in range(split_count)])
+        filters.append(f"[0:v]split={split_count}{split_outputs}")
 
-    # ==========================================================================
-    # FILTER CHAIN:
-    # [0:v] -> split into background and foreground
-    # background: scale to fill + (random transforms for 9:16) + blur
-    # foreground: scale to fit
-    # overlay foreground on background
-    # optional: overlay logo
-    # ==========================================================================
+        # Process each blur layer
+        current_bg = "[canvas]"
 
-    # Split input into two streams
-    filters.append(f"[0:v]split=2[bg_in][fg_in]")
+        for i, layer in enumerate(blur_layers):
+            layer_input = f"[s{i}]"
+            layer_output = f"[blur{i}]"
+            blend_output = f"[bg{i}]"
 
-    # Background: scale to fill entire frame (crop center), then blur
-    # Calculate scale to fill (cover) the output dimensions
-    base_scale = max(final_w / orig_w, final_h / orig_h) * 1.1  # 10% extra for crop margin
+            # Calculate rotation in radians
+            rot_rad = layer['rotation'] * math.pi / 180
 
-    # For 9:16, apply additional zoom factor and account for rotation padding
-    if is_vertical_output:
-        # Extra scaling to account for rotation (corners need margin)
-        rotation_margin = 1.0 + abs(math.sin(rand_angle_rad)) * 0.15
-        scale_fill = base_scale * rand_zoom * rotation_margin
+            # Calculate scaled dimensions (for covering the frame after rotation)
+            scale_factor = layer['scale'] * 1.3  # Extra margin for rotation
+            layer_w = int(orig_w * scale_factor)
+            layer_h = int(orig_h * scale_factor)
+            # Ensure even dimensions
+            layer_w = layer_w + (layer_w % 2)
+            layer_h = layer_h + (layer_h % 2)
+
+            # Build transformation chain for this layer
+            transform_parts = []
+
+            # 1. Seek to random time offset using setpts (creates static frame effect from that moment)
+            # Use trim to get a small segment starting at the offset, then loop it
+            if duration > 1:
+                trim_start = max(0, layer['time_offset'])
+                trim_end = min(trim_start + 0.5, duration)
+                transform_parts.append(f"trim=start={trim_start:.3f}:end={trim_end:.3f},setpts=PTS-STARTPTS")
+
+            # 2. Scale up
+            transform_parts.append(f"scale={layer_w}:{layer_h}:flags=fast_bilinear")
+
+            # 3. Horizontal flip (if enabled)
+            if layer['hflip']:
+                transform_parts.append("hflip")
+
+            # 4. Apply rotation
+            # Calculate output size for rotation to avoid black corners
+            rot_margin = abs(math.sin(rot_rad)) + abs(math.cos(rot_rad))
+            rot_out_w = int(layer_w * rot_margin)
+            rot_out_h = int(layer_h * rot_margin)
+            rot_out_w = rot_out_w + (rot_out_w % 2)
+            rot_out_h = rot_out_h + (rot_out_h % 2)
+            transform_parts.append(f"rotate={rot_rad:.6f}:ow={rot_out_w}:oh={rot_out_h}:fillcolor=black")
+
+            # 5. Apply color adjustments (hue/saturation for variety)
+            hue_val = layer['hue_shift']
+            sat_val = layer['saturation_mult']
+            transform_parts.append(f"hue=h={hue_val*360:.1f}:s={sat_val:.2f}")
+
+            # 6. Crop to final dimensions with random offset
+            crop_x = f"(iw-{final_w})/2+{int(layer['offset_x'] * final_w)}"
+            crop_y = f"(ih-{final_h})/2+{int(layer['offset_y'] * final_h)}"
+            transform_parts.append(f"crop={final_w}:{final_h}:{crop_x}:{crop_y}")
+
+            # 7. Apply blur (heavier blur for background layers)
+            layer_blur = blur_sigma + (i * 5)  # Increase blur for each layer
+            transform_parts.append(f"gblur=sigma={layer_blur}")
+
+            # 8. Set opacity using format and colorchannelmixer
+            opacity = layer['opacity']
+            transform_parts.append(f"format=rgba,colorchannelmixer=aa={opacity:.2f}")
+
+            # Combine transform chain
+            transform_chain = ",".join(transform_parts) + layer_output
+            filters.append(f"{layer_input}{transform_chain}")
+
+            # Blend this layer onto the current background
+            # Use overlay with alpha blending
+            filters.append(f"{current_bg}{layer_output}overlay=0:0:format=auto{blend_output}")
+            current_bg = blend_output
+
+        # Final background processing: apply one more blur pass for smoothness
+        filters.append(f"{current_bg}gblur=sigma={blur_sigma // 2 + 1}[bg]")
+
+        # Foreground: scale to fit within output dimensions (using the last split stream)
+        fg_input = f"[s{num_blur_layers}]"
+        fg_filter = f"{fg_input}scale={scaled_w}:{scaled_h}:flags=lanczos[fg]"
+        filters.append(fg_filter)
+
     else:
-        scale_fill = base_scale
+        # ======================================================================
+        # NON-9:16 OUTPUTS: Standard single-layer blur background
+        # ======================================================================
 
-    bg_scaled_w = int(orig_w * scale_fill)
-    bg_scaled_h = int(orig_h * scale_fill)
-    # Ensure even
-    bg_scaled_w = bg_scaled_w + (bg_scaled_w % 2)
-    bg_scaled_h = bg_scaled_h + (bg_scaled_h % 2)
+        # Split input into two streams
+        filters.append(f"[0:v]split=2[bg_in][fg_in]")
 
-    # Background filter chain
-    if is_vertical_output:
-        # Build filter chain with random transformations for 9:16
-        bg_filter_parts = [f"[bg_in]scale={bg_scaled_w}:{bg_scaled_h}:flags=fast_bilinear"]
+        # Background: scale to fill entire frame (crop center), then blur
+        base_scale = max(final_w / orig_w, final_h / orig_h) * 1.1
+        bg_scaled_w = int(orig_w * base_scale)
+        bg_scaled_h = int(orig_h * base_scale)
+        bg_scaled_w = bg_scaled_w + (bg_scaled_w % 2)
+        bg_scaled_h = bg_scaled_h + (bg_scaled_h % 2)
 
-        # Apply horizontal flip (before rotation for more variety)
-        if apply_hflip:
-            bg_filter_parts.append("hflip")
-
-        # Apply rotation (angle in radians, fillcolor for edges)
-        # Use larger output size to capture rotated content
-        rot_out_w = int(bg_scaled_w * 1.2)
-        rot_out_h = int(bg_scaled_h * 1.2)
-        # Ensure even dimensions
-        rot_out_w = rot_out_w + (rot_out_w % 2)
-        rot_out_h = rot_out_h + (rot_out_h % 2)
-        bg_filter_parts.append(f"rotate={rand_angle_rad:.6f}:ow={rot_out_w}:oh={rot_out_h}:fillcolor=black")
-
-        # Apply brightness/contrast adjustments
-        bg_filter_parts.append(f"eq=brightness={rand_brightness:.4f}:contrast={rand_contrast:.4f}")
-
-        # Crop to final dimensions (center crop)
-        bg_filter_parts.append(f"crop={final_w}:{final_h}:(iw-{final_w})/2:(ih-{final_h})/2")
-
-        # Apply blur
-        bg_filter_parts.append(f"gblur=sigma={blur_sigma}[bg]")
-
-        bg_filter = ",".join(bg_filter_parts)
-    else:
-        # Original behavior for non-9:16 outputs
         bg_filter = (
             f"[bg_in]scale={bg_scaled_w}:{bg_scaled_h}:flags=fast_bilinear,"
             f"crop={final_w}:{final_h}:(iw-{final_w})/2:(ih-{final_h})/2,"
             f"gblur=sigma={blur_sigma}[bg]"
         )
-    filters.append(bg_filter)
+        filters.append(bg_filter)
 
-    # Foreground: scale to fit within output dimensions
-    fg_filter = f"[fg_in]scale={scaled_w}:{scaled_h}:flags=lanczos[fg]"
-    filters.append(fg_filter)
+        # Foreground: scale to fit
+        fg_filter = f"[fg_in]scale={scaled_w}:{scaled_h}:flags=lanczos[fg]"
+        filters.append(fg_filter)
 
-    # Overlay foreground on background (centered)
+    # ==========================================================================
+    # OVERLAY FOREGROUND ON BACKGROUND
+    # ==========================================================================
     overlay_x = content_x
     overlay_y = content_y
     filters.append(f"[bg][fg]overlay={overlay_x}:{overlay_y}:format=auto[main]")
@@ -590,21 +736,20 @@ def _build_filter_complex(
     # Track current output stream
     current_output = "[main]"
 
-    # Apply color adjustments if any
+    # ==========================================================================
+    # COLOR ADJUSTMENTS
+    # ==========================================================================
     color_filters = []
 
     if brightness != 0:
-        # brightness: -1.0 to 1.0 (we get -50 to 50)
         br_val = brightness / 100.0
         color_filters.append(f"brightness={br_val}")
 
     if contrast != 0:
-        # contrast: 0 to 2.0 (we get -50 to 50, map to 0.5-1.5)
         ct_val = 1.0 + (contrast / 100.0)
         color_filters.append(f"contrast={ct_val}")
 
     if saturation != 0:
-        # saturation: 0 to 3.0 (we get -100 to 100, map to 0-2)
         sat_val = 1.0 + (saturation / 100.0)
         color_filters.append(f"saturation={sat_val}")
 
@@ -613,19 +758,25 @@ def _build_filter_complex(
         filters.append(eq_filter)
         current_output = "[color]"
 
-    # Logo overlay (if logo file provided)
+    # ==========================================================================
+    # LOGO OVERLAY
+    # ==========================================================================
     if logo_path and os.path.exists(logo_path):
         # Logo will be second input [1:v]
-        # Position: bottom center with 5% margin
+        # Position: bottom center with 5% margin from bottom
         logo_y = f"H-h-H*0.05"  # 5% from bottom
-        logo_x = "(W-w)/2"  # centered
+        logo_x = "(W-w)/2"  # centered horizontally
 
+        # Add slight transparency to logo for better blending
         filters.append(f"{current_output}[1:v]overlay={logo_x}:{logo_y}:format=auto[out]")
         current_output = "[out]"
+        print(f"[VideoReframe] Logo overlay added at bottom-center")
     else:
-        # Rename final output
+        # No logo - just pass through
         filters.append(f"{current_output}null[out]")
         current_output = "[out]"
+        if logo_path:
+            print(f"[VideoReframe] WARNING: Logo path provided but file not found: {logo_path}")
 
     return ";".join(filters)
 
@@ -663,8 +814,10 @@ def _run_ffmpeg_reframe(
         cmd.extend(['-i', input_path])
 
         # Input logo if filter uses it
+        # Logo needs -loop 1 to repeat for the entire video duration
         if has_logo:
-            cmd.extend(['-i', logo_path])
+            cmd.extend(['-loop', '1', '-i', logo_path])
+            print(f"[VideoReframe] Adding logo input: {logo_path}")
 
         # Filter complex
         cmd.extend(['-filter_complex', filter_complex])
@@ -705,6 +858,10 @@ def _run_ffmpeg_reframe(
             cmd.extend(['-map', '0:a?', '-c:a', 'aac', '-b:a', '128k'])
         else:
             cmd.append('-an')
+
+        # If we have a looping logo input, use -shortest to end when video ends
+        if has_logo:
+            cmd.append('-shortest')
 
         cmd.extend([
             '-movflags', '+faststart',
@@ -859,19 +1016,29 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 3:
-        print("Usage: python processor.py <input.mp4> <output.mp4> [aspect_ratio]")
+        print("Usage: python processor.py <input.mp4> <output.mp4> [aspect_ratio] [logo_name]")
         print("Example: python processor.py video.mp4 out.mp4 9:16")
+        print("Example with logo: python processor.py video.mp4 out.mp4 9:16 farmium_full")
+        print("")
+        print("Logo options: farmium_icon, farmium_full, none, or URL")
         sys.exit(1)
 
     input_file = sys.argv[1]
     output_file = sys.argv[2]
     aspect = sys.argv[3] if len(sys.argv) > 3 else '9:16'
+    logo = sys.argv[4] if len(sys.argv) > 4 else 'farmium_full'
 
     config = {
         'aspectRatio': aspect,
-        'logoName': 'none',
+        'logoName': logo,
+        'logoSize': 15,  # 15% of video width
         'blurIntensity': 20,
     }
+
+    print(f"[CLI] Input: {input_file}")
+    print(f"[CLI] Output: {output_file}")
+    print(f"[CLI] Aspect: {aspect}")
+    print(f"[CLI] Logo: {logo}")
 
     def progress(p, msg):
         print(f"[{int(p*100):3d}%] {msg}")

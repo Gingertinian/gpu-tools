@@ -214,17 +214,21 @@ def process_video_with_blur_logo(
     if spatial.get('rotation', 0) > 0:
         rotation_angle = py_rng.uniform(-spatial['rotation'], spatial['rotation'])
 
+    # Color adjustments - scale config values (0-100) to proper ranges
     brightness_adj = 0
     if tonal.get('brightness', 0) > 0:
-        brightness_adj = py_rng.uniform(-tonal['brightness'], tonal['brightness']) * 0.4
+        # Scale: config 5 -> ±0.05 brightness adjustment
+        brightness_adj = py_rng.uniform(-tonal['brightness'], tonal['brightness']) * 0.01
 
     contrast_adj = 1.0
     if tonal.get('contrast', 0) > 0:
-        contrast_adj = 1 + py_rng.uniform(-tonal['contrast'], tonal['contrast'])
+        # Scale: config 5 -> ±0.05 contrast variation (0.95 to 1.05)
+        contrast_adj = 1 + py_rng.uniform(-tonal['contrast'], tonal['contrast']) * 0.01
 
     saturation_adj = 1.0
     if tonal.get('saturation', 0) > 0:
-        saturation_adj = 1 + py_rng.uniform(-tonal['saturation'], tonal['saturation'])
+        # Scale: config 5 -> ±0.05 saturation variation (0.95 to 1.05)
+        saturation_adj = 1 + py_rng.uniform(-tonal['saturation'], tonal['saturation']) * 0.01
 
     # Start FFmpeg writer
     ffmpeg_process = _start_spoofer_ffmpeg(

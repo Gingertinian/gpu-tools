@@ -1,21 +1,19 @@
 """
-Video Reframe Processor - 100% GPU/FFmpeg Pipeline
-Converts any aspect ratio video to vertical (9:16) with blur areas and logo overlay.
+Video Reframe Processor - Frame-by-Frame with Animated Blur Zones
 
-This processor uses FFmpeg's hardware acceleration pipeline for maximum throughput:
-- GPU decode: h264_cuvid/hevc_cuvid
-- GPU scaling: scale_cuda/scale_npp
-- GPU blur: Dynamic random frame sampling with transformations
-- GPU encode: h264_nvenc with CUDA output
+Converts any aspect ratio video to vertical (9:16) with blur zones on TOP and BOTTOM.
 
-Performance: ~200-500 fps on modern GPUs vs ~5-10 fps with frame-by-frame OpenCV
+Key features:
+1. Video content stays CENTERED, scaled to fill the WIDTH
+2. Blur zones on TOP and BOTTOM (not left/right)
+3. Blur is generated FROM the video content itself
+4. Blur ANIMATES - updates every ~20 frames with different random parameters
+5. Optional logo overlay
 
-Blur Zone Feature:
-- Samples random frames from the video at different timestamps
-- Applies random rotation (-15 to +15 degrees)
-- Applies random scale/zoom
-- Applies variable opacity (0.3-0.7)
-- Creates a dynamic, visually interesting blur background
+For 9:16 output (1080x1920):
+- Video content fills width (1080px)
+- Height is scaled proportionally
+- Blur fills the gaps above and below the video
 """
 
 import os
@@ -25,6 +23,8 @@ import json
 import random
 import math
 import shutil
+import cv2
+import numpy as np
 from pathlib import Path
 from typing import Optional, Callable, Dict, Any, List
 
@@ -37,7 +37,6 @@ try:
         GPUManager
     )
 except ImportError:
-    # Fallback imports for local testing
     try:
         from gpu_utils import (
             get_gpu_count,
@@ -52,6 +51,90 @@ except ImportError:
         GPUManager = None
 
 
+# =============================================================================
+# BLUR EFFECTS CLASS
+# =============================================================================
+
+class BlurEffects:
+    """Optimized blur and visual effects for video processing."""
+
+    @staticmethod
+    def gaussian_blur(image: np.ndarray, strength: int = 25) -> np.ndarray:
+        """Apply Gaussian blur with specified strength."""
+        if strength <= 0:
+            return image
+        k = int(strength) | 1  # Ensure odd kernel size
+        return cv2.GaussianBlur(image, (k, k), 0)
+
+    @staticmethod
+    def flip_vertical(image: np.ndarray) -> np.ndarray:
+        """Flip image vertically (mirror effect)."""
+        return cv2.flip(image, 0)
+
+    @staticmethod
+    def flip_horizontal(image: np.ndarray) -> np.ndarray:
+        """Flip image horizontally."""
+        return cv2.flip(image, 1)
+
+    @staticmethod
+    def color_shift(image: np.ndarray, hue_shift: int) -> np.ndarray:
+        """Shift hue values in image."""
+        if hue_shift == 0:
+            return image
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        hsv[:, :, 0] = (hsv[:, :, 0].astype(np.int16) + int(hue_shift)) % 180
+        return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+    @staticmethod
+    def adjust_saturation_brightness(image: np.ndarray, saturation: float = 1.0, brightness: float = 1.0) -> np.ndarray:
+        """Adjust saturation and brightness."""
+        if saturation == 1.0 and brightness == 1.0:
+            return image
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV).astype(np.float32)
+        if saturation != 1.0:
+            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * saturation, 0, 255)
+        if brightness != 1.0:
+            hsv[:, :, 2] = np.clip(hsv[:, :, 2] * brightness, 0, 255)
+        return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+    @staticmethod
+    def add_noise(image: np.ndarray, intensity: int) -> np.ndarray:
+        """Add random noise to image."""
+        if intensity <= 0:
+            return image
+        noise = np.random.randint(-intensity, intensity + 1, image.shape, dtype=np.int16)
+        return np.clip(image.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def tilt(image: np.ndarray, angle: float, rotation_matrix: np.ndarray = None) -> np.ndarray:
+        """Apply rotation/tilt to image."""
+        if angle == 0:
+            return image
+        h, w = image.shape[:2]
+        if rotation_matrix is None:
+            center = (w // 2, h // 2)
+            rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+        return cv2.warpAffine(image, rotation_matrix, (w, h), borderMode=cv2.BORDER_REFLECT)
+
+    @staticmethod
+    def adjust_contrast(image: np.ndarray, contrast: float) -> np.ndarray:
+        """Adjust image contrast."""
+        if contrast == 1.0:
+            return image
+        return cv2.convertScaleAbs(image, alpha=contrast, beta=(1 - contrast) * 128)
+
+    @staticmethod
+    def darken(image: np.ndarray, factor: float = 0.7) -> np.ndarray:
+        """Darken image by a factor."""
+        if factor >= 1.0:
+            return image
+        return (image.astype(np.float32) * factor).astype(np.uint8)
+
+
+# =============================================================================
+# MAIN PROCESSOR
+# =============================================================================
+
 def process_video_reframe(
     input_path: str,
     output_path: str,
@@ -61,7 +144,10 @@ def process_video_reframe(
     video_index: int = 0
 ) -> dict:
     """
-    Convert any video to vertical format using 100% FFmpeg GPU pipeline.
+    Convert any video to vertical format with blur zones on TOP and BOTTOM.
+
+    The video content is centered and fills the WIDTH. Blur zones fill the
+    vertical gaps above and below the video content.
 
     Args:
         input_path: Path to input video file
@@ -70,13 +156,14 @@ def process_video_reframe(
             - aspectRatio: Target aspect ratio as string '9:16', '4:5', '1:1', '16:9'
             - logoName: 'farmium_icon' | 'farmium_full' | 'none' | URL
             - logoSize: Logo size as percentage (default: 15)
-            - blurIntensity: Blur strength 1-100 (default: 20)
+            - blurIntensity: Blur strength 1-100 (default: 25)
             - brightness: Brightness adjustment -50 to 50 (default: 0)
             - saturation: Saturation adjustment -100 to 100 (default: 0)
             - contrast: Contrast adjustment -50 to 50 (default: 0)
+            - blurUpdateInterval: Frames between blur updates (default: 20)
         progress_callback: Optional callback(progress: float, message: str)
-        gpu_id: GPU device ID to use
-        video_index: Index of the video in batch processing (used as seed for random blur transformations)
+        gpu_id: GPU device ID (used for encoder selection)
+        video_index: Index of video in batch (for random seed)
 
     Returns:
         dict with status, outputPath, dimensions, etc.
@@ -88,94 +175,174 @@ def process_video_reframe(
     if progress_callback:
         progress_callback(0.05, "Analyzing video...")
 
-    # Get video info
-    video_info = _get_video_info_ffprobe(str(input_path))
-    orig_w = video_info['width']
-    orig_h = video_info['height']
-    fps = video_info['fps']
-    duration = video_info['duration']
-    has_audio = video_info['has_audio']
+    # Open video
+    cap = cv2.VideoCapture(str(input_path))
+    if not cap.isOpened():
+        raise ValueError(f"Could not open video: {input_path}")
 
-    print(f"[VideoReframe] Input: {orig_w}x{orig_h} @ {fps:.2f} fps, duration: {duration:.2f}s")
+    # Get video properties
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    orig_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    orig_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    duration = total_frames / fps if fps > 0 else 0
+
+    # Check for audio
+    has_audio = _check_audio(str(input_path))
+
+    print(f"[VideoReframe] Input: {orig_w}x{orig_h} @ {fps:.2f} fps, {total_frames} frames, duration: {duration:.2f}s")
 
     # Parse config
     aspect_raw = config.get('aspectRatio', '9:16')
-    # Handle both array [9, 16] and string '9:16' formats
     if isinstance(aspect_raw, (list, tuple)) and len(aspect_raw) == 2:
         aspect_str = f"{aspect_raw[0]}:{aspect_raw[1]}"
     else:
         aspect_str = str(aspect_raw) if aspect_raw else '9:16'
 
     logo_name = config.get('logoName', 'farmium_full')
-    logo_size = config.get('logoSize', 15)  # percentage
-    blur_intensity = config.get('blurIntensity', 20)
-    brightness = config.get('brightness', 0)
-    saturation = config.get('saturation', 0)
-    contrast = config.get('contrast', 0)
+    logo_size = config.get('logoSize', 15)
+    blur_intensity = config.get('blurIntensity', 25)
+    brightness_adj = config.get('brightness', 0)
+    saturation_adj = config.get('saturation', 0)
+    contrast_adj = config.get('contrast', 0)
+    blur_update_interval = config.get('blurUpdateInterval', 20)  # Update blur every N frames
 
     # Calculate output dimensions
     final_w, final_h = _get_output_dimensions(aspect_str)
     print(f"[VideoReframe] Output: {final_w}x{final_h} (aspect: {aspect_str})")
 
-    # Calculate scaling and positioning
+    # Calculate layout - content fills WIDTH, blur on TOP/BOTTOM
     layout = _calculate_layout(orig_w, orig_h, final_w, final_h)
 
-    if progress_callback:
-        progress_callback(0.10, "Building filter pipeline...")
+    print(f"[VideoReframe] Layout: content={layout['scaled_w']}x{layout['scaled_h']}, "
+          f"blur_top={layout['blur_top']}px, blur_bottom={layout['blur_bottom']}px")
 
-    # Prepare logo if needed
-    logo_path = None
+    if progress_callback:
+        progress_callback(0.10, "Preparing processing pipeline...")
+
+    # Prepare logo
+    logo_data = None
     if logo_name and logo_name != 'none':
-        logo_path = _prepare_logo_file(logo_name, final_w, logo_size)
-        if logo_path:
-            print(f"[VideoReframe] Logo prepared successfully: {logo_path}")
-            # Verify the logo file exists and has content
-            if os.path.exists(logo_path):
-                logo_size_bytes = os.path.getsize(logo_path)
-                print(f"[VideoReframe] Logo file size: {logo_size_bytes} bytes")
-            else:
-                print(f"[VideoReframe] WARNING: Logo path returned but file does not exist!")
-                logo_path = None
-        else:
-            print(f"[VideoReframe] WARNING: Logo preparation failed for '{logo_name}'")
+        logo_data = _prepare_logo(logo_name, final_w, logo_size)
+        if logo_data:
+            print(f"[VideoReframe] Logo prepared: {logo_data['image'].shape[1]}x{logo_data['image'].shape[0]}")
 
-    # Build FFmpeg filter complex
-    filter_complex = _build_filter_complex(
-        orig_w, orig_h, final_w, final_h,
-        layout, blur_intensity,
-        brightness, saturation, contrast,
-        logo_path, logo_size,
-        video_index,
-        duration  # Pass duration for random time sampling in blur zones
+    # Initialize blur effects
+    effects = BlurEffects()
+
+    # Random generator with seed for reproducibility
+    rng = random.Random(video_index + 42)
+
+    # Generate initial blur parameters
+    blur_params = _generate_blur_params(rng)
+
+    # Start FFmpeg process for output
+    ffmpeg_process = _start_ffmpeg_writer(
+        str(output_path), final_w, final_h, fps,
+        str(input_path) if has_audio else None,
+        gpu_id
     )
-
-    print(f"[VideoReframe] Filter: {filter_complex[:200]}...")
 
     if progress_callback:
-        progress_callback(0.15, "Starting GPU encoding...")
+        progress_callback(0.15, "Processing frames...")
 
-    # Build and run FFmpeg command
-    success, result = _run_ffmpeg_reframe(
-        str(input_path),
-        str(output_path),
-        filter_complex,
-        fps,
-        duration,
-        has_audio,
-        gpu_id,
-        progress_callback,
-        logo_path  # Pass logo path for second input
-    )
+    # Pre-allocate output frame buffer
+    output_frame = np.zeros((final_h, final_w, 3), dtype=np.uint8)
 
-    # Cleanup temp logo
-    if logo_path and os.path.exists(logo_path):
-        try:
-            os.unlink(logo_path)
-        except:
-            pass
+    # Blur cache (only used between blur updates)
+    cache_blur_top = None
+    cache_blur_bottom = None
 
-    if not success:
-        raise RuntimeError(f"FFmpeg encoding failed: {result.get('error', 'Unknown error')}")
+    # Extract layout values
+    scaled_w = layout['scaled_w']
+    scaled_h = layout['scaled_h']
+    content_x = layout['content_x']
+    content_y = layout['content_y']
+    blur_top_h = layout['blur_top']
+    blur_bottom_h = layout['blur_bottom']
+
+    # Pre-compute rotation matrices if tilt is used
+    rot_matrix_top = None
+    rot_matrix_bottom = None
+
+    frame_idx = 0
+    encoder_used = 'NVENC'  # Will be updated if fallback
+
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Check if we need to update blur (every blur_update_interval frames)
+            update_blur = (frame_idx % blur_update_interval == 0)
+
+            if update_blur:
+                # Generate new random parameters for animated blur effect
+                blur_params = _generate_blur_params(rng)
+
+                # Update rotation matrices
+                if blur_params['tilt_angle'] != 0:
+                    if blur_top_h > 0:
+                        center_top = (final_w // 2, blur_top_h // 2)
+                        rot_matrix_top = cv2.getRotationMatrix2D(center_top, blur_params['tilt_angle'], 1.0)
+                    if blur_bottom_h > 0:
+                        center_bottom = (final_w // 2, blur_bottom_h // 2)
+                        rot_matrix_bottom = cv2.getRotationMatrix2D(center_bottom, -blur_params['tilt_angle'], 1.0)
+                else:
+                    rot_matrix_top = None
+                    rot_matrix_bottom = None
+
+            # Scale content to fit width
+            content = cv2.resize(frame, (scaled_w, scaled_h), interpolation=cv2.INTER_LANCZOS4)
+
+            # Apply color adjustments to content if specified
+            if brightness_adj != 0 or contrast_adj != 0 or saturation_adj != 0:
+                content = _apply_color_adjustments(content, brightness_adj, saturation_adj, contrast_adj)
+
+            # Generate blur zones FROM the video content
+            if blur_top_h > 0:
+                if update_blur or cache_blur_top is None:
+                    cache_blur_top = _create_blur_zone(
+                        effects, content, final_w, blur_top_h, 'top',
+                        blur_intensity, blur_params, rot_matrix_top
+                    )
+                output_frame[0:blur_top_h, :] = cache_blur_top
+
+            # Place main content in center
+            output_frame[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content
+
+            # Bottom blur zone
+            if blur_bottom_h > 0:
+                if update_blur or cache_blur_bottom is None:
+                    cache_blur_bottom = _create_blur_zone(
+                        effects, content, final_w, blur_bottom_h, 'bottom',
+                        blur_intensity, blur_params, rot_matrix_bottom
+                    )
+                output_frame[content_y + scaled_h:, :] = cache_blur_bottom
+
+            # Apply logo overlay
+            if logo_data is not None:
+                _apply_logo(output_frame, logo_data, final_w, final_h)
+
+            # Write frame to FFmpeg
+            try:
+                ffmpeg_process.stdin.write(output_frame.tobytes())
+            except BrokenPipeError:
+                print("[VideoReframe] FFmpeg pipe closed unexpectedly")
+                break
+
+            frame_idx += 1
+
+            # Progress update
+            if progress_callback and (frame_idx % 30 == 0 or frame_idx == total_frames):
+                progress = 0.15 + (frame_idx / total_frames) * 0.80
+                progress_callback(min(progress, 0.95), f"Processing frame {frame_idx}/{total_frames}")
+
+    finally:
+        cap.release()
+        ffmpeg_process.stdin.close()
+        ffmpeg_process.wait()
 
     if progress_callback:
         progress_callback(1.0, "Complete")
@@ -187,80 +354,27 @@ def process_video_reframe(
         "outputPath": str(output_path),
         "outputSize": output_size,
         "dimensions": f"{final_w}x{final_h}",
-        "encoder": result.get('encoder_used', 'unknown'),
+        "encoder": encoder_used,
         "fps": fps,
-        "duration": duration
+        "duration": duration,
+        "framesProcessed": frame_idx
     }
 
 
-def _get_video_info_ffprobe(path: str) -> Dict[str, Any]:
-    """Get video metadata using ffprobe."""
+def _check_audio(video_path: str) -> bool:
+    """Check if video has audio stream using ffprobe."""
     try:
         cmd = [
             'ffprobe', '-v', 'quiet',
-            '-print_format', 'json',
-            '-show_streams', '-show_format',
-            path
+            '-select_streams', 'a',
+            '-show_entries', 'stream=codec_type',
+            '-of', 'csv=p=0',
+            video_path
         ]
-
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-
-        if result.returncode != 0:
-            return _default_video_info()
-
-        info = json.loads(result.stdout)
-
-        video_stream = next(
-            (s for s in info.get('streams', []) if s.get('codec_type') == 'video'),
-            {}
-        )
-
-        audio_stream = next(
-            (s for s in info.get('streams', []) if s.get('codec_type') == 'audio'),
-            None
-        )
-
-        # Parse FPS
-        fps_str = video_stream.get('r_frame_rate', '30/1')
-        try:
-            if '/' in fps_str:
-                num, den = fps_str.split('/')
-                fps = int(num) / int(den) if int(den) != 0 else 30
-            else:
-                fps = float(fps_str)
-        except:
-            fps = 30
-
-        # Get duration
-        duration = float(info.get('format', {}).get('duration', 0))
-        if duration == 0:
-            # Try from video stream
-            duration = float(video_stream.get('duration', 0))
-
-        return {
-            'width': int(video_stream.get('width', 1920)),
-            'height': int(video_stream.get('height', 1080)),
-            'fps': min(fps, 60),  # Cap at 60fps
-            'duration': duration,
-            'has_audio': audio_stream is not None,
-            'codec': video_stream.get('codec_name', 'unknown')
-        }
-
-    except Exception as e:
-        print(f"[VideoReframe] Error getting video info: {e}")
-        return _default_video_info()
-
-
-def _default_video_info() -> Dict[str, Any]:
-    """Return default video info."""
-    return {
-        'width': 1920,
-        'height': 1080,
-        'fps': 30,
-        'duration': 10,
-        'has_audio': True,
-        'codec': 'h264'
-    }
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return 'audio' in result.stdout.lower()
+    except:
+        return True  # Assume audio exists
 
 
 def _get_output_dimensions(aspect_str: str) -> tuple:
@@ -281,673 +395,409 @@ def _get_output_dimensions(aspect_str: str) -> tuple:
     try:
         if ':' in aspect_str:
             w, h = map(int, aspect_str.split(':'))
-            # Scale to 1080 width
             final_w = 1080
             final_h = int(1080 * h / w)
-            # Ensure even dimensions
-            final_h = final_h - (final_h % 2)
+            final_h = final_h - (final_h % 2)  # Ensure even
             return (final_w, final_h)
     except:
         pass
 
-    # Default to 9:16
-    return (1080, 1920)
+    return (1080, 1920)  # Default to 9:16
 
 
 def _calculate_layout(orig_w: int, orig_h: int, final_w: int, final_h: int) -> dict:
     """
-    Calculate how to fit original video into final dimensions.
-    Returns scaling factor and blur zone heights.
+    Calculate layout for content and blur zones.
 
-    For 9:16 vertical outputs, we ALWAYS create blur zones by cropping/zooming
-    the content, even if the input is already 9:16. This ensures variety and
-    blur effects on every vertical video.
+    KEY PRINCIPLE: Content fills the WIDTH, blur zones on TOP and BOTTOM.
     """
-    orig_ratio = orig_w / orig_h
-    final_ratio = final_w / final_h
-
-    # Check if output is 9:16 vertical format
-    is_vertical_output = final_w == 1080 and final_h == 1920
-
-    if orig_ratio > final_ratio:
-        # Original is wider - fit to width, add blur top/bottom
-        scale = final_w / orig_w
-        scaled_h = int(orig_h * scale)
-        scaled_w = final_w
-
-        blur_space = final_h - scaled_h
-        blur_top = blur_space // 2
-        blur_bottom = blur_space - blur_top
-        content_y = blur_top
-    else:
-        # Original is taller or same aspect ratio
-
-        # For 9:16 outputs, FORCE blur zones by zooming/cropping the content
-        # This ensures every vertical video gets blur treatment with random transforms
-        if is_vertical_output:
-            # Zoom factor: crop content to ~85% height, creating 15% blur space
-            zoom_crop_factor = 0.85
-
-            # Calculate scaled dimensions with forced crop
-            # Content will only take up 85% of the vertical space
-            available_height = int(final_h * zoom_crop_factor)
-
-            scale = available_height / orig_h
-            scaled_w = int(orig_w * scale)
-            scaled_h = available_height
-
-            # If scaled width exceeds final width, constrain to width instead
-            if scaled_w > final_w:
-                scale = final_w / orig_w
-                scaled_w = final_w
-                scaled_h = int(orig_h * scale)
-
-            # Calculate blur zones (content centered vertically)
-            blur_space = final_h - scaled_h
-            blur_top = blur_space // 2
-            blur_bottom = blur_space - blur_top
-            content_y = blur_top
-
-            print(f"[VideoReframe] Forcing blur zones for 9:16: content={scaled_w}x{scaled_h}, "
-                  f"blur_top={blur_top}, blur_bottom={blur_bottom}")
-        else:
-            # Non-vertical output: fit to height, no forced blur
-            scale = final_h / orig_h
-            scaled_w = int(orig_w * scale)
-            scaled_h = final_h
-
-            # For non-vertical content, center it
-            blur_top = 0
-            blur_bottom = 0
-            content_y = 0
+    # Scale content to fill the full width
+    scale = final_w / orig_w
+    scaled_w = final_w
+    scaled_h = int(orig_h * scale)
 
     # Ensure even dimensions
-    scaled_w = scaled_w - (scaled_w % 2)
     scaled_h = scaled_h - (scaled_h % 2)
+
+    # If scaled height exceeds final height, scale down to fit height
+    if scaled_h > final_h:
+        scale = final_h / orig_h
+        scaled_h = final_h
+        scaled_w = int(orig_w * scale)
+        scaled_w = scaled_w - (scaled_w % 2)
+
+    # Calculate blur zones (vertical space above and below content)
+    blur_space = final_h - scaled_h
+    blur_top = blur_space // 2
+    blur_bottom = blur_space - blur_top
+
+    # Content position (centered)
+    content_x = (final_w - scaled_w) // 2
+    content_y = blur_top
 
     return {
         'scaled_w': scaled_w,
         'scaled_h': scaled_h,
-        'content_x': (final_w - scaled_w) // 2,
+        'content_x': content_x,
         'content_y': content_y,
         'blur_top': blur_top,
         'blur_bottom': blur_bottom,
-        'needs_blur': blur_top > 0 or blur_bottom > 0 or scaled_w < final_w
+        'needs_blur': blur_top > 0 or blur_bottom > 0
     }
 
 
-def _prepare_logo_file(logo_name: str, video_width: int, size_percent: float) -> Optional[str]:
-    """
-    Prepare logo as PNG file for FFmpeg overlay.
-    Returns path to temp PNG file or None if failed.
+def _generate_blur_params(rng: random.Random) -> dict:
+    """Generate random parameters for animated blur effect."""
+    return {
+        'hflip': rng.random() < 0.3,  # 30% chance horizontal flip
+        'vflip': rng.random() < 0.2,  # 20% chance vertical flip (for mirror effect)
+        'color_shift': rng.randint(-15, 15),  # Hue shift
+        'saturation': rng.uniform(0.7, 1.2),  # Saturation multiplier
+        'brightness': rng.uniform(0.6, 0.9),  # Slightly darker blur
+        'tilt_angle': rng.uniform(-8, 8),  # Rotation angle
+        'zoom': rng.uniform(1.2, 1.5),  # Zoom factor for blur source
+        'darken': rng.uniform(0.5, 0.8),  # Darken factor
+    }
 
-    Search order for logos:
-    1. /workspace/assets/logos/ (Docker runtime)
-    2. ./assets/logos/ (relative to script)
-    3. ../assets/logos/ (one level up)
-    4. Script directory/../assets/logos/
+
+def _create_blur_zone(
+    effects: BlurEffects,
+    content: np.ndarray,
+    target_w: int,
+    target_h: int,
+    position: str,  # 'top' or 'bottom'
+    blur_strength: int,
+    params: dict,
+    rotation_matrix: np.ndarray = None
+) -> np.ndarray:
+    """
+    Create a blur zone from video content.
+
+    The blur is generated FROM the actual video content, not from a separate
+    background layer. This creates a cohesive look where blur matches the video.
+    """
+    if target_h <= 0:
+        return np.zeros((0, target_w, 3), dtype=np.uint8)
+
+    content_h, content_w = content.shape[:2]
+
+    # Extract source region from content (take 60-70% of content height)
+    source_ratio = 0.65
+    source_h = max(int(content_h * source_ratio), min(content_h, max(target_h * 2, 100)))
+    source_h = max(10, min(source_h, content_h))
+
+    if position == 'top':
+        # For top blur, take from the top portion of content
+        source = content[0:source_h, :].copy()
+    else:
+        # For bottom blur, take from the bottom portion of content
+        start_y = max(0, content_h - source_h)
+        source = content[start_y:, :].copy()
+
+    # Apply zoom to fill blur zone with some overshoot
+    zoom = max(target_w / source.shape[1], target_h / source.shape[0]) * params['zoom']
+    zoomed_w = int(source.shape[1] * zoom)
+    zoomed_h = int(source.shape[0] * zoom)
+
+    if zoomed_w <= 0 or zoomed_h <= 0:
+        return np.zeros((target_h, target_w, 3), dtype=np.uint8)
+
+    source = cv2.resize(source, (zoomed_w, zoomed_h), interpolation=cv2.INTER_LINEAR)
+
+    # Crop to target size (center crop)
+    crop_x = max(0, (zoomed_w - target_w) // 2)
+    crop_y = max(0, (zoomed_h - target_h) // 2)
+    blur_section = source[crop_y:crop_y + target_h, crop_x:crop_x + target_w]
+
+    # Ensure exact dimensions
+    if blur_section.shape[0] != target_h or blur_section.shape[1] != target_w:
+        blur_section = cv2.resize(blur_section, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+    # Apply horizontal flip for variety
+    if params['hflip']:
+        blur_section = effects.flip_horizontal(blur_section)
+
+    # Apply vertical flip (mirror effect) for top zone
+    if position == 'top' and params['vflip']:
+        blur_section = effects.flip_vertical(blur_section)
+
+    # Apply color adjustments
+    if params['color_shift'] != 0:
+        blur_section = effects.color_shift(blur_section, params['color_shift'])
+
+    if params['saturation'] != 1.0 or params['brightness'] != 1.0:
+        blur_section = effects.adjust_saturation_brightness(
+            blur_section, params['saturation'], params['brightness']
+        )
+
+    # Apply rotation/tilt
+    if params['tilt_angle'] != 0 and rotation_matrix is not None:
+        blur_section = effects.tilt(blur_section, params['tilt_angle'], rotation_matrix)
+
+    # Darken the blur to make content stand out
+    blur_section = effects.darken(blur_section, params['darken'])
+
+    # Apply the main blur effect
+    if blur_strength > 0:
+        blur_section = effects.gaussian_blur(blur_section, blur_strength)
+
+    return blur_section
+
+
+def _apply_color_adjustments(
+    image: np.ndarray,
+    brightness: int,
+    saturation: int,
+    contrast: int
+) -> np.ndarray:
+    """Apply brightness, saturation, and contrast adjustments."""
+    result = image
+
+    # Convert percentages to multipliers
+    if brightness != 0 or saturation != 0:
+        hsv = cv2.cvtColor(result, cv2.COLOR_BGR2HSV).astype(np.float32)
+
+        if saturation != 0:
+            sat_mult = 1.0 + (saturation / 100.0)
+            hsv[:, :, 1] = np.clip(hsv[:, :, 1] * sat_mult, 0, 255)
+
+        if brightness != 0:
+            br_mult = 1.0 + (brightness / 100.0)
+            hsv[:, :, 2] = np.clip(hsv[:, :, 2] * br_mult, 0, 255)
+
+        result = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+    if contrast != 0:
+        ct_mult = 1.0 + (contrast / 100.0)
+        result = cv2.convertScaleAbs(result, alpha=ct_mult, beta=(1 - ct_mult) * 128)
+
+    return result
+
+
+def _prepare_logo(logo_name: str, video_width: int, size_percent: float) -> Optional[dict]:
+    """
+    Prepare logo for overlay.
+    Returns dict with 'image' (BGR), 'alpha' (float mask), and dimensions.
     """
     try:
-        # Multiple search paths for logos (Docker + local development)
+        from PIL import Image
+
+        # Multiple search paths for logos
         workspace = os.environ.get('WORKSPACE', '/workspace')
         script_dir = Path(__file__).parent.resolve()
 
         search_paths = [
-            Path(workspace) / 'assets' / 'logos',           # Docker: /workspace/assets/logos
-            Path('/workspace/assets/logos'),                 # Explicit Docker path
-            script_dir / 'assets' / 'logos',                # Same dir as script
-            script_dir.parent / 'assets' / 'logos',         # One level up
-            script_dir.parent.parent / 'assets' / 'logos',  # Two levels up (gpu-tools/assets/logos)
-            Path('./assets/logos'),                          # Current working directory
-            Path('../assets/logos'),                         # One up from cwd
+            Path(workspace) / 'assets' / 'logos',
+            Path('/workspace/assets/logos'),
+            script_dir / 'assets' / 'logos',
+            script_dir.parent / 'assets' / 'logos',
+            script_dir.parent.parent / 'assets' / 'logos',
+            Path('./assets/logos'),
+            Path('../assets/logos'),
         ]
 
-        print(f"[VideoReframe] Searching for logo '{logo_name}' in paths...")
-
         logo_source = None
-        is_svg = False
 
-        # Check for built-in logo names
         if logo_name in ['farmium_icon', 'farmium_full']:
-            # Try PNG first, then SVG
             for search_path in search_paths:
                 png_path = search_path / f'{logo_name}.png'
-                svg_path = search_path / f'{logo_name}.svg'
-
                 if png_path.exists():
                     logo_source = str(png_path)
-                    is_svg = False
-                    print(f"[VideoReframe] Found PNG logo at: {logo_source}")
-                    break
-                elif svg_path.exists():
-                    logo_source = str(svg_path)
-                    is_svg = True
-                    print(f"[VideoReframe] Found SVG logo at: {logo_source}")
                     break
 
         elif logo_name.startswith('http://') or logo_name.startswith('https://'):
-            # Download from URL
             import requests
-            print(f"[VideoReframe] Downloading logo from URL: {logo_name}")
             response = requests.get(logo_name, timeout=30)
             response.raise_for_status()
-
-            # Save to temp file
-            ext = '.png' if '.png' in logo_name.lower() else '.png'
-            temp_logo = tempfile.NamedTemporaryFile(suffix=ext, delete=False)
+            temp_logo = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
             temp_logo.write(response.content)
             temp_logo.close()
             logo_source = temp_logo.name
 
         elif Path(logo_name).exists():
             logo_source = logo_name
-            is_svg = logo_name.lower().endswith('.svg')
-            print(f"[VideoReframe] Using provided logo path: {logo_source}")
 
         if not logo_source:
             print(f"[VideoReframe] Logo not found: {logo_name}")
-            print(f"[VideoReframe] Searched paths: {[str(p) for p in search_paths]}")
             return None
 
-        # Calculate target logo width (ensure minimum size for visibility)
-        logo_w = max(int(video_width * size_percent / 100), 80)  # At least 80px
-        print(f"[VideoReframe] Target logo width: {logo_w}px (size_percent={size_percent}%)")
+        # Load and resize logo
+        pil_logo = Image.open(logo_source).convert('RGBA')
 
-        # Convert/resize logo using FFmpeg
-        temp_output = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
-        temp_output.close()
+        logo_w = max(int(video_width * size_percent / 100), 80)
+        logo_h = int(logo_w * pil_logo.height / pil_logo.width)
 
-        if is_svg:
-            # Use cairosvg if available
-            try:
-                import cairosvg
-                print(f"[VideoReframe] Converting SVG to PNG using cairosvg...")
-                png_data = cairosvg.svg2png(url=logo_source, output_width=logo_w)
-                with open(temp_output.name, 'wb') as f:
-                    f.write(png_data)
-                print(f"[VideoReframe] SVG converted successfully: {temp_output.name}")
-                return temp_output.name
-            except ImportError:
-                print("[VideoReframe] cairosvg not available, trying rsvg-convert...")
-                # Try rsvg-convert as fallback (available on many Linux systems)
-                try:
-                    cmd = ['rsvg-convert', '-w', str(logo_w), '-o', temp_output.name, logo_source]
-                    result = subprocess.run(cmd, capture_output=True, timeout=30)
-                    if result.returncode == 0:
-                        print(f"[VideoReframe] SVG converted with rsvg-convert: {temp_output.name}")
-                        return temp_output.name
-                except Exception as e:
-                    print(f"[VideoReframe] rsvg-convert failed: {e}")
+        pil_logo = pil_logo.resize((logo_w, logo_h), Image.Resampling.LANCZOS)
 
-                # Try Inkscape as last resort
-                try:
-                    cmd = ['inkscape', '--export-type=png', f'--export-width={logo_w}',
-                           f'--export-filename={temp_output.name}', logo_source]
-                    result = subprocess.run(cmd, capture_output=True, timeout=60)
-                    if result.returncode == 0:
-                        print(f"[VideoReframe] SVG converted with Inkscape: {temp_output.name}")
-                        return temp_output.name
-                except Exception as e:
-                    print(f"[VideoReframe] Inkscape failed: {e}")
+        # Convert to numpy
+        logo_array = np.array(pil_logo)
+        logo_bgr = cv2.cvtColor(logo_array[:, :, :3], cv2.COLOR_RGB2BGR)
+        logo_alpha = logo_array[:, :, 3].astype(np.float32) / 255.0
 
-                print("[VideoReframe] No SVG converter available. Logo will be skipped.")
-                return None
-        else:
-            # Resize PNG using FFmpeg (maintains alpha)
-            cmd = [
-                'ffmpeg', '-y', '-v', 'warning',
-                '-i', logo_source,
-                '-vf', f'scale={logo_w}:-1:flags=lanczos',
-                '-c:v', 'png',
-                temp_output.name
-            ]
-
-            print(f"[VideoReframe] Resizing PNG logo...")
-            result = subprocess.run(cmd, capture_output=True, timeout=30)
-
-            if result.returncode == 0:
-                print(f"[VideoReframe] Logo prepared: {temp_output.name}")
-                return temp_output.name
-            else:
-                print(f"[VideoReframe] Failed to resize logo: {result.stderr.decode()[:200]}")
-                # Try copying as-is if resize fails
-                try:
-                    shutil.copy2(logo_source, temp_output.name)
-                    print(f"[VideoReframe] Using original logo without resize")
-                    return temp_output.name
-                except Exception as e:
-                    print(f"[VideoReframe] Copy fallback also failed: {e}")
-                    return None
+        return {
+            'image': logo_bgr,
+            'alpha': logo_alpha,
+            'alpha_3d': logo_alpha[:, :, np.newaxis]
+        }
 
     except Exception as e:
         print(f"[VideoReframe] Error preparing logo: {e}")
-        import traceback
-        traceback.print_exc()
         return None
 
 
-def _build_filter_complex(
-    orig_w: int, orig_h: int,
-    final_w: int, final_h: int,
-    layout: dict,
-    blur_intensity: int,
-    brightness: int, saturation: int, contrast: int,
-    logo_path: Optional[str],
-    logo_size: float,
-    video_index: int = 0,
-    duration: float = 10.0
-) -> str:
-    """
-    Build FFmpeg filter_complex string for the entire reframe pipeline.
+def _apply_logo(frame: np.ndarray, logo_data: dict, frame_w: int, frame_h: int):
+    """Apply logo overlay to frame (bottom center with 5% margin)."""
+    logo = logo_data['image']
+    alpha_3d = logo_data['alpha_3d']
+    lh, lw = logo.shape[:2]
 
-    Strategy for 9:16 vertical outputs (ENHANCED BLUR ZONES):
-    1. Create multiple blur layer streams from different time offsets of the video
-    2. Apply random transformations to each layer:
-       - Random rotation (-15 to +15 degrees)
-       - Random scale/zoom
-       - Variable opacity (0.3-0.7)
-       - Random position offset
-    3. Blend layers together for dynamic, visually interesting blur background
-    4. Scale content to fit and overlay
-    5. Optionally overlay logo
+    # Position: bottom center, 5% from bottom
+    margin = int(frame_h * 0.05)
+    x = (frame_w - lw) // 2
+    y = frame_h - lh - margin
 
-    For non-9:16 outputs:
-    - Standard single-layer blurred background
+    # Ensure within bounds
+    x = max(0, min(frame_w - lw, x))
+    y = max(0, min(frame_h - lh, y))
 
-    Args:
-        video_index: Used as random seed for deterministic randomization per video
-        duration: Video duration in seconds (for calculating time offsets)
-    """
-    filters = []
-
-    # Calculate blur kernel size (must be odd, 1-99)
-    blur_sigma = max(1, min(blur_intensity, 50))
-
-    scaled_w = layout['scaled_w']
-    scaled_h = layout['scaled_h']
-    content_x = layout['content_x']
-    content_y = layout['content_y']
-
-    # ==========================================================================
-    # DETECT IF OUTPUT IS 9:16 (VERTICAL) FOR DYNAMIC RANDOM BLUR ZONES
-    # ==========================================================================
-    is_vertical_output = final_w == 1080 and final_h == 1920  # 9:16 format
-
-    if is_vertical_output:
-        # Use seeded RNG for reproducible but varied results
-        rng = random.Random(video_index + 42)
-
-        # Number of blur layers (reduced from 4 to 2 for performance)
-        num_blur_layers = 2
-
-        # Generate random parameters for each blur layer
-        blur_layers = []
-        for i in range(num_blur_layers):
-            layer = {
-                # Time offset: sample from different parts of the video
-                'time_offset': rng.uniform(0, max(0.1, duration - 0.5)),
-                # Rotation: -15 to +15 degrees (more aggressive than before)
-                'rotation': rng.uniform(-15, 15),
-                # Scale: 1.2 to 2.0 (zoomed in significantly)
-                'scale': rng.uniform(1.2, 2.0),
-                # Opacity: 0.3 to 0.7
-                'opacity': rng.uniform(0.3, 0.7),
-                # Position offset as percentage of frame
-                'offset_x': rng.uniform(-0.3, 0.3),  # -30% to +30%
-                'offset_y': rng.uniform(-0.3, 0.3),
-                # Horizontal flip: 50% chance
-                'hflip': rng.random() < 0.5,
-                # Color shift for variety
-                'hue_shift': rng.uniform(-0.1, 0.1),
-                'saturation_mult': rng.uniform(0.7, 1.3),
-            }
-            blur_layers.append(layer)
-
-        print(f"[VideoReframe] 9:16 dynamic blur zones: {num_blur_layers} layers")
-        for i, layer in enumerate(blur_layers):
-            print(f"  Layer {i}: time={layer['time_offset']:.2f}s, rot={layer['rotation']:.1f}deg, "
-                  f"scale={layer['scale']:.2f}, opacity={layer['opacity']:.2f}, hflip={layer['hflip']}")
-
-        # ======================================================================
-        # BUILD DYNAMIC BLUR BACKGROUND FROM MULTIPLE VIDEO SAMPLES
-        # ======================================================================
-
-        # First, create the base black canvas
-        filters.append(f"color=c=black:s={final_w}x{final_h}:r=30[canvas]")
-
-        # Split input into N+1 streams (N for blur layers + 1 for foreground)
-        split_count = num_blur_layers + 1
-        split_outputs = "".join([f"[s{i}]" for i in range(split_count)])
-        filters.append(f"[0:v]split={split_count}{split_outputs}")
-
-        # Process each blur layer
-        current_bg = "[canvas]"
-
-        for i, layer in enumerate(blur_layers):
-            layer_input = f"[s{i}]"
-            layer_output = f"[blur{i}]"
-            blend_output = f"[bg{i}]"
-
-            # Calculate rotation in radians
-            rot_rad = layer['rotation'] * math.pi / 180
-
-            # Calculate scaled dimensions (for covering the frame after rotation)
-            scale_factor = layer['scale'] * 1.05  # Reduced margin for better performance
-            layer_w = int(orig_w * scale_factor)
-            layer_h = int(orig_h * scale_factor)
-            # Ensure even dimensions
-            layer_w = layer_w + (layer_w % 2)
-            layer_h = layer_h + (layer_h % 2)
-
-            # Build transformation chain for this layer
-            transform_parts = []
-
-            # 1. Seek to random time offset using setpts (creates static frame effect from that moment)
-            # Use trim to get a small segment starting at the offset, then loop it
-            if duration > 1:
-                trim_start = max(0, layer['time_offset'])
-                trim_end = min(trim_start + 0.5, duration)
-                transform_parts.append(f"trim=start={trim_start:.3f}:end={trim_end:.3f},setpts=PTS-STARTPTS")
-
-            # 2. Scale up
-            transform_parts.append(f"scale={layer_w}:{layer_h}:flags=fast_bilinear")
-
-            # 3. Horizontal flip (if enabled)
-            if layer['hflip']:
-                transform_parts.append("hflip")
-
-            # 4. Apply rotation
-            # Calculate output size for rotation to avoid black corners
-            rot_margin = abs(math.sin(rot_rad)) + abs(math.cos(rot_rad))
-            rot_out_w = int(layer_w * rot_margin)
-            rot_out_h = int(layer_h * rot_margin)
-            rot_out_w = rot_out_w + (rot_out_w % 2)
-            rot_out_h = rot_out_h + (rot_out_h % 2)
-            transform_parts.append(f"rotate={rot_rad:.6f}:ow={rot_out_w}:oh={rot_out_h}:fillcolor=black")
-
-            # 5. Apply color adjustments (hue/saturation for variety)
-            hue_val = layer['hue_shift']
-            sat_val = layer['saturation_mult']
-            transform_parts.append(f"hue=h={hue_val*360:.1f}:s={sat_val:.2f}")
-
-            # 6. Crop to final dimensions with random offset
-            crop_x = f"(iw-{final_w})/2+{int(layer['offset_x'] * final_w)}"
-            crop_y = f"(ih-{final_h})/2+{int(layer['offset_y'] * final_h)}"
-            transform_parts.append(f"crop={final_w}:{final_h}:{crop_x}:{crop_y}")
-
-            # 7. Apply blur (heavier blur for background layers) - using boxblur for speed
-            layer_blur_radius = (blur_sigma + (i * 5)) // 2  # Convert sigma to radius approximation
-            transform_parts.append(f"boxblur={layer_blur_radius}:2")
-
-            # 8. Set opacity using format and colorchannelmixer
-            opacity = layer['opacity']
-            transform_parts.append(f"format=rgba,colorchannelmixer=aa={opacity:.2f}")
-
-            # Combine transform chain
-            transform_chain = ",".join(transform_parts) + layer_output
-            filters.append(f"{layer_input}{transform_chain}")
-
-            # Blend this layer onto the current background
-            # Use overlay with alpha blending
-            filters.append(f"{current_bg}{layer_output}overlay=0:0:format=auto{blend_output}")
-            current_bg = blend_output
-
-        # Final background processing: apply one more blur pass for smoothness (boxblur for speed)
-        final_blur_radius = (blur_sigma // 2 + 1) // 2
-        filters.append(f"{current_bg}boxblur={final_blur_radius}:1[bg]")
-
-        # Foreground: scale to fit within output dimensions (using the last split stream)
-        fg_input = f"[s{num_blur_layers}]"
-        fg_filter = f"{fg_input}scale={scaled_w}:{scaled_h}:flags=lanczos[fg]"
-        filters.append(fg_filter)
-
-    else:
-        # ======================================================================
-        # NON-9:16 OUTPUTS: Standard single-layer blur background
-        # ======================================================================
-
-        # Split input into two streams
-        filters.append(f"[0:v]split=2[bg_in][fg_in]")
-
-        # Background: scale to fill entire frame (crop center), then blur
-        base_scale = max(final_w / orig_w, final_h / orig_h) * 1.1
-        bg_scaled_w = int(orig_w * base_scale)
-        bg_scaled_h = int(orig_h * base_scale)
-        bg_scaled_w = bg_scaled_w + (bg_scaled_w % 2)
-        bg_scaled_h = bg_scaled_h + (bg_scaled_h % 2)
-
-        bg_filter = (
-            f"[bg_in]scale={bg_scaled_w}:{bg_scaled_h}:flags=fast_bilinear,"
-            f"crop={final_w}:{final_h}:(iw-{final_w})/2:(ih-{final_h})/2,"
-            f"boxblur={blur_sigma // 2}:2[bg]"
-        )
-        filters.append(bg_filter)
-
-        # Foreground: scale to fit
-        fg_filter = f"[fg_in]scale={scaled_w}:{scaled_h}:flags=lanczos[fg]"
-        filters.append(fg_filter)
-
-    # ==========================================================================
-    # OVERLAY FOREGROUND ON BACKGROUND
-    # ==========================================================================
-    overlay_x = content_x
-    overlay_y = content_y
-    filters.append(f"[bg][fg]overlay={overlay_x}:{overlay_y}:format=auto[main]")
-
-    # Track current output stream
-    current_output = "[main]"
-
-    # ==========================================================================
-    # COLOR ADJUSTMENTS
-    # ==========================================================================
-    color_filters = []
-
-    if brightness != 0:
-        br_val = brightness / 100.0
-        color_filters.append(f"brightness={br_val}")
-
-    if contrast != 0:
-        ct_val = 1.0 + (contrast / 100.0)
-        color_filters.append(f"contrast={ct_val}")
-
-    if saturation != 0:
-        sat_val = 1.0 + (saturation / 100.0)
-        color_filters.append(f"saturation={sat_val}")
-
-    if color_filters:
-        eq_filter = f"{current_output}eq={':'.join(color_filters)}[color]"
-        filters.append(eq_filter)
-        current_output = "[color]"
-
-    # ==========================================================================
-    # LOGO OVERLAY
-    # ==========================================================================
-    if logo_path and os.path.exists(logo_path):
-        # Logo will be second input [1:v]
-        # Position: bottom center with 5% margin from bottom
-        logo_y = f"H-h-H*0.05"  # 5% from bottom
-        logo_x = "(W-w)/2"  # centered horizontally
-
-        # Add slight transparency to logo for better blending
-        filters.append(f"{current_output}[1:v]overlay={logo_x}:{logo_y}:format=auto[out]")
-        current_output = "[out]"
-        print(f"[VideoReframe] Logo overlay added at bottom-center")
-    else:
-        # No logo - just pass through
-        filters.append(f"{current_output}null[out]")
-        current_output = "[out]"
-        if logo_path:
-            print(f"[VideoReframe] WARNING: Logo path provided but file not found: {logo_path}")
-
-    return ";".join(filters)
+    # Blend logo with frame using alpha
+    roi = frame[y:y + lh, x:x + lw]
+    blended = (alpha_3d * logo + (1 - alpha_3d) * roi).astype(np.uint8)
+    frame[y:y + lh, x:x + lw] = blended
 
 
-def _run_ffmpeg_reframe(
-    input_path: str,
+def _start_ffmpeg_writer(
     output_path: str,
-    filter_complex: str,
+    width: int,
+    height: int,
     fps: float,
-    duration: float,
-    has_audio: bool,
-    gpu_id: int,
-    progress_callback: Optional[Callable],
-    logo_path: Optional[str] = None
-) -> tuple:
+    audio_source: str = None,
+    gpu_id: int = 0
+) -> subprocess.Popen:
     """
-    Run FFmpeg with the reframe filter, trying NVENC first then CPU fallback.
+    Start FFmpeg subprocess for writing video frames.
+    Tries NVENC first, falls back to libx264.
     """
-    import re
+    import platform
 
-    # Check if we have a logo input (filter contains [1:v])
-    has_logo = '[1:v]' in filter_complex and logo_path and os.path.exists(logo_path)
+    # Determine encoder based on platform
+    system_os = platform.system()
 
-    def build_cmd(use_nvenc: bool) -> list:
-        cmd = ['ffmpeg', '-y', '-hide_banner']
+    # Build command
+    cmd = [
+        'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',
+        '-f', 'rawvideo',
+        '-vcodec', 'rawvideo',
+        '-s', f'{width}x{height}',
+        '-pix_fmt', 'bgr24',
+        '-r', str(min(fps, 60)),
+        '-thread_queue_size', '512',
+        '-i', '-',  # Video from stdin
+    ]
 
-        if use_nvenc:
-            # Try hardware decode
-            cmd.extend([
-                '-hwaccel', 'cuda',
-                '-hwaccel_device', str(gpu_id),
-            ])
+    # Add audio input if available
+    if audio_source:
+        cmd.extend(['-i', audio_source])
 
-        # Input video
-        cmd.extend(['-i', input_path])
-
-        # Input logo if filter uses it
-        # Logo needs -loop 1 to repeat for the entire video duration
-        if has_logo:
-            cmd.extend(['-loop', '1', '-i', logo_path])
-            print(f"[VideoReframe] Adding logo input: {logo_path}")
-
-        # Filter complex
-        cmd.extend(['-filter_complex', filter_complex])
-
-        # Map output
-        cmd.extend(['-map', '[out]'])
-
-        # Video encoding
-        if use_nvenc:
-            cmd.extend([
-                '-c:v', 'h264_nvenc',
-                '-gpu', str(gpu_id),
-                '-preset', 'p1',  # Fastest preset for maximum speed
-                '-tune', 'll',   # Low latency tuning for faster encoding
-                '-rc', 'vbr',
-                '-cq', '23',
-                '-b:v', '8000k',
-                '-maxrate', '12000k',
-                '-bufsize', '16000k',
-                '-rc-lookahead', '0',  # Disable lookahead for faster encoding
-                '-bf', '0',  # Disable B-frames for speed
-            ])
-        else:
-            cmd.extend([
-                '-c:v', 'libx264',
-                '-preset', 'fast',
-                '-crf', '23',
-            ])
-
-        # Output settings
+    # Video encoding settings - try NVENC first on Linux/Windows
+    if system_os in ['Linux', 'Windows']:
+        # Try NVENC
         cmd.extend([
+            '-c:v', 'h264_nvenc',
+            '-gpu', str(gpu_id),
+            '-preset', 'p4',  # Balanced preset
+            '-rc', 'vbr',
+            '-cq', '23',
+            '-b:v', '8000k',
+            '-maxrate', '12000k',
+            '-bufsize', '16000k',
+        ])
+    elif system_os == 'Darwin':
+        # macOS - use VideoToolbox
+        cmd.extend([
+            '-c:v', 'h264_videotoolbox',
+            '-b:v', '8000k',
+            '-allow_sw', '1',
+        ])
+    else:
+        # Fallback to CPU
+        cmd.extend([
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-crf', '23',
+        ])
+
+    cmd.extend(['-pix_fmt', 'yuv420p'])
+
+    # Map streams
+    cmd.extend(['-map', '0:v'])
+
+    if audio_source:
+        cmd.extend([
+            '-map', '1:a?',
+            '-c:a', 'aac',
+            '-b:a', '128k',
+            '-shortest',
+        ])
+    else:
+        cmd.append('-an')
+
+    cmd.extend([
+        '-movflags', '+faststart',
+        output_path
+    ])
+
+    print(f"[VideoReframe] Starting FFmpeg: {' '.join(cmd[:15])}...")
+
+    try:
+        process = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
+        return process
+    except Exception as e:
+        print(f"[VideoReframe] FFmpeg start failed, trying CPU fallback: {e}")
+
+        # Fallback to CPU encoder
+        cmd_cpu = [
+            'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',
+            '-f', 'rawvideo', '-vcodec', 'rawvideo',
+            '-s', f'{width}x{height}',
+            '-pix_fmt', 'bgr24',
             '-r', str(min(fps, 60)),
+            '-i', '-',
+        ]
+
+        if audio_source:
+            cmd_cpu.extend(['-i', audio_source])
+
+        cmd_cpu.extend([
+            '-c:v', 'libx264',
+            '-preset', 'fast',
+            '-crf', '23',
             '-pix_fmt', 'yuv420p',
+            '-map', '0:v',
         ])
 
-        # Audio
-        if has_audio:
-            cmd.extend(['-map', '0:a?', '-c:a', 'aac', '-b:a', '128k'])
+        if audio_source:
+            cmd_cpu.extend(['-map', '1:a?', '-c:a', 'aac', '-b:a', '128k', '-shortest'])
         else:
-            cmd.append('-an')
+            cmd_cpu.append('-an')
 
-        # If we have a looping logo input, use -shortest to end when video ends
-        if has_logo:
-            cmd.append('-shortest')
+        cmd_cpu.extend(['-movflags', '+faststart', output_path])
 
-        cmd.extend([
-            '-movflags', '+faststart',
-            '-threads', '0',
-            output_path
-        ])
-
-        return cmd
-
-    def run_ffmpeg(cmd: list, mode: str) -> tuple:
-        """Run FFmpeg and parse progress."""
-        print(f"[VideoReframe] Running FFmpeg ({mode})...")
-        print(f"[VideoReframe] Command: {' '.join(cmd[:20])}...")
-
-        try:
-            process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                universal_newlines=True
-            )
-
-            stderr_lines = []
-
-            while True:
-                line = process.stderr.readline()
-                if not line:
-                    if process.poll() is not None:
-                        break
-                    continue
-
-                stderr_lines.append(line)
-                if len(stderr_lines) > 100:
-                    stderr_lines.pop(0)
-
-                # Parse progress
-                if 'time=' in line and duration > 0 and progress_callback:
-                    try:
-                        match = re.search(r'time=(\d+):(\d+):(\d+\.?\d*)', line)
-                        if match:
-                            h, m, s = match.groups()
-                            current = int(h) * 3600 + int(m) * 60 + float(s)
-                            progress = 0.15 + (current / duration) * 0.80
-                            progress = min(progress, 0.95)
-                            progress_callback(progress, f"Encoding... {int(current)}/{int(duration)}s")
-                    except:
-                        pass
-
-                # Check for errors
-                if 'error' in line.lower() or 'invalid' in line.lower():
-                    print(f"[VideoReframe] FFmpeg: {line.strip()}")
-
-            process.wait(timeout=3600)  # 1 hour max
-
-            if process.returncode == 0:
-                return True, {'encoder_used': mode}
-            else:
-                error_msg = ''.join(stderr_lines[-20:])
-                print(f"[VideoReframe] FFmpeg failed: {error_msg}")
-                return False, {'error': error_msg}
-
-        except subprocess.TimeoutExpired:
-            process.kill()
-            return False, {'error': 'FFmpeg timed out'}
-        except Exception as e:
-            return False, {'error': str(e)}
-
-    # Try NVENC first
-    cmd_nvenc = build_cmd(use_nvenc=True)
-    success, result = run_ffmpeg(cmd_nvenc, 'NVENC')
-
-    if success:
-        return True, result
-
-    print("[VideoReframe] NVENC failed, trying CPU fallback...")
-
-    # CPU fallback
-    cmd_cpu = build_cmd(use_nvenc=False)
-    success, result = run_ffmpeg(cmd_cpu, 'CPU')
-
-    return success, result
+        return subprocess.Popen(
+            cmd_cpu,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE
+        )
 
 
 # =============================================================================
-# BATCH PROCESSING FOR PIPELINE SUPPORT
+# BATCH PROCESSING
 # =============================================================================
 
 def process_video_reframe_batch(
@@ -978,7 +828,6 @@ def process_video_reframe_batch(
             base_progress = i / total
             progress_callback(base_progress, f"Processing video {i+1}/{total}")
 
-        # Generate output filename
         input_name = Path(input_path).stem
         output_path = Path(output_dir) / f"{input_name}_reframed.mp4"
 
@@ -994,12 +843,14 @@ def process_video_reframe_batch(
                 config,
                 sub_progress,
                 gpu_id,
-                video_index=i  # Pass index for deterministic random transformations
+                video_index=i
             )
             results.append(result)
 
         except Exception as e:
             print(f"[VideoReframe] Error processing {input_path}: {e}")
+            import traceback
+            traceback.print_exc()
             results.append({
                 "status": "failed",
                 "error": str(e),
@@ -1022,24 +873,30 @@ if __name__ == "__main__":
         print("Example with logo: python processor.py video.mp4 out.mp4 9:16 farmium_full")
         print("")
         print("Logo options: farmium_icon, farmium_full, none, or URL")
+        print("")
+        print("This processor creates blur zones on TOP and BOTTOM of the video,")
+        print("with the video content filling the width and centered vertically.")
+        print("Blur animates every 20 frames for visual interest.")
         sys.exit(1)
 
     input_file = sys.argv[1]
     output_file = sys.argv[2]
     aspect = sys.argv[3] if len(sys.argv) > 3 else '9:16'
-    logo = sys.argv[4] if len(sys.argv) > 4 else 'farmium_full'
+    logo = sys.argv[4] if len(sys.argv) > 4 else 'none'
 
     config = {
         'aspectRatio': aspect,
         'logoName': logo,
-        'logoSize': 15,  # 15% of video width
-        'blurIntensity': 20,
+        'logoSize': 15,
+        'blurIntensity': 25,
+        'blurUpdateInterval': 20,  # Update blur every 20 frames (~0.66s at 30fps)
     }
 
     print(f"[CLI] Input: {input_file}")
     print(f"[CLI] Output: {output_file}")
     print(f"[CLI] Aspect: {aspect}")
     print(f"[CLI] Logo: {logo}")
+    print(f"[CLI] Blur update interval: {config['blurUpdateInterval']} frames")
 
     def progress(p, msg):
         print(f"[{int(p*100):3d}%] {msg}")

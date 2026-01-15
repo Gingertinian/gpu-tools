@@ -577,8 +577,8 @@ def _build_filter_complex(
         # Use seeded RNG for reproducible but varied results
         rng = random.Random(video_index + 42)
 
-        # Number of blur layers (3-5 for visual variety)
-        num_blur_layers = 4
+        # Number of blur layers (reduced from 4 to 2 for performance)
+        num_blur_layers = 2
 
         # Generate random parameters for each blur layer
         blur_layers = []
@@ -632,7 +632,7 @@ def _build_filter_complex(
             rot_rad = layer['rotation'] * math.pi / 180
 
             # Calculate scaled dimensions (for covering the frame after rotation)
-            scale_factor = layer['scale'] * 1.3  # Extra margin for rotation
+            scale_factor = layer['scale'] * 1.05  # Reduced margin for better performance
             layer_w = int(orig_w * scale_factor)
             layer_h = int(orig_h * scale_factor)
             # Ensure even dimensions
@@ -675,9 +675,9 @@ def _build_filter_complex(
             crop_y = f"(ih-{final_h})/2+{int(layer['offset_y'] * final_h)}"
             transform_parts.append(f"crop={final_w}:{final_h}:{crop_x}:{crop_y}")
 
-            # 7. Apply blur (heavier blur for background layers)
-            layer_blur = blur_sigma + (i * 5)  # Increase blur for each layer
-            transform_parts.append(f"gblur=sigma={layer_blur}")
+            # 7. Apply blur (heavier blur for background layers) - using boxblur for speed
+            layer_blur_radius = (blur_sigma + (i * 5)) // 2  # Convert sigma to radius approximation
+            transform_parts.append(f"boxblur={layer_blur_radius}:2")
 
             # 8. Set opacity using format and colorchannelmixer
             opacity = layer['opacity']
@@ -692,8 +692,9 @@ def _build_filter_complex(
             filters.append(f"{current_bg}{layer_output}overlay=0:0:format=auto{blend_output}")
             current_bg = blend_output
 
-        # Final background processing: apply one more blur pass for smoothness
-        filters.append(f"{current_bg}gblur=sigma={blur_sigma // 2 + 1}[bg]")
+        # Final background processing: apply one more blur pass for smoothness (boxblur for speed)
+        final_blur_radius = (blur_sigma // 2 + 1) // 2
+        filters.append(f"{current_bg}boxblur={final_blur_radius}:1[bg]")
 
         # Foreground: scale to fit within output dimensions (using the last split stream)
         fg_input = f"[s{num_blur_layers}]"
@@ -718,7 +719,7 @@ def _build_filter_complex(
         bg_filter = (
             f"[bg_in]scale={bg_scaled_w}:{bg_scaled_h}:flags=fast_bilinear,"
             f"crop={final_w}:{final_h}:(iw-{final_w})/2:(ih-{final_h})/2,"
-            f"gblur=sigma={blur_sigma}[bg]"
+            f"boxblur={blur_sigma // 2}:2[bg]"
         )
         filters.append(bg_filter)
 

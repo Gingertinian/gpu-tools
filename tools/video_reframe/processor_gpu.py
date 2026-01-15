@@ -327,11 +327,28 @@ def _build_gpu_filter_complex(
 
         parts = [content_filter]
 
-        # Create blurred background (scale to full output size, then blur)
-        parts.append(
-            f"[blur_src]scale={final_w}:{final_h}:flags=fast_bilinear,"
-            f"gblur=sigma={blur_sigma}[blurred]"
-        )
+        # Random variations for blur background
+        extra_zoom = 1.0 + random.uniform(0.05, 0.25)  # 1.05x - 1.25x extra zoom
+        rotation_deg = random.uniform(-8, 8)  # -8 to +8 degrees rotation
+        crop_offset_x = random.randint(-50, 50)  # Horizontal offset
+        crop_offset_y = random.randint(-50, 50)  # Vertical offset
+
+        # Calculate scaled size with extra zoom
+        blur_scale_w = int(final_w * extra_zoom)
+        blur_scale_h = int(final_h * extra_zoom)
+
+        # Build blur filter chain:
+        # 1. Scale up (maintain aspect ratio + extra zoom)
+        # 2. Rotate slightly
+        # 3. Crop with offset to final size
+        # 4. Apply blur
+        blur_filters = [
+            f"scale={blur_scale_w}:{blur_scale_h}:force_original_aspect_ratio=increase",
+            f"rotate={rotation_deg}*PI/180:fillcolor=black:ow={blur_scale_w}:oh={blur_scale_h}",
+            f"crop={final_w}:{final_h}:{crop_offset_x + (blur_scale_w - final_w)//2}:{crop_offset_y + (blur_scale_h - final_h)//2}",
+            f"gblur=sigma={blur_sigma}"
+        ]
+        parts.append(f"[blur_src]{','.join(blur_filters)}[blurred]")
 
         # Overlay content directly on blurred background (no pad needed)
         # Content is placed at content_x, content_y position
@@ -532,9 +549,33 @@ def _process_image_cupy(
     needs_blur = blur_top_h > 0 or blur_bottom_h > 0 or content_x > 0
 
     if needs_blur:
-        # Create full-frame blurred background first (like video processing)
-        bg_zoom = (final_h / img.shape[0], final_w / img.shape[1], 1)
-        blurred_bg = gpu_ndimage.zoom(gpu_img, bg_zoom, order=1)
+        # Create full-frame blurred background with random variations
+        orig_h, orig_w = img.shape[:2]
+
+        # Random variations
+        extra_zoom = 1.0 + random.uniform(0.05, 0.25)  # 1.05x - 1.25x
+        rotation_deg = random.uniform(-8, 8)  # -8 to +8 degrees
+        offset_x = random.randint(-30, 30)
+        offset_y = random.randint(-30, 30)
+
+        # Calculate scale with extra zoom
+        scale_w = final_w / orig_w
+        scale_h = final_h / orig_h
+        scale = max(scale_w, scale_h) * extra_zoom
+
+        # Zoom maintaining aspect ratio
+        bg_zoom = (scale, scale, 1)
+        zoomed = gpu_ndimage.zoom(gpu_img, bg_zoom, order=1)
+
+        # Apply rotation if significant
+        if abs(rotation_deg) > 0.5:
+            zoomed = gpu_ndimage.rotate(zoomed, rotation_deg, axes=(1, 0), reshape=False, mode='reflect')
+
+        # Crop with offset to exact output size
+        crop_x = max(0, min((zoomed.shape[1] - final_w) // 2 + offset_x, zoomed.shape[1] - final_w))
+        crop_y = max(0, min((zoomed.shape[0] - final_h) // 2 + offset_y, zoomed.shape[0] - final_h))
+        blurred_bg = zoomed[crop_y:crop_y + final_h, crop_x:crop_x + final_w]
+
         # Apply gaussian blur to background
         for c in range(3):
             blurred_bg[:, :, c] = gpu_ndimage.gaussian_filter(blurred_bg[:, :, c], sigma=blur_sigma)
@@ -606,8 +647,36 @@ def _process_image_cpu(
     needs_blur = blur_top_h > 0 or blur_bottom_h > 0 or content_x > 0
 
     if needs_blur:
-        # Create full-frame blurred background first (like video processing)
-        blurred_bg = cv2.resize(img, (final_w, final_h), interpolation=cv2.INTER_LINEAR)
+        # Create full-frame blurred background with random variations
+        orig_h, orig_w = img.shape[:2]
+
+        # Random variations
+        extra_zoom = 1.0 + random.uniform(0.05, 0.25)  # 1.05x - 1.25x
+        rotation_deg = random.uniform(-8, 8)  # -8 to +8 degrees
+        offset_x = random.randint(-30, 30)
+        offset_y = random.randint(-30, 30)
+
+        # Calculate scale with extra zoom
+        scale_w = final_w / orig_w
+        scale_h = final_h / orig_h
+        scale = max(scale_w, scale_h) * extra_zoom
+
+        # Resize maintaining aspect ratio
+        new_w = int(orig_w * scale)
+        new_h = int(orig_h * scale)
+        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+        # Apply rotation
+        if abs(rotation_deg) > 0.5:
+            center = (new_w // 2, new_h // 2)
+            rot_matrix = cv2.getRotationMatrix2D(center, rotation_deg, 1.0)
+            resized = cv2.warpAffine(resized, rot_matrix, (new_w, new_h), borderMode=cv2.BORDER_REFLECT)
+
+        # Crop with offset to exact output size
+        crop_x = max(0, min((new_w - final_w) // 2 + offset_x, new_w - final_w))
+        crop_y = max(0, min((new_h - final_h) // 2 + offset_y, new_h - final_h))
+        blurred_bg = resized[crop_y:crop_y + final_h, crop_x:crop_x + final_w]
+
         blurred_bg = cv2.GaussianBlur(blurred_bg, (blur_ksize, blur_ksize), blur_sigma)
         output = blurred_bg
     else:

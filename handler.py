@@ -765,6 +765,15 @@ class AsyncPipelineProcessor:
             else:
                 return {"status": "failed", "error": "Face Swap not available"}
 
+        elif tool == "video_reframe":
+            if process_video_reframe is not None:
+                result = process_video_reframe(item.input_path, item.output_path, gpu_config)
+                # video_reframe may change output path for images
+                if result and result.get('outputPath'):
+                    item.output_path = result['outputPath']
+            else:
+                return {"status": "failed", "error": "Video Reframe not available"}
+
         else:
             return {"status": "failed", "error": f"Unknown tool: {tool}"}
 
@@ -905,7 +914,7 @@ class AsyncPipelineProcessor:
                 output_ext = ".png"
             elif tool in ["pic_to_video", "video_gen"]:
                 output_ext = ".mp4"
-            elif tool in ["spoofer", "captioner", "vignettes", "resize"]:
+            elif tool in ["spoofer", "captioner", "vignettes", "resize", "video_reframe"]:
                 output_ext = ext if is_video(ext) else '.jpg'
             else:
                 output_ext = ext
@@ -1307,6 +1316,15 @@ def process_single_file_for_batch(args: tuple, gpu_tracker: GPULoadTracker = Non
                 result = process_face_swap(input_path, output_path, gpu_config)
             else:
                 return {"index": file_index, "status": "failed", "error": "Face Swap not available", "gpu_id": gpu_id}
+
+        elif tool == "video_reframe":
+            if process_video_reframe is not None:
+                result = process_video_reframe(input_path, output_path, gpu_config)
+                # video_reframe may change output path for images
+                if result and result.get('outputPath'):
+                    output_path = result['outputPath']
+            else:
+                return {"index": file_index, "status": "failed", "error": "Video Reframe not available", "gpu_id": gpu_id}
 
         else:
             return {"index": file_index, "status": "failed", "error": f"Unknown tool: {tool}", "gpu_id": gpu_id}

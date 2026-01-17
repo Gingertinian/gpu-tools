@@ -88,13 +88,13 @@ def test_video_reframe(input_path: str, output_path: str):
 
     config = {
         'aspectRatio': '9:16',
-        'blurIntensity': 25,
-        'brightness': 0,
-        'saturation': 0,
+        'blurIntensity': 30,        # Blur intensity for background
+        'brightness': 5,            # Slight brightness boost
+        'saturation': 10,           # Slight saturation boost
         'contrast': 0,
         'forceBlur': 0,
-        'logoName': 'none',
-        'logoSize': 15,
+        'logoName': 'farmium_full', # Use logo
+        'logoSize': 15,             # 15% of width
     }
 
     def progress(p, msg):

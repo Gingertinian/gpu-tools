@@ -148,17 +148,29 @@ def _process_video_gpu(
 
     print(f"[GPU-Reframe] Input: {orig_w}x{orig_h} @ {fps:.2f} fps, duration: {duration:.2f}s")
 
-    # Parse config
-    aspect_str = _parse_aspect_ratio(config.get('aspectRatio', '9:16'))
+    # Parse config (snake_case from backend, fallback to camelCase for local testing)
+    aspect_str = _parse_aspect_ratio(
+        config.get('aspect_ratio') or config.get('aspectRatio', '9:16')
+    )
     final_w, final_h = ASPECT_RATIOS.get(aspect_str, (1080, 1920))
 
-    logo_name = config.get('logoName', 'farmium_full')
-    logo_size = config.get('logoSize', 15)
-    blur_intensity = config.get('blurIntensity', 25)
+    logo_name = config.get('logo_name') or config.get('logoName', 'farmium_full')
+    logo_size = config.get('logo_size') or config.get('logoSize', 15)
+    blur_intensity = config.get('blur_intensity') or config.get('blurIntensity', 25)
     brightness_adj = config.get('brightness', 0)
     saturation_adj = config.get('saturation', 0)
     contrast_adj = config.get('contrast', 0)
-    force_blur_percent = config.get('forceBlur', 0)
+
+    # Blur zones: frontend sends top_blur_percent + bottom_blur_percent
+    # Combined as force_blur_percent for layout calculation
+    top_blur = config.get('top_blur_percent') or config.get('topBlurPercent', 0)
+    bottom_blur = config.get('bottom_blur_percent') or config.get('bottomBlurPercent', 0)
+    force_blur_percent = config.get('force_blur') or config.get('forceBlur') or (top_blur + bottom_blur)
+
+    # Additional effects from frontend
+    randomize_effects = config.get('randomize_effects', config.get('randomizeEffects', False))
+    tilt_range = config.get('tilt_range') or config.get('tiltRange', 5)
+    color_shift_range = config.get('color_shift_range') or config.get('colorShiftRange', 0)
 
     # Calculate layout
     layout = _calculate_layout(orig_w, orig_h, final_w, final_h, force_blur_percent)
@@ -177,13 +189,26 @@ def _process_video_gpu(
     )
 
     # Build FFmpeg command helper
-    def _build_ffmpeg_cmd(use_nvenc: bool) -> list:
-        """Build FFmpeg command with NVENC or CPU (libx264) encoder."""
-        cmd = [
-            'ffmpeg', '-y',
-            '-threads', '0',  # Auto threads for decode
-            '-i', str(input_path),
-        ]
+    def _build_ffmpeg_cmd(use_nvenc: bool, use_hw_decode: bool = False) -> list:
+        """Build FFmpeg command with maximum GPU utilization.
+
+        Note: hw_decode with h264_cuvid is disabled by default because our filters
+        (crop, scale, overlay, gblur) are CPU filters. The main speed gain comes
+        from NVENC encoding with p1 preset.
+        """
+        cmd = ['ffmpeg', '-y']
+
+        if use_hw_decode:
+            # Hardware decode (useful when filters are also GPU-based)
+            cmd.extend([
+                '-hwaccel', 'cuda',
+                '-hwaccel_device', str(gpu_id),
+            ])
+
+        # Use multiple threads for software decode
+        cmd.extend(['-threads', '0'])
+
+        cmd.extend(['-i', str(input_path)])
 
         # Add logo input if needed
         logo_path = _get_logo_path(logo_name)
@@ -197,14 +222,21 @@ def _process_video_gpu(
         cmd.extend(['-map', '[out]'])
 
         if use_nvenc:
-            # NVENC GPU encoding - use constrained quality mode (no -b:v 0)
+            # NVENC GPU encoding - MAXIMUM THROUGHPUT settings (like spoofer)
             cmd.extend([
                 '-c:v', 'h264_nvenc',
                 '-gpu', str(gpu_id),
-                '-preset', 'p4',       # Balanced speed/quality
-                '-tune', 'hq',         # High quality tune
-                '-rc', 'constqp',      # Constant QP mode (no bitrate needed)
-                '-qp', '23',           # Quality parameter (lower = better)
+                '-preset', 'p1',        # FASTEST preset for maximum throughput
+                '-tune', 'll',          # Low latency tune
+                '-rc', 'vbr',           # Variable bitrate
+                '-cq', '26',            # Constant quality (good balance)
+                '-b:v', '8000k',        # Target bitrate
+                '-maxrate', '16000k',   # 2x headroom for peaks
+                '-bufsize', '16000k',
+                '-rc-lookahead', '0',   # Zero lookahead for minimum latency
+                '-bf', '0',             # No B-frames for maximum speed
+                '-spatial-aq', '0',     # Disable spatial AQ for speed
+                '-temporal-aq', '0',    # Disable temporal AQ for speed
                 '-profile:v', 'high',
                 '-level', '4.1',
             ])
@@ -212,8 +244,8 @@ def _process_video_gpu(
             # CPU fallback with libx264
             cmd.extend([
                 '-c:v', 'libx264',
-                '-preset', 'fast',     # Fast encoding
-                '-crf', '23',          # Constant rate factor
+                '-preset', 'ultrafast', # Fastest CPU preset
+                '-crf', '23',
                 '-profile:v', 'high',
                 '-level', '4.1',
             ])
@@ -281,15 +313,24 @@ def _process_video_gpu(
     if progress_callback:
         progress_callback(0.15, "Encoding video...")
 
-    # Try NVENC first, then fallback to CPU
+    # 2-tier fallback strategy for maximum reliability
+    # Tier 1: NVENC with p1 preset (maximum throughput) - FASTEST
+    # Tier 2: CPU fallback (libx264 ultrafast) - if NVENC fails
+
     encoder_used = "NVENC"
+    success = False
+    stderr = ""
+
+    # Tier 1: NVENC encoding (maximum throughput with p1 preset)
+    print(f"[GPU-Reframe] Trying NVENC encoder (p1 preset, max throughput)...")
     cmd_nvenc = _build_ffmpeg_cmd(use_nvenc=True)
     success, stderr = _run_ffmpeg_with_progress(cmd_nvenc, "NVENC")
 
     if not success:
+        # Tier 2: CPU fallback
         print(f"[GPU-Reframe] NVENC failed, trying CPU fallback (libx264)...")
         if progress_callback:
-            progress_callback(0.15, "NVENC failed, trying CPU encoder...")
+            progress_callback(0.15, "Using CPU encoder (libx264)...")
 
         encoder_used = "libx264"
         cmd_cpu = _build_ffmpeg_cmd(use_nvenc=False)
@@ -332,7 +373,9 @@ def _build_gpu_filter_complex(
     """
     Build FFmpeg filter_complex for GPU-accelerated processing.
 
-    Uses pad filter instead of overlay for simplicity and reliability.
+    When forceBlur > 0:
+    - Content: Crop from original (remove top/bottom), then scale to fill width
+    - Background: Original video (no crop) with blur + random variations
     """
     scaled_w = layout['scaled_w']
     scaled_h = layout['scaled_h']
@@ -340,19 +383,14 @@ def _build_gpu_filter_complex(
     content_y = layout['content_y']
     blur_top_h = layout['blur_top']
     blur_bottom_h = layout['blur_bottom']
+    crop_top_px = layout.get('crop_top_px', 0)
+    cropped_orig_h = layout.get('cropped_orig_h', orig_h)
 
     # Blur sigma based on intensity (0-100 -> 10-50)
     blur_sigma = 10 + (blur_intensity / 100) * 40
     blur_sigma = max(5, min(blur_sigma, 50))
 
-    # Build filter chain
-    # Start: scale content to target size
-    chain = [
-        "[0:v]format=yuv420p",
-        f"scale={scaled_w}:{scaled_h}:flags=lanczos"
-    ]
-
-    # Apply color adjustments if needed
+    # Build color adjustment string
     eq_parts = []
     if brightness_adj != 0:
         eq_parts.append(f"brightness={brightness_adj/100:.3f}")
@@ -360,27 +398,35 @@ def _build_gpu_filter_complex(
         eq_parts.append(f"contrast={1 + contrast_adj/100:.3f}")
     if saturation_adj != 0:
         eq_parts.append(f"saturation={1 + saturation_adj/100:.3f}")
+    eq_filter = f",eq={':'.join(eq_parts)}" if eq_parts else ""
 
-    if eq_parts:
-        chain.append(f"eq={':'.join(eq_parts)}")
-
-    # If we need blur zones, use split and overlay approach
+    # If we need blur zones (forceBlur > 0 or natural blur from aspect ratio)
     if blur_top_h > 0 or blur_bottom_h > 0:
-        chain.append("split=2[content][blur_src]")
-        content_filter = ','.join(chain)
+        parts = []
 
-        parts = [content_filter]
+        # === CONTENT STREAM ===
+        # 1. Crop top/bottom from original (if forceBlur is set)
+        # 2. Scale to final width (maintaining aspect ratio of cropped content)
+        # 3. Apply color adjustments
+        if crop_top_px > 0:
+            # Crop from original, then scale
+            content_chain = f"[0:v]crop={orig_w}:{cropped_orig_h}:0:{crop_top_px},scale={scaled_w}:{scaled_h}:flags=lanczos{eq_filter}[content]"
+        else:
+            # No crop needed, just scale
+            content_chain = f"[0:v]scale={scaled_w}:{scaled_h}:flags=lanczos{eq_filter}[content]"
+        parts.append(content_chain)
 
-        # Random variations for blur background
-        extra_zoom = 1.0 + random.uniform(0.1, 0.3)  # 1.1x - 1.3x extra zoom (more margin)
-        rotation_deg = random.uniform(-5, 5)  # -5 to +5 degrees (reduced for safety)
+        # === BLUR BACKGROUND STREAM ===
+        # Use ORIGINAL video (no crop) with blur and random variations
+        extra_zoom = 1.0 + random.uniform(0.1, 0.3)  # 1.1x - 1.3x extra zoom
+        rotation_deg = random.uniform(-5, 5)  # -5 to +5 degrees
 
         # Calculate scaled size with extra zoom
         blur_scale_w = int(final_w * extra_zoom)
         blur_scale_h = int(final_h * extra_zoom)
 
-        # Calculate safe crop offset range (ensure we stay within bounds)
-        max_offset_x = (blur_scale_w - final_w) // 2 - 10  # 10px safety margin
+        # Calculate safe crop offset range
+        max_offset_x = (blur_scale_w - final_w) // 2 - 10
         max_offset_y = (blur_scale_h - final_h) // 2 - 10
         max_offset_x = max(0, max_offset_x)
         max_offset_y = max(0, max_offset_y)
@@ -388,34 +434,32 @@ def _build_gpu_filter_complex(
         crop_offset_x = random.randint(-max_offset_x, max_offset_x) if max_offset_x > 0 else 0
         crop_offset_y = random.randint(-max_offset_y, max_offset_y) if max_offset_y > 0 else 0
 
-        # Calculate final crop position (always positive)
-        crop_x = max(0, (blur_scale_w - final_w) // 2 + crop_offset_x)
-        crop_y = max(0, (blur_scale_h - final_h) // 2 + crop_offset_y)
+        bg_crop_x = max(0, (blur_scale_w - final_w) // 2 + crop_offset_x)
+        bg_crop_y = max(0, (blur_scale_h - final_h) // 2 + crop_offset_y)
 
-        # Build blur filter chain:
-        # 1. Scale up (maintain aspect ratio + extra zoom)
-        # 2. Rotate slightly
-        # 3. Crop to final size
-        # 4. Apply blur
-        blur_filters = [
-            f"scale={blur_scale_w}:{blur_scale_h}:force_original_aspect_ratio=increase",
-            f"rotate={rotation_deg}*PI/180:fillcolor=black:ow={blur_scale_w}:oh={blur_scale_h}",
-            f"crop={final_w}:{final_h}:{crop_x}:{crop_y}",
-            f"gblur=sigma={blur_sigma}"
-        ]
-        parts.append(f"[blur_src]{','.join(blur_filters)}[blurred]")
+        # Blur background: scale up original → rotate → crop to final → blur
+        blur_chain = (
+            f"[0:v]scale={blur_scale_w}:{blur_scale_h}:force_original_aspect_ratio=increase,"
+            f"rotate={rotation_deg}*PI/180:fillcolor=black:ow={blur_scale_w}:oh={blur_scale_h},"
+            f"crop={final_w}:{final_h}:{bg_crop_x}:{bg_crop_y},"
+            f"gblur=sigma={blur_sigma}[blurred]"
+        )
+        parts.append(blur_chain)
 
-        # Overlay content directly on blurred background (no pad needed)
-        # Content is placed at content_x, content_y position
+        # === COMPOSITE ===
+        # Overlay cropped content on blurred background
         parts.append(
             f"[blurred][content]overlay={content_x}:{content_y}:format=yuv420[composited]"
         )
 
         current_output = "[composited]"
     else:
-        # No blur needed - just pad to final size
-        chain.append(f"pad={final_w}:{final_h}:{content_x}:{content_y}:black[composited]")
-        parts = [','.join(chain)]
+        # No blur needed - just scale and pad to final size
+        if crop_top_px > 0:
+            chain = f"[0:v]crop={orig_w}:{cropped_orig_h}:0:{crop_top_px},scale={scaled_w}:{scaled_h}:flags=lanczos{eq_filter},pad={final_w}:{final_h}:{content_x}:{content_y}:black[composited]"
+        else:
+            chain = f"[0:v]scale={scaled_w}:{scaled_h}:flags=lanczos{eq_filter},pad={final_w}:{final_h}:{content_x}:{content_y}:black[composited]"
+        parts = [chain]
         current_output = "[composited]"
 
     # Add logo if present
@@ -763,20 +807,26 @@ def _parse_aspect_ratio(aspect_raw) -> str:
 def _calculate_layout(orig_w: int, orig_h: int, final_w: int, final_h: int, force_blur_percent: float = 0) -> dict:
     """
     Calculate layout for reframe.
-    Content fills width, blur zones on top/bottom.
+
+    When forceBlur > 0:
+    - Crop top/bottom from original content (forceBlur/2 each)
+    - Scale cropped content to fill width
+    - Blur zones filled with original content + blur effects
+
+    Example: forceBlur=50 means crop 25% top + 25% bottom, content is middle 50%
     """
-    # Scale to fill width
+    # Calculate crop amounts from original if forceBlur is set
+    crop_top_percent = force_blur_percent / 2 / 100  # e.g., 50% -> 25% = 0.25
+    crop_bottom_percent = force_blur_percent / 2 / 100
+
+    # Calculate the height of content after cropping from original
+    content_height_ratio = 1.0 - crop_top_percent - crop_bottom_percent  # e.g., 0.50
+    cropped_orig_h = int(orig_h * content_height_ratio)
+
+    # Scale cropped content to fill final width
     scale = final_w / orig_w
     scaled_w = final_w
-    scaled_h = int(orig_h * scale)
-
-    # Apply force blur
-    if force_blur_percent > 0:
-        reduction = 1.0 - (force_blur_percent / 100)
-        scaled_h = int(scaled_h * reduction)
-        # Re-scale width proportionally
-        new_scale = scaled_h / orig_h
-        scaled_w = int(orig_w * new_scale)
+    scaled_h = int(cropped_orig_h * scale)
 
     # Ensure even dimensions
     scaled_w = scaled_w - (scaled_w % 2)
@@ -790,6 +840,10 @@ def _calculate_layout(orig_w: int, orig_h: int, final_w: int, final_h: int, forc
     blur_top = content_y
     blur_bottom = final_h - (content_y + scaled_h)
 
+    # Store crop info for filter construction
+    crop_top_px = int(orig_h * crop_top_percent)
+    crop_bottom_px = int(orig_h * crop_bottom_percent)
+
     return {
         'scaled_w': scaled_w,
         'scaled_h': scaled_h,
@@ -797,7 +851,10 @@ def _calculate_layout(orig_w: int, orig_h: int, final_w: int, final_h: int, forc
         'content_y': content_y,
         'blur_top': blur_top,
         'blur_bottom': blur_bottom,
-        'scale': scale
+        'scale': scale,
+        'crop_top_px': crop_top_px,
+        'crop_bottom_px': crop_bottom_px,
+        'cropped_orig_h': cropped_orig_h,
     }
 
 

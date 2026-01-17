@@ -77,6 +77,62 @@ IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'}
 VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v', '.wmv', '.flv'}
 
 
+# =============================================================================
+# CONFIG HELPERS - Support both camelCase and snake_case
+# =============================================================================
+
+def _get_config(config: dict, camel_key: str, default=None):
+    """
+    Get config value supporting both camelCase and snake_case.
+    Backend converts camelCase to snake_case, so we need to check both.
+
+    Example:
+        _get_config(config, 'logoSize', 15)
+        # Checks config['logoSize'] first, then config['logo_size']
+    """
+    # Try camelCase first (original format)
+    if camel_key in config:
+        return config[camel_key]
+
+    # Convert camelCase to snake_case and try
+    snake_key = ''.join(['_' + c.lower() if c.isupper() else c for c in camel_key]).lstrip('_')
+    if snake_key in config:
+        return config[snake_key]
+
+    return default
+
+
+def _parse_aspect_ratio(config: dict) -> str:
+    """Parse aspect ratio from config, supporting multiple formats."""
+    aspect_raw = _get_config(config, 'aspectRatio', '9:16')
+    if isinstance(aspect_raw, (list, tuple)) and len(aspect_raw) == 2:
+        return f"{aspect_raw[0]}:{aspect_raw[1]}"
+    return str(aspect_raw) if aspect_raw else '9:16'
+
+
+def _parse_logo_position(config: dict) -> tuple:
+    """
+    Parse logo position from config.
+    Returns (x, y) as normalized values (0-1).
+    """
+    # Try flat keys first (logoPositionX, logoPositionY)
+    pos_x = _get_config(config, 'logoPositionX')
+    pos_y = _get_config(config, 'logoPositionY')
+
+    # If flat keys not found, try nested logoPosition object
+    if pos_x is None or pos_y is None:
+        logo_pos = _get_config(config, 'logoPosition', {})
+        if isinstance(logo_pos, dict):
+            pos_x = logo_pos.get('x', 0.5) if pos_x is None else pos_x
+            pos_y = logo_pos.get('y', 0.85) if pos_y is None else pos_y
+
+    # Default values if still not found
+    pos_x = float(pos_x) if pos_x is not None else 0.5
+    pos_y = float(pos_y) if pos_y is not None else 0.85
+
+    return (pos_x, pos_y)
+
+
 def is_image_file(path: str) -> bool:
     """Check if file is an image based on extension."""
     return Path(path).suffix.lower() in IMAGE_EXTENSIONS
@@ -245,27 +301,33 @@ def _process_image_reframe(
     orig_h, orig_w = image.shape[:2]
     print(f"[ImageReframe] Input: {orig_w}x{orig_h}")
 
-    # Parse config
-    aspect_raw = config.get('aspectRatio', '9:16')
-    if isinstance(aspect_raw, (list, tuple)) and len(aspect_raw) == 2:
-        aspect_str = f"{aspect_raw[0]}:{aspect_raw[1]}"
-    else:
-        aspect_str = str(aspect_raw) if aspect_raw else '9:16'
+    # Parse config using helper that supports both camelCase and snake_case
+    aspect_str = _parse_aspect_ratio(config)
 
-    logo_name = config.get('logoName', 'farmium_full')
-    logo_size = config.get('logoSize', 15)
-    blur_intensity = config.get('blurIntensity', 25)
-    brightness_adj = config.get('brightness', 0)
-    saturation_adj = config.get('saturation', 0)
-    contrast_adj = config.get('contrast', 0)
-    force_blur_percent = config.get('forceBlur', 0)
+    logo_name = _get_config(config, 'logoName', 'farmium_full')
+    logo_url = _get_config(config, 'logoUrl')  # Custom logo URL from backend
+    logo_size = _get_config(config, 'logoSize', 15)
+    logo_position = _parse_logo_position(config)
+    blur_intensity = _get_config(config, 'blurIntensity', 25)
+    brightness_adj = _get_config(config, 'brightness', 0)
+    saturation_adj = _get_config(config, 'saturation', 0)
+    contrast_adj = _get_config(config, 'contrast', 0)
+
+    # Blur percentages - support individual top/bottom
+    top_blur_percent = _get_config(config, 'topBlurPercent', 0)
+    bottom_blur_percent = _get_config(config, 'bottomBlurPercent', 0)
+    force_blur_percent = _get_config(config, 'forceBlur', 0)
+
+    # Log parsed config
+    print(f"[ImageReframe] Config: logo={logo_name}, logoUrl={logo_url}, size={logo_size}%, pos=({logo_position[0]:.2f}, {logo_position[1]:.2f})")
+    print(f"[ImageReframe] Blur: intensity={blur_intensity}, top={top_blur_percent}%, bottom={bottom_blur_percent}%")
 
     # Calculate output dimensions
     final_w, final_h = _get_output_dimensions(aspect_str)
     print(f"[ImageReframe] Output: {final_w}x{final_h} (aspect: {aspect_str})")
 
-    # Calculate layout
-    layout = _calculate_layout(orig_w, orig_h, final_w, final_h, force_blur_percent)
+    # Calculate layout with individual blur percentages
+    layout = _calculate_layout(orig_w, orig_h, final_w, final_h, force_blur_percent, top_blur_percent, bottom_blur_percent)
 
     print(f"[ImageReframe] Layout: content={layout['scaled_w']}x{layout['scaled_h']}, "
           f"blur_top={layout['blur_top']}px, blur_bottom={layout['blur_bottom']}px")
@@ -287,10 +349,14 @@ def _process_image_reframe(
     if progress_callback:
         progress_callback(0.20, "Processing image...")
 
-    # Prepare logo
+    # Prepare logo - use logoUrl if provided (custom user logo), otherwise use logoName
     logo_data = None
-    if logo_name and logo_name != 'none':
-        logo_data = _prepare_logo(logo_name, final_w, logo_size)
+    logo_source = logo_url if logo_url else logo_name
+    if logo_source and logo_source != 'none':
+        logo_data = _prepare_logo(logo_source, final_w, logo_size)
+        if logo_data:
+            # Store logo position in logo_data for _apply_logo
+            logo_data['position'] = logo_position
 
     # Random generator
     rng = random.Random(video_index + 42)
@@ -384,28 +450,34 @@ def _process_video_reframe(
 
     print(f"[VideoReframe] Input: {orig_w}x{orig_h} @ {fps:.2f} fps, {total_frames} frames, duration: {duration:.2f}s")
 
-    # Parse config
-    aspect_raw = config.get('aspectRatio', '9:16')
-    if isinstance(aspect_raw, (list, tuple)) and len(aspect_raw) == 2:
-        aspect_str = f"{aspect_raw[0]}:{aspect_raw[1]}"
-    else:
-        aspect_str = str(aspect_raw) if aspect_raw else '9:16'
+    # Parse config using helper that supports both camelCase and snake_case
+    aspect_str = _parse_aspect_ratio(config)
 
-    logo_name = config.get('logoName', 'farmium_full')
-    logo_size = config.get('logoSize', 15)
-    blur_intensity = config.get('blurIntensity', 25)
-    brightness_adj = config.get('brightness', 0)
-    saturation_adj = config.get('saturation', 0)
-    contrast_adj = config.get('contrast', 0)
-    blur_update_interval = config.get('blurUpdateInterval', 20)
-    force_blur_percent = config.get('forceBlur', 0)
+    logo_name = _get_config(config, 'logoName', 'farmium_full')
+    logo_url = _get_config(config, 'logoUrl')  # Custom logo URL from backend
+    logo_size = _get_config(config, 'logoSize', 15)
+    logo_position = _parse_logo_position(config)
+    blur_intensity = _get_config(config, 'blurIntensity', 25)
+    brightness_adj = _get_config(config, 'brightness', 0)
+    saturation_adj = _get_config(config, 'saturation', 0)
+    contrast_adj = _get_config(config, 'contrast', 0)
+    blur_update_interval = _get_config(config, 'blurUpdateInterval', 20)
+
+    # Blur percentages - support individual top/bottom
+    top_blur_percent = _get_config(config, 'topBlurPercent', 0)
+    bottom_blur_percent = _get_config(config, 'bottomBlurPercent', 0)
+    force_blur_percent = _get_config(config, 'forceBlur', 0)
+
+    # Log parsed config
+    print(f"[VideoReframe] Config: logo={logo_name}, logoUrl={logo_url}, size={logo_size}%, pos=({logo_position[0]:.2f}, {logo_position[1]:.2f})")
+    print(f"[VideoReframe] Blur: intensity={blur_intensity}, top={top_blur_percent}%, bottom={bottom_blur_percent}%")
 
     # Calculate output dimensions
     final_w, final_h = _get_output_dimensions(aspect_str)
     print(f"[VideoReframe] Output: {final_w}x{final_h} (aspect: {aspect_str})")
 
-    # Calculate layout
-    layout = _calculate_layout(orig_w, orig_h, final_w, final_h, force_blur_percent)
+    # Calculate layout with individual blur percentages
+    layout = _calculate_layout(orig_w, orig_h, final_w, final_h, force_blur_percent, top_blur_percent, bottom_blur_percent)
 
     print(f"[VideoReframe] Layout: content={layout['scaled_w']}x{layout['scaled_h']}, "
           f"blur_top={layout['blur_top']}px, blur_bottom={layout['blur_bottom']}px")
@@ -424,12 +496,15 @@ def _process_video_reframe(
         effects = BlurEffects()
         print("[VideoReframe] Using CPU processing")
 
-    # Prepare logo
+    # Prepare logo - use logoUrl if provided (custom user logo), otherwise use logoName
     logo_data = None
-    if logo_name and logo_name != 'none':
-        logo_data = _prepare_logo(logo_name, final_w, logo_size)
+    logo_source = logo_url if logo_url else logo_name
+    if logo_source and logo_source != 'none':
+        logo_data = _prepare_logo(logo_source, final_w, logo_size)
         if logo_data:
-            print(f"[VideoReframe] Logo prepared: {logo_data['image'].shape[1]}x{logo_data['image'].shape[0]}")
+            # Store logo position in logo_data for _apply_logo
+            logo_data['position'] = logo_position
+            print(f"[VideoReframe] Logo prepared: {logo_data['image'].shape[1]}x{logo_data['image'].shape[0]} at pos ({logo_position[0]:.2f}, {logo_position[1]:.2f})")
 
     # Random generator with seed for reproducibility
     rng = random.Random(video_index + 42)
@@ -922,8 +997,31 @@ def _get_output_dimensions(aspect_str: str) -> tuple:
     return (1080, 1920)
 
 
-def _calculate_layout(orig_w: int, orig_h: int, final_w: int, final_h: int, force_blur_percent: float = 0) -> dict:
-    """Calculate layout for content and blur zones."""
+def _calculate_layout(
+    orig_w: int,
+    orig_h: int,
+    final_w: int,
+    final_h: int,
+    force_blur_percent: float = 0,
+    top_blur_percent: float = 0,
+    bottom_blur_percent: float = 0
+) -> dict:
+    """
+    Calculate layout for content and blur zones.
+
+    Args:
+        orig_w, orig_h: Original content dimensions
+        final_w, final_h: Target output dimensions
+        force_blur_percent: Force equal blur on top/bottom (legacy, for same-aspect videos)
+        top_blur_percent: Specific top blur percentage (0-100)
+        bottom_blur_percent: Specific bottom blur percentage (0-100)
+
+    Priority:
+        1. If top_blur_percent or bottom_blur_percent > 0: Use individual percentages
+        2. Else if force_blur_percent > 0: Apply equal blur top/bottom
+        3. Else: Auto-calculate based on aspect ratio difference
+    """
+    # Start with auto-calculated layout based on aspect ratio
     scale = final_w / orig_w
     scaled_w = final_w
     scaled_h = int(orig_h * scale)
@@ -935,11 +1033,38 @@ def _calculate_layout(orig_w: int, orig_h: int, final_w: int, final_h: int, forc
         scaled_w = int(orig_w * scale)
         scaled_w = scaled_w - (scaled_w % 2)
 
+    # Auto-calculated blur from aspect ratio difference
     blur_space = final_h - scaled_h
     blur_top = blur_space // 2
     blur_bottom = blur_space - blur_top
 
-    if force_blur_percent > 0 and blur_space == 0:
+    # Check if individual blur percentages are specified
+    has_individual_blur = (top_blur_percent > 0 or bottom_blur_percent > 0)
+
+    if has_individual_blur:
+        # Use individual blur percentages (from frontend)
+        top_pct = min(top_blur_percent, 50)  # Cap at 50%
+        bottom_pct = min(bottom_blur_percent, 50)  # Cap at 50%
+
+        # Calculate blur heights in pixels
+        blur_top = int(final_h * top_pct / 100)
+        blur_bottom = int(final_h * bottom_pct / 100)
+
+        # Recalculate content size to fit in remaining space
+        content_space = final_h - blur_top - blur_bottom
+        if content_space < scaled_h:
+            # Content needs to shrink to fit
+            new_scale = content_space / orig_h
+            scaled_h = content_space
+            scaled_h = scaled_h - (scaled_h % 2)
+            scaled_w = int(orig_w * new_scale)
+            scaled_w = min(scaled_w, final_w)
+            scaled_w = scaled_w - (scaled_w % 2)
+
+        print(f"[Reframe] Individual blur: top={top_pct}% ({blur_top}px), bottom={bottom_pct}% ({blur_bottom}px)")
+
+    elif force_blur_percent > 0 and blur_space == 0:
+        # Legacy: force equal blur when content matches aspect (force_blur_percent)
         blur_percent = min(force_blur_percent, 40)
         content_percent = 1.0 - (2 * blur_percent / 100)
         scaled_h = int(final_h * content_percent)
@@ -1148,15 +1273,31 @@ def _prepare_logo(logo_name: str, video_width: int, size_percent: float) -> Opti
 
 
 def _apply_logo(frame: np.ndarray, logo_data: dict, frame_w: int, frame_h: int):
-    """Apply logo overlay to frame."""
+    """
+    Apply logo overlay to frame.
+
+    Uses position from logo_data['position'] if available (normalized 0-1 coords),
+    otherwise defaults to center-bottom with 5% margin.
+
+    Position interpretation:
+        - x=0.0: Left edge, x=0.5: Center, x=1.0: Right edge
+        - y=0.0: Top edge, y=0.5: Center, y=1.0: Bottom edge
+        The logo is centered on the specified position point.
+    """
     logo = logo_data['image']
     alpha_3d = logo_data['alpha_3d']
     lh, lw = logo.shape[:2]
 
-    margin = int(frame_h * 0.05)
-    x = (frame_w - lw) // 2
-    y = frame_h - lh - margin
+    # Get position from config, default to center-bottom (0.5, 0.85)
+    position = logo_data.get('position', (0.5, 0.85))
+    pos_x, pos_y = position if isinstance(position, (list, tuple)) else (0.5, 0.85)
 
+    # Convert normalized position to pixel coordinates
+    # Position is the CENTER of the logo
+    x = int(pos_x * frame_w - lw / 2)
+    y = int(pos_y * frame_h - lh / 2)
+
+    # Clamp to frame bounds
     x = max(0, min(frame_w - lw, x))
     y = max(0, min(frame_h - lh, y))
 

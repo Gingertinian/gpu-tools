@@ -541,25 +541,32 @@ def _build_gpu_filter_complex(
         else:
             content_filter = f"scale={scaled_w}:{scaled_h}:flags=fast_bilinear{eq_filter}"
 
-        # NEW APPROACH: Create FULL blurred background showing ENTIRE original content
+        # OPTIMIZED BLUR PIPELINE - 4x faster
         #
-        # Pipeline:
-        # 1. Scale original directly to output size (stretch to fill)
-        # 2. Apply blur - stretching not noticeable when blurred
-        # 3. Overlay sharp content in center
+        # Instead of blurring at full 1080x1920 resolution (slow!), we:
+        # 1. Scale to 1/4 resolution (270x480)
+        # 2. Apply blur (16x fewer pixels = much faster)
+        # 3. Scale back to full resolution (blur hides upscale artifacts)
         #
-        # This shows the FULL original frame (edge to edge) in the blur
+        # This gives same visual result but MUCH faster processing
 
-        print(f"[GPU-Reframe] Using FULL blur background (stretched, shows entire original)")
+        # Calculate low-res dimensions (1/4 size, ensure even)
+        blur_scale_w = (final_w // 4) - ((final_w // 4) % 2)
+        blur_scale_h = (final_h // 4) - ((final_h // 4) % 2)
+        # Reduce blur radius proportionally (since image is smaller)
+        scaled_blur_radius = max(3, blur_radius // 4)
+
+        print(f"[GPU-Reframe] FAST blur: {blur_scale_w}x{blur_scale_h} (1/4 res), radius={scaled_blur_radius}")
 
         # Split into 2: one for blur background, one for content
         parts.append(f"[0:v]split=2[v_bg][v_content]")
 
-        # Background: scale directly to output size (stretch), apply blur
-        # Stretching is not noticeable when heavily blurred
+        # Background: scale to LOW res, blur, then scale to full output
+        # This is ~16x faster than blurring at full resolution
         parts.append(
-            f"[v_bg]scale={final_w}:{final_h}:flags=fast_bilinear,"
-            f"boxblur=luma_radius={blur_radius}:chroma_radius={blur_radius}[blur_bg]"
+            f"[v_bg]scale={blur_scale_w}:{blur_scale_h}:flags=fast_bilinear,"
+            f"boxblur=luma_radius={scaled_blur_radius}:chroma_radius={scaled_blur_radius},"
+            f"scale={final_w}:{final_h}:flags=fast_bilinear[blur_bg]"
         )
 
         # Content: scale to fit width

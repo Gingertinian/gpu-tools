@@ -530,9 +530,10 @@ def _build_gpu_filter_complex(
 
     parts = []
 
-    # If we need blur zones
+    # If we need blur zones (horizontal video -> vertical output)
     if blur_top_h > 0 or blur_bottom_h > 0:
         print(f"[GPU-Reframe] Blur zones: top={blur_top_h}px, bottom={blur_bottom_h}px, content={scaled_h}px")
+        print(f"[GPU-Reframe] Content position: y={content_y}px")
 
         # Build content filter (with optional crop if video is taller than content area)
         if crop_top_px > 0 or crop_bottom_px > 0:
@@ -540,79 +541,32 @@ def _build_gpu_filter_complex(
         else:
             content_filter = f"scale={scaled_w}:{scaled_h}:flags=fast_bilinear{eq_filter}"
 
-        # Generate RANDOM transformations for each blur zone (OPTIMIZED for speed)
-        # Uses boxblur (O(1)) instead of gblur (O(n²)) - 5-10x faster
-        # Removed hue shift (minimal visual impact, adds processing time)
-        import random
+        # NEW APPROACH: Create FULL blurred background showing ENTIRE original content
+        #
+        # Pipeline:
+        # 1. Scale original directly to output size (stretch to fill)
+        # 2. Apply blur - stretching not noticeable when blurred
+        # 3. Overlay sharp content in center
+        #
+        # This shows the FULL original frame (edge to edge) in the blur
 
-        # OPTIMIZED: Single scale to output size, then random crops
-        # This is much faster than multiple different-sized scales
+        print(f"[GPU-Reframe] Using FULL blur background (stretched, shows entire original)")
 
-        # Random crop offsets for visual variety (from different parts of scaled video)
-        # Top blur: crop from top half with random X offset
-        top_crop_x = random.randint(0, max(0, int(final_w * 0.2)))
-        top_crop_y = random.randint(0, max(0, int(final_h * 0.15)))
+        # Split into 2: one for blur background, one for content
+        parts.append(f"[0:v]split=2[v_bg][v_content]")
 
-        # Bottom blur: crop from bottom half with different random X offset
-        bottom_crop_x = random.randint(0, max(0, int(final_w * 0.2)))
-        bottom_crop_y = random.randint(int(final_h * 0.3), max(int(final_h * 0.3), int(final_h * 0.5)))
+        # Background: scale directly to output size (stretch), apply blur
+        # Stretching is not noticeable when heavily blurred
+        parts.append(
+            f"[v_bg]scale={final_w}:{final_h}:flags=fast_bilinear,"
+            f"boxblur=luma_radius={blur_radius}:chroma_radius={blur_radius}[blur_bg]"
+        )
 
-        # Calculate padded scale size to allow for random crops
-        blur_scale_w = final_w + int(final_w * 0.25)
-        blur_scale_h = final_h + int(final_h * 0.55)
+        # Content: scale to fit width
+        parts.append(f"[v_content]{content_filter}[content]")
 
-        print(f"[GPU-Reframe] OPTIMIZED blur: boxblur radius={blur_radius}, scale={blur_scale_w}x{blur_scale_h}")
-        print(f"[GPU-Reframe] Blur crops: top=({top_crop_x},{top_crop_y}), bottom=({bottom_crop_x},{bottom_crop_y})")
-
-        if blur_top_h > 0 and blur_bottom_h > 0:
-            parts.append(f"[0:v]split=3[v1][v2][v3]")
-            parts.append(f"[v1]{content_filter}[content]")
-            # OPTIMIZED: boxblur is O(1) vs gblur O(n²), removed hue shift
-            parts.append(
-                f"[v2]scale={blur_scale_w}:{blur_scale_h}:flags=fast_bilinear,"
-                f"boxblur=luma_radius={blur_radius}:chroma_radius={blur_radius},"
-                f"crop={final_w}:{blur_top_h}:{top_crop_x}:{top_crop_y}[blur_top]"
-            )
-            parts.append(
-                f"[v3]scale={blur_scale_w}:{blur_scale_h}:flags=fast_bilinear,"
-                f"boxblur=luma_radius={blur_radius}:chroma_radius={blur_radius},"
-                f"crop={final_w}:{blur_bottom_h}:{bottom_crop_x}:{bottom_crop_y}[blur_bottom]"
-            )
-        elif blur_top_h > 0:
-            parts.append(f"[0:v]split=2[v1][v2]")
-            parts.append(f"[v1]{content_filter}[content]")
-            parts.append(
-                f"[v2]scale={blur_scale_w}:{blur_scale_h}:flags=fast_bilinear,"
-                f"boxblur=luma_radius={blur_radius}:chroma_radius={blur_radius},"
-                f"crop={final_w}:{blur_top_h}:{top_crop_x}:{top_crop_y}[blur_top]"
-            )
-        elif blur_bottom_h > 0:
-            parts.append(f"[0:v]split=2[v1][v2]")
-            parts.append(f"[v1]{content_filter}[content]")
-            parts.append(
-                f"[v2]scale={blur_scale_w}:{blur_scale_h}:flags=fast_bilinear,"
-                f"boxblur=luma_radius={blur_radius}:chroma_radius={blur_radius},"
-                f"crop={final_w}:{blur_bottom_h}:{bottom_crop_x}:{bottom_crop_y}[blur_bottom]"
-            )
-
-        # Composite: Use pad to create black background, then overlay blur zones
-        # This avoids the "shortest=1" issue with color filter
-        if blur_top_h > 0 and blur_bottom_h > 0:
-            # Both blur zones - pad content first, then overlay blur zones
-            parts.append(f"[content]pad={final_w}:{final_h}:{content_x}:{content_y}:black[padded]")
-            parts.append(f"[padded][blur_top]overlay=0:0[t1]")
-            parts.append(f"[t1][blur_bottom]overlay=0:{final_h - blur_bottom_h}[composited]")
-        elif blur_top_h > 0:
-            # Only top blur
-            parts.append(f"[content]pad={final_w}:{final_h}:{content_x}:{content_y}:black[padded]")
-            parts.append(f"[padded][blur_top]overlay=0:0[composited]")
-        elif blur_bottom_h > 0:
-            # Only bottom blur
-            parts.append(f"[content]pad={final_w}:{final_h}:{content_x}:{content_y}:black[padded]")
-            parts.append(f"[padded][blur_bottom]overlay=0:{final_h - blur_bottom_h}[composited]")
-        else:
-            # No blur (shouldn't reach here)
-            parts.append(f"[content]pad={final_w}:{final_h}:{content_x}:{content_y}:black[composited]")
+        # Composite: overlay content on blur background
+        parts.append(f"[blur_bg][content]overlay={content_x}:{content_y}[composited]")
 
         current_output = "[composited]"
     else:

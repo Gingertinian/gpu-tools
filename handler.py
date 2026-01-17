@@ -1614,14 +1614,18 @@ def process_batch_mode(job, job_input: dict) -> dict:
 
     temp_dir = tempfile.mkdtemp(prefix=f"farmium_batch_{job_id}_")
 
+    # Get optimal I/O workers based on GPU count
+    download_workers, upload_workers = get_optimal_io_workers(gpu_count)
+    print(f"[Batch Mode] I/O workers: {download_workers} download, {upload_workers} upload")
+
     try:
         # Use the new async pipeline processor
         pipeline = AsyncPipelineProcessor(
             gpu_info=gpu_info,
             job=job,
             temp_dir=temp_dir,
-            download_workers=DOWNLOAD_WORKERS,
-            upload_workers=UPLOAD_WORKERS
+            download_workers=download_workers,
+            upload_workers=upload_workers
         )
 
         result = pipeline.process_batch(

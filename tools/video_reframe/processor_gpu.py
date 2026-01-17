@@ -419,11 +419,12 @@ def _build_gpu_filter_complex(
         parts.append(content_chain)
 
         # === BLUR BACKGROUND STREAM ===
-        # Use ORIGINAL video (no crop) with blur and random variations
-        extra_zoom = 1.0 + random.uniform(0.1, 0.3)  # 1.1x - 1.3x extra zoom
+        # CRITICAL: Use CROPPED content (middle part) for blur, NOT original video
+        # This ensures blur zones show reconstructed content from the visible middle
+        extra_zoom = 1.0 + random.uniform(0.15, 0.35)  # 1.15x - 1.35x extra zoom
         rotation_deg = random.uniform(-5, 5)  # -5 to +5 degrees
 
-        # Calculate scaled size with extra zoom
+        # Calculate scaled size with extra zoom to fill entire frame
         blur_scale_w = int(final_w * extra_zoom)
         blur_scale_h = int(final_h * extra_zoom)
 
@@ -439,13 +440,24 @@ def _build_gpu_filter_complex(
         bg_crop_x = max(0, (blur_scale_w - final_w) // 2 + crop_offset_x)
         bg_crop_y = max(0, (blur_scale_h - final_h) // 2 + crop_offset_y)
 
-        # Blur background: scale up original → rotate → crop to final → blur
-        blur_chain = (
-            f"[0:v]scale={blur_scale_w}:{blur_scale_h}:force_original_aspect_ratio=increase,"
-            f"rotate={rotation_deg}*PI/180:fillcolor=black:ow={blur_scale_w}:oh={blur_scale_h},"
-            f"crop={final_w}:{final_h}:{bg_crop_x}:{bg_crop_y},"
-            f"gblur=sigma={blur_sigma}[blurred]"
-        )
+        # Blur background: crop middle → scale up to fill frame → rotate → crop to final → blur
+        if crop_top_px > 0:
+            # Use cropped content (middle part) as source for blur
+            blur_chain = (
+                f"[0:v]crop={orig_w}:{cropped_orig_h}:0:{crop_top_px},"
+                f"scale={blur_scale_w}:{blur_scale_h}:force_original_aspect_ratio=increase,"
+                f"rotate={rotation_deg}*PI/180:fillcolor=black:ow={blur_scale_w}:oh={blur_scale_h},"
+                f"crop={final_w}:{final_h}:{bg_crop_x}:{bg_crop_y},"
+                f"gblur=sigma={blur_sigma}[blurred]"
+            )
+        else:
+            # No crop, use original
+            blur_chain = (
+                f"[0:v]scale={blur_scale_w}:{blur_scale_h}:force_original_aspect_ratio=increase,"
+                f"rotate={rotation_deg}*PI/180:fillcolor=black:ow={blur_scale_w}:oh={blur_scale_h},"
+                f"crop={final_w}:{final_h}:{bg_crop_x}:{bg_crop_y},"
+                f"gblur=sigma={blur_sigma}[blurred]"
+            )
         parts.append(blur_chain)
 
         # === COMPOSITE ===
@@ -652,23 +664,24 @@ def _process_image_cupy(
     needs_blur = blur_top_h > 0 or blur_bottom_h > 0 or content_x > 0
 
     if needs_blur:
-        # Create full-frame blurred background with random variations
-        orig_h, orig_w = img.shape[:2]
+        # CRITICAL: Create blurred background from CONTENT (scaled/processed), not original
+        # This ensures blur zones show reconstructed content from the visible area
+        content_h, content_w = content.shape[:2]
 
         # Random variations
-        extra_zoom = 1.0 + random.uniform(0.05, 0.25)  # 1.05x - 1.25x
+        extra_zoom = 1.0 + random.uniform(0.15, 0.35)  # 1.15x - 1.35x
         rotation_deg = random.uniform(-8, 8)  # -8 to +8 degrees
         offset_x = random.randint(-30, 30)
         offset_y = random.randint(-30, 30)
 
-        # Calculate scale with extra zoom
-        scale_w = final_w / orig_w
-        scale_h = final_h / orig_h
+        # Calculate scale to fill entire frame from content
+        scale_w = final_w / content_w
+        scale_h = final_h / content_h
         scale = max(scale_w, scale_h) * extra_zoom
 
-        # Zoom maintaining aspect ratio
+        # Zoom content to fill frame
         bg_zoom = (scale, scale, 1)
-        zoomed = gpu_ndimage.zoom(gpu_img, bg_zoom, order=1)
+        zoomed = gpu_ndimage.zoom(content, bg_zoom, order=1)
 
         # Apply rotation if significant
         if abs(rotation_deg) > 0.5:
@@ -679,8 +692,7 @@ def _process_image_cupy(
         crop_y = max(0, min((zoomed.shape[0] - final_h) // 2 + offset_y, zoomed.shape[0] - final_h))
         blurred_bg = zoomed[crop_y:crop_y + final_h, crop_x:crop_x + final_w]
 
-        # OPTIMIZED: Apply gaussian blur to all channels at once (3x faster)
-        # Using separable filter for each channel is still fast
+        # Apply gaussian blur to background
         for c in range(3):
             blurred_bg[:, :, c] = gpu_ndimage.gaussian_filter(blurred_bg[:, :, c], sigma=blur_sigma)
         output = blurred_bg
@@ -753,24 +765,25 @@ def _process_image_cpu(
     needs_blur = blur_top_h > 0 or blur_bottom_h > 0 or content_x > 0
 
     if needs_blur:
-        # Create full-frame blurred background with random variations
-        orig_h, orig_w = img.shape[:2]
+        # CRITICAL: Create blurred background from CONTENT (scaled/processed), not original
+        # This ensures blur zones show reconstructed content from the visible area
+        content_h, content_w = content.shape[:2]
 
         # Random variations
-        extra_zoom = 1.0 + random.uniform(0.05, 0.25)  # 1.05x - 1.25x
+        extra_zoom = 1.0 + random.uniform(0.15, 0.35)  # 1.15x - 1.35x
         rotation_deg = random.uniform(-8, 8)  # -8 to +8 degrees
         offset_x = random.randint(-30, 30)
         offset_y = random.randint(-30, 30)
 
-        # Calculate scale with extra zoom
-        scale_w = final_w / orig_w
-        scale_h = final_h / orig_h
+        # Calculate scale to fill entire frame from content
+        scale_w = final_w / content_w
+        scale_h = final_h / content_h
         scale = max(scale_w, scale_h) * extra_zoom
 
-        # Resize maintaining aspect ratio
-        new_w = int(orig_w * scale)
-        new_h = int(orig_h * scale)
-        resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        # Resize content to fill frame
+        new_w = int(content_w * scale)
+        new_h = int(content_h * scale)
+        resized = cv2.resize(content, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
 
         # Apply rotation
         if abs(rotation_deg) > 0.5:

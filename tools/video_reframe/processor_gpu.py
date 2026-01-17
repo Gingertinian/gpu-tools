@@ -428,6 +428,11 @@ def _build_gpu_filter_complex(
         bg_crop_x = max(0, (blur_scale_w - final_w) // 2 + crop_offset_x)
         bg_crop_y = max(0, (blur_scale_h - final_h) // 2 + crop_offset_y)
 
+        # Convert sigma to boxblur radius (boxblur is O(1) vs gblur O(n²))
+        # boxblur uses luma_radius and chroma_radius, typically radius ≈ sigma * 1.5
+        blur_radius = int(blur_sigma * 1.5)
+        blur_radius = max(1, min(blur_radius, 30))  # Clamp between 1-30
+
         if crop_top_px > 0:
             # OPTIMIZED: Crop once, split into two streams
             # Stream 1 (cropped1) -> content
@@ -439,12 +444,12 @@ def _build_gpu_filter_complex(
             parts.append(
                 f"[cropped1]scale={scaled_w}:{scaled_h}:flags=lanczos{eq_filter}[content]"
             )
-            # Blur stream: scale up + rotate + crop + blur
+            # Blur stream: scale up + rotate + crop + blur (using boxblur for O(1) performance)
             parts.append(
                 f"[cropped2]scale={blur_scale_w}:{blur_scale_h}:force_original_aspect_ratio=increase,"
                 f"rotate={rotation_deg}*PI/180:fillcolor=black:ow={blur_scale_w}:oh={blur_scale_h},"
                 f"crop={final_w}:{final_h}:{bg_crop_x}:{bg_crop_y},"
-                f"gblur=sigma={blur_sigma}[blurred]"
+                f"boxblur=luma_radius={blur_radius}:chroma_radius={blur_radius}:luma_power=2[blurred]"
             )
         else:
             # No crop needed - split original
@@ -454,11 +459,12 @@ def _build_gpu_filter_complex(
             parts.append(
                 f"[src1]scale={scaled_w}:{scaled_h}:flags=lanczos{eq_filter}[content]"
             )
+            # Using boxblur for O(1) performance instead of gblur O(n²)
             parts.append(
                 f"[src2]scale={blur_scale_w}:{blur_scale_h}:force_original_aspect_ratio=increase,"
                 f"rotate={rotation_deg}*PI/180:fillcolor=black:ow={blur_scale_w}:oh={blur_scale_h},"
                 f"crop={final_w}:{final_h}:{bg_crop_x}:{bg_crop_y},"
-                f"gblur=sigma={blur_sigma}[blurred]"
+                f"boxblur=luma_radius={blur_radius}:chroma_radius={blur_radius}:luma_power=2[blurred]"
             )
 
         # === COMPOSITE ===

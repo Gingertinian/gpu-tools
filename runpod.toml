@@ -61,7 +61,7 @@ UVICORN_LOG_LEVEL = "warning"
 # max_workers    - The maximum number of workers your endpoint has running at any given point.
 
 active_workers = 0   # No always-on (flashboot keeps cold starts ~10-15s)
-max_workers = 5      # Scale up to 5 workers for parallel processing
+max_workers = 20     # Scale up to 20 workers for maximum parallel processing (matches UNLIMITED tier)
 flashboot = true
 
 [runtime]

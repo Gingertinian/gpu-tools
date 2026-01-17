@@ -532,91 +532,95 @@ def _build_gpu_filter_complex(
 
     # If we need blur zones
     if blur_top_h > 0 or blur_bottom_h > 0:
-        # Generate DIFFERENT random parameters for top and bottom blur zones
-        # This ensures they look distinct from each other
+        print(f"[GPU-Reframe] Blur zones: top={blur_top_h}px, bottom={blur_bottom_h}px, content={scaled_h}px")
 
-        # Top blur zone parameters
-        top_zoom = 1.0 + random.uniform(0.3, 0.6)
-        top_rotation = random.uniform(-10, 10)
-        top_offset_x = random.randint(-80, 80)
-        top_offset_y = random.randint(0, 200)  # Positive = use upper part of content
-
-        # Bottom blur zone parameters (DIFFERENT from top)
-        bottom_zoom = 1.0 + random.uniform(0.3, 0.6)
-        bottom_rotation = random.uniform(-10, 10)
-        bottom_offset_x = random.randint(-80, 80)
-        bottom_offset_y = random.randint(-200, 0)  # Negative = use lower part of content
-
-        print(f"[GPU-Reframe] Top blur: zoom={top_zoom:.2f}, rot={top_rotation:.1f}, offset=({top_offset_x}, {top_offset_y})")
-        print(f"[GPU-Reframe] Bottom blur: zoom={bottom_zoom:.2f}, rot={bottom_rotation:.1f}, offset=({bottom_offset_x}, {bottom_offset_y})")
-
-        # Calculate scaled sizes for blur sources
-        # We want to create blur zones from the content (middle section)
-        top_scale_h = max(blur_top_h * 2, int(scaled_h * top_zoom))
-        top_scale_w = int(final_w * top_zoom)
-        bottom_scale_h = max(blur_bottom_h * 2, int(scaled_h * bottom_zoom))
-        bottom_scale_w = int(final_w * bottom_zoom)
-
+        # Build content filter (with optional crop if video is taller than content area)
         if crop_top_px > 0 or crop_bottom_px > 0:
-            # Crop to get middle section, then split for content + blur sources
-            parts.append(
-                f"[0:v]crop={orig_w}:{cropped_orig_h}:0:{crop_top_px},split=3[for_content][for_blur_top][for_blur_bottom]"
-            )
+            content_filter = f"crop={orig_w}:{orig_h - crop_top_px - crop_bottom_px}:0:{crop_top_px},scale={scaled_w}:{scaled_h}:flags=fast_bilinear{eq_filter}"
         else:
-            # No crop, split original
-            parts.append(f"[0:v]split=3[for_content][for_blur_top][for_blur_bottom]")
+            content_filter = f"scale={scaled_w}:{scaled_h}:flags=fast_bilinear{eq_filter}"
 
-        # Content: scale to fit in the middle
-        parts.append(
-            f"[for_content]scale={scaled_w}:{scaled_h}:flags=lanczos{eq_filter}[content]"
-        )
+        # Generate RANDOM transformations for each blur zone
+        # This makes top and bottom blur zones look different
+        import random
 
-        # Calculate crop positions for top blur (from upper portion of scaled content)
-        top_crop_x = max(0, min((top_scale_w - final_w) // 2 + top_offset_x, top_scale_w - final_w))
-        top_crop_y = max(0, min((top_scale_h - blur_top_h) // 2 + top_offset_y, top_scale_h - blur_top_h))
+        # Top blur: random zoom (1.2-1.8x), random crop offset, slight hue shift
+        top_zoom = random.uniform(1.3, 1.8)
+        top_scale_w = int(final_w * top_zoom)
+        top_scale_h = int(final_h * top_zoom)
+        top_crop_x = random.randint(0, max(0, top_scale_w - final_w))
+        top_crop_y = random.randint(0, max(0, int(top_scale_h * 0.3)))  # Crop from top 30%
+        top_hue = random.uniform(-0.05, 0.05)  # Slight hue variation
 
-        # Calculate crop positions for bottom blur (from lower portion of scaled content)
-        bottom_crop_x = max(0, min((bottom_scale_w - final_w) // 2 + bottom_offset_x, bottom_scale_w - final_w))
-        bottom_crop_y = max(0, min((bottom_scale_h - blur_bottom_h) // 2 + abs(bottom_offset_y), bottom_scale_h - blur_bottom_h))
+        # Bottom blur: different random zoom, different crop offset, different hue
+        bottom_zoom = random.uniform(1.2, 1.6)
+        bottom_scale_w = int(final_w * bottom_zoom)
+        bottom_scale_h = int(final_h * bottom_zoom)
+        bottom_crop_x = random.randint(0, max(0, bottom_scale_w - final_w))
+        bottom_crop_y = random.randint(int(bottom_scale_h * 0.5), max(int(bottom_scale_h * 0.5), bottom_scale_h - final_h))  # Crop from bottom 50%
+        bottom_hue = random.uniform(-0.05, 0.05)
 
-        if blur_top_h > 0:
-            # Top blur zone: scale up, rotate, crop to zone size, blur
-            parts.append(
-                f"[for_blur_top]scale={top_scale_w}:{top_scale_h}:force_original_aspect_ratio=increase,"
-                f"rotate={top_rotation}*PI/180:fillcolor=black:ow={top_scale_w}:oh={top_scale_h},"
-                f"crop={final_w}:{blur_top_h}:{top_crop_x}:{top_crop_y},"
-                f"boxblur=luma_radius={blur_radius}:chroma_radius={blur_radius}:luma_power=2[blur_top]"
-            )
+        print(f"[GPU-Reframe] Blur randomization: top_zoom={top_zoom:.2f}, bottom_zoom={bottom_zoom:.2f}")
+        print(f"[GPU-Reframe] Top blur crop: ({top_crop_x}, {top_crop_y}), Bottom blur crop: ({bottom_crop_x}, {bottom_crop_y})")
 
-        if blur_bottom_h > 0:
-            # Bottom blur zone: different params for visual variety
-            parts.append(
-                f"[for_blur_bottom]scale={bottom_scale_w}:{bottom_scale_h}:force_original_aspect_ratio=increase,"
-                f"rotate={bottom_rotation}*PI/180:fillcolor=black:ow={bottom_scale_w}:oh={bottom_scale_h},"
-                f"crop={final_w}:{blur_bottom_h}:{bottom_crop_x}:{bottom_crop_y},"
-                f"boxblur=luma_radius={blur_radius}:chroma_radius={blur_radius}:luma_power=2[blur_bottom]"
-            )
-
-        # Create black canvas
-        parts.append(f"color=black:size={final_w}x{final_h}:d=1:r=30[canvas]")
-
-        # Composite: overlay blur zones and content onto canvas
         if blur_top_h > 0 and blur_bottom_h > 0:
-            # Both blur zones
-            parts.append(f"[canvas][blur_top]overlay=0:0:shortest=1[t1]")
-            parts.append(f"[t1][content]overlay={content_x}:{content_y}:shortest=1[t2]")
-            parts.append(f"[t2][blur_bottom]overlay=0:{final_h - blur_bottom_h}:shortest=1[composited]")
+            parts.append(f"[0:v]split=3[v1][v2][v3]")
+            parts.append(f"[v1]{content_filter}[content]")
+            # Top blur: scale up with zoom, apply hue shift, blur, crop to final size, then crop blur zone
+            parts.append(
+                f"[v2]scale={top_scale_w}:{top_scale_h}:flags=fast_bilinear,"
+                f"hue=h={top_hue},"
+                f"gblur=sigma={blur_radius},"
+                f"crop={final_w}:{final_h}:{top_crop_x}:{top_crop_y},"
+                f"crop={final_w}:{blur_top_h}:0:0[blur_top]"
+            )
+            # Bottom blur: different zoom, different hue, different crop
+            parts.append(
+                f"[v3]scale={bottom_scale_w}:{bottom_scale_h}:flags=fast_bilinear,"
+                f"hue=h={bottom_hue},"
+                f"gblur=sigma={blur_radius},"
+                f"crop={final_w}:{final_h}:{bottom_crop_x}:{bottom_crop_y},"
+                f"crop={final_w}:{blur_bottom_h}:0:{final_h - blur_bottom_h}[blur_bottom]"
+            )
+        elif blur_top_h > 0:
+            parts.append(f"[0:v]split=2[v1][v2]")
+            parts.append(f"[v1]{content_filter}[content]")
+            parts.append(
+                f"[v2]scale={top_scale_w}:{top_scale_h}:flags=fast_bilinear,"
+                f"hue=h={top_hue},"
+                f"gblur=sigma={blur_radius},"
+                f"crop={final_w}:{final_h}:{top_crop_x}:{top_crop_y},"
+                f"crop={final_w}:{blur_top_h}:0:0[blur_top]"
+            )
+        elif blur_bottom_h > 0:
+            parts.append(f"[0:v]split=2[v1][v2]")
+            parts.append(f"[v1]{content_filter}[content]")
+            parts.append(
+                f"[v2]scale={bottom_scale_w}:{bottom_scale_h}:flags=fast_bilinear,"
+                f"hue=h={bottom_hue},"
+                f"gblur=sigma={blur_radius},"
+                f"crop={final_w}:{final_h}:{bottom_crop_x}:{bottom_crop_y},"
+                f"crop={final_w}:{blur_bottom_h}:0:{final_h - blur_bottom_h}[blur_bottom]"
+            )
+
+        # Composite: Use pad to create black background, then overlay blur zones
+        # This avoids the "shortest=1" issue with color filter
+        if blur_top_h > 0 and blur_bottom_h > 0:
+            # Both blur zones - pad content first, then overlay blur zones
+            parts.append(f"[content]pad={final_w}:{final_h}:{content_x}:{content_y}:black[padded]")
+            parts.append(f"[padded][blur_top]overlay=0:0[t1]")
+            parts.append(f"[t1][blur_bottom]overlay=0:{final_h - blur_bottom_h}[composited]")
         elif blur_top_h > 0:
             # Only top blur
-            parts.append(f"[canvas][blur_top]overlay=0:0:shortest=1[t1]")
-            parts.append(f"[t1][content]overlay={content_x}:{content_y}:shortest=1[composited]")
+            parts.append(f"[content]pad={final_w}:{final_h}:{content_x}:{content_y}:black[padded]")
+            parts.append(f"[padded][blur_top]overlay=0:0[composited]")
         elif blur_bottom_h > 0:
             # Only bottom blur
-            parts.append(f"[canvas][content]overlay={content_x}:{content_y}:shortest=1[t1]")
-            parts.append(f"[t1][blur_bottom]overlay=0:{final_h - blur_bottom_h}:shortest=1[composited]")
+            parts.append(f"[content]pad={final_w}:{final_h}:{content_x}:{content_y}:black[padded]")
+            parts.append(f"[padded][blur_bottom]overlay=0:{final_h - blur_bottom_h}[composited]")
         else:
             # No blur (shouldn't reach here)
-            parts.append(f"[canvas][content]overlay={content_x}:{content_y}:shortest=1[composited]")
+            parts.append(f"[content]pad={final_w}:{final_h}:{content_x}:{content_y}:black[composited]")
 
         current_output = "[composited]"
     else:
@@ -644,8 +648,9 @@ def _build_gpu_filter_complex(
         parts.append(
             f"[1:v]scale={logo_w}:-1:flags=lanczos,format=yuva420p[logo]"
         )
+        # Use eof_action=repeat to loop logo (static image) for entire video duration
         parts.append(
-            f"{current_output}[logo]overlay={logo_x}:{logo_y}:shortest=1[out]"
+            f"{current_output}[logo]overlay={logo_x}:{logo_y}:eof_action=repeat[out]"
         )
     else:
         print(f"[GPU-Reframe] No logo to add (logo_path={logo_path})")
@@ -1042,21 +1047,13 @@ def _calculate_layout(
     bottom_blur_pct: float = 0
 ) -> dict:
     """
-    Calculate layout for reframe with ASYMMETRIC blur zone support.
+    Calculate layout for reframe.
 
-    FIXED (2026-01-17): Respects EXACT user values for top/bottom blur.
-    User sets blur zones as percentage of FINAL output height.
-    Content fills the remaining space between blur zones.
-
-    Args:
-        orig_w, orig_h: Original dimensions
-        final_w, final_h: Target dimensions
-        top_blur_pct: Percentage of FINAL height for top blur zone (0-50)
-        bottom_blur_pct: Percentage of FINAL height for bottom blur zone (0-50)
-
-    Returns layout dict with positions and sizes.
+    - Blur zones are exact percentages of final height (user's choice)
+    - Content fills width (1080px), height is cropped to fit content area
+    - Maintains width, crops height as needed
     """
-    # Blur zones are percentage of FINAL output height (what user sees in UI)
+    # Blur zones are percentage of FINAL output height
     blur_top = int(final_h * min(top_blur_pct, 50) / 100)
     blur_bottom = int(final_h * min(bottom_blur_pct, 50) / 100)
 
@@ -1064,56 +1061,47 @@ def _calculate_layout(
     blur_top = blur_top - (blur_top % 2)
     blur_bottom = blur_bottom - (blur_bottom % 2)
 
-    # Content area is what remains between blur zones
-    content_y = blur_top
+    # Content area height (space between blur zones)
     content_h = final_h - blur_top - blur_bottom
-    content_h = max(content_h, int(final_h * 0.2))  # Minimum 20% content
+    content_h = max(content_h, int(final_h * 0.2))  # Minimum 20%
     content_h = content_h - (content_h % 2)
 
-    # Scale content to fill width, height is the remaining space
+    # Scale to fill width, then crop height to fit content area
     scaled_w = final_w
-    scaled_h = content_h
-    content_x = 0  # Full width
+    scale = final_w / orig_w
+    scaled_h_natural = int(orig_h * scale)  # Natural height if we scale by width
 
-    # Calculate how much to crop from original to fit content area
-    # We want to fill the content area while maintaining aspect ratio
-    orig_aspect = orig_w / orig_h
-    content_aspect = scaled_w / scaled_h
-
-    if orig_aspect > content_aspect:
-        # Original is wider - crop sides (but we scale to width, so crop top/bottom)
-        crop_top_pct = 0
-        crop_bottom_pct = 0
-        cropped_orig_h = orig_h
+    if scaled_h_natural <= content_h:
+        # Video is shorter than content area - use natural height, center vertically
+        scaled_h = scaled_h_natural
+        content_y = blur_top + (content_h - scaled_h) // 2
+        crop_top_px = 0
+        crop_bottom_px = 0
     else:
-        # Original is taller - need to crop top/bottom to fit
-        # Calculate how much of original height we need
-        needed_orig_h = int(orig_w / content_aspect * orig_h / orig_h)
-        needed_orig_h = min(needed_orig_h, orig_h)
+        # Video is taller than content area - crop to fit
+        scaled_h = content_h
+        content_y = blur_top
+        # Calculate how much to crop from original
+        needed_orig_h = int(content_h / scale)
         crop_total = orig_h - needed_orig_h
-        crop_top_pct = crop_total / 2 / orig_h
-        crop_bottom_pct = crop_total / 2 / orig_h
-        cropped_orig_h = needed_orig_h
+        crop_top_px = crop_total // 2
+        crop_bottom_px = crop_total - crop_top_px
 
-    # For now, use full original and let FFmpeg scale
-    crop_top_px = 0
-    crop_bottom_px = 0
-    cropped_orig_h = orig_h
-
-    # Calculate scale factor
-    scale = scaled_w / orig_w
+    # Ensure even
+    scaled_h = scaled_h - (scaled_h % 2)
+    content_y = content_y - (content_y % 2)
 
     return {
         'scaled_w': scaled_w,
         'scaled_h': scaled_h,
-        'content_x': content_x,
+        'content_x': 0,
         'content_y': content_y,
         'blur_top': blur_top,
         'blur_bottom': blur_bottom,
         'scale': scale,
         'crop_top_px': crop_top_px,
         'crop_bottom_px': crop_bottom_px,
-        'cropped_orig_h': cropped_orig_h,
+        'cropped_orig_h': orig_h - crop_top_px - crop_bottom_px,
     }
 
 

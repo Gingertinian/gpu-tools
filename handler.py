@@ -1811,8 +1811,10 @@ def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipel
                     if process_video_reframe is None:
                         return {"error": "Video Reframe processor not available"}
                     result = process_video_reframe(current_file, output_path, batch_config, progress_callback=step_callback)
-                    if os.path.exists(output_path):
-                        next_files.append(output_path)
+                    # video_reframe may change extension for images (mp4 -> jpg)
+                    actual_path = result.get('outputPath', output_path) if result else output_path
+                    if os.path.exists(actual_path):
+                        next_files.append(actual_path)
 
                 else:
                     return {"error": f"Unknown tool in pipeline: {tool}"}
@@ -1994,7 +1996,10 @@ def process_single_pipeline_for_batch(args: tuple) -> dict:
                 elif tool == "video_gen" and process_video_gen is not None:
                     process_video_gen(current_file, output_path, step_config)
                 elif tool == "video_reframe" and process_video_reframe is not None:
-                    process_video_reframe(current_file, output_path, step_config)
+                    reframe_result = process_video_reframe(current_file, output_path, step_config)
+                    # video_reframe may change extension for images (mp4 -> jpg)
+                    if reframe_result and reframe_result.get('outputPath'):
+                        output_path = reframe_result['outputPath']
 
                 if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                     next_files.append(output_path)
@@ -2531,6 +2536,10 @@ def handler(job):
                 input_path, output_path, config,
                 progress_callback=progress_callback
             )
+            # IMPORTANT: video_reframe may change extension for images (mp4 -> jpg)
+            # Use actual output path from result if available
+            if result and result.get('outputPath'):
+                output_path = result['outputPath']
 
         # ==================== UNKNOWN TOOL ====================
         else:

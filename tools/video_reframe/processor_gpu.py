@@ -176,83 +176,127 @@ def _process_video_gpu(
         logo_name, logo_size, gpu_id
     )
 
-    # Build FFmpeg command
-    # Use software decode (more compatible) + NVENC encode (fast)
-    # On RunPod with proper CUDA, we can add hwaccel for decode too
-    cmd = [
-        'ffmpeg', '-y',
-        '-threads', '0',  # Auto threads for decode
-        '-i', str(input_path),
-    ]
+    # Build FFmpeg command helper
+    def _build_ffmpeg_cmd(use_nvenc: bool) -> list:
+        """Build FFmpeg command with NVENC or CPU (libx264) encoder."""
+        cmd = [
+            'ffmpeg', '-y',
+            '-threads', '0',  # Auto threads for decode
+            '-i', str(input_path),
+        ]
 
-    # Add logo input if needed
-    logo_path = _get_logo_path(logo_name)
-    if logo_path and logo_path.exists():
-        cmd.extend(['-i', str(logo_path)])
+        # Add logo input if needed
+        logo_path = _get_logo_path(logo_name)
+        if logo_path and logo_path.exists():
+            cmd.extend(['-i', str(logo_path)])
 
-    # Add filter complex (simplified - no hwdownload needed with software decode)
-    cmd.extend(['-filter_complex', filter_complex])
+        # Add filter complex
+        cmd.extend(['-filter_complex', filter_complex])
 
-    # Output settings - maximum NVENC throughput
-    cmd.extend([
-        '-map', '[out]',
-        '-c:v', 'h264_nvenc',
-        '-gpu', str(gpu_id),
-        '-preset', 'p1',  # Fastest encoding for maximum throughput
-        '-tune', 'll',    # Low latency
-        '-rc', 'vbr',
-        '-cq', '23',
-        '-b:v', '0',
-        '-maxrate', '10M',
-        '-bufsize', '20M',
-    ])
+        # Map video output
+        cmd.extend(['-map', '[out]'])
 
-    # Audio handling
-    if has_audio:
-        cmd.extend(['-map', '0:a?', '-c:a', 'aac', '-b:a', '128k'])
-    else:
-        cmd.append('-an')
+        if use_nvenc:
+            # NVENC GPU encoding - use constrained quality mode (no -b:v 0)
+            cmd.extend([
+                '-c:v', 'h264_nvenc',
+                '-gpu', str(gpu_id),
+                '-preset', 'p4',       # Balanced speed/quality
+                '-tune', 'hq',         # High quality tune
+                '-rc', 'constqp',      # Constant QP mode (no bitrate needed)
+                '-qp', '23',           # Quality parameter (lower = better)
+                '-profile:v', 'high',
+                '-level', '4.1',
+            ])
+        else:
+            # CPU fallback with libx264
+            cmd.extend([
+                '-c:v', 'libx264',
+                '-preset', 'fast',     # Fast encoding
+                '-crf', '23',          # Constant rate factor
+                '-profile:v', 'high',
+                '-level', '4.1',
+            ])
 
-    cmd.extend([
-        '-movflags', '+faststart',
-        str(output_path)
-    ])
+        # Common output settings
+        cmd.extend(['-pix_fmt', 'yuv420p'])
 
-    print(f"[GPU-Reframe] FFmpeg command: {' '.join(cmd[:20])}...")
+        # Audio handling
+        if has_audio:
+            cmd.extend(['-map', '0:a?', '-c:a', 'aac', '-b:a', '128k'])
+        else:
+            cmd.append('-an')
+
+        cmd.extend([
+            '-movflags', '+faststart',
+            str(output_path)
+        ])
+
+        return cmd
+
+    def _run_ffmpeg_with_progress(cmd: list, encoder_name: str) -> Tuple[bool, str]:
+        """Run FFmpeg and monitor progress. Returns (success, stderr_output)."""
+        print(f"[GPU-Reframe] Trying {encoder_name} encoder...")
+        print(f"[GPU-Reframe] Command: {' '.join(cmd[:25])}...")
+
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+
+            # Collect stderr lines for error reporting
+            stderr_lines = []
+
+            # Monitor progress from stderr
+            for line in process.stderr:
+                stderr_lines.append(line)
+                if 'time=' in line:
+                    try:
+                        time_str = line.split('time=')[1].split()[0]
+                        parts = time_str.split(':')
+                        current_time = float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+                        if duration > 0 and progress_callback:
+                            progress = 0.15 + (current_time / duration) * 0.80
+                            progress_callback(min(progress, 0.95), f"Encoding ({encoder_name}): {current_time:.1f}s / {duration:.1f}s")
+                    except:
+                        pass
+
+            process.wait()
+
+            stderr_output = ''.join(stderr_lines[-30:])
+
+            if process.returncode != 0:
+                print(f"[GPU-Reframe] {encoder_name} failed with code {process.returncode}")
+                print(f"[GPU-Reframe] stderr:\n{stderr_output}")
+                return False, stderr_output
+
+            return True, stderr_output
+
+        except Exception as e:
+            return False, str(e)
 
     if progress_callback:
-        progress_callback(0.15, "Encoding with full GPU pipeline...")
+        progress_callback(0.15, "Encoding video...")
 
-    # Run FFmpeg with progress monitoring
-    try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True
-        )
+    # Try NVENC first, then fallback to CPU
+    encoder_used = "NVENC"
+    cmd_nvenc = _build_ffmpeg_cmd(use_nvenc=True)
+    success, stderr = _run_ffmpeg_with_progress(cmd_nvenc, "NVENC")
 
-        # Monitor progress from stderr
-        for line in process.stderr:
-            if 'time=' in line:
-                try:
-                    time_str = line.split('time=')[1].split()[0]
-                    parts = time_str.split(':')
-                    current_time = float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
-                    if duration > 0 and progress_callback:
-                        progress = 0.15 + (current_time / duration) * 0.80
-                        progress_callback(min(progress, 0.95), f"Encoding: {current_time:.1f}s / {duration:.1f}s")
-                except:
-                    pass
+    if not success:
+        print(f"[GPU-Reframe] NVENC failed, trying CPU fallback (libx264)...")
+        if progress_callback:
+            progress_callback(0.15, "NVENC failed, trying CPU encoder...")
 
-        process.wait()
+        encoder_used = "libx264"
+        cmd_cpu = _build_ffmpeg_cmd(use_nvenc=False)
+        success, stderr = _run_ffmpeg_with_progress(cmd_cpu, "libx264")
 
-        if process.returncode != 0:
-            stderr_output = process.stderr.read() if process.stderr else ""
-            raise RuntimeError(f"FFmpeg failed with code {process.returncode}")
-
-    except Exception as e:
-        raise RuntimeError(f"FFmpeg processing failed: {e}")
+        if not success:
+            raise RuntimeError(f"FFmpeg failed with all encoders. Last error: {stderr}")
 
     if progress_callback:
         progress_callback(1.0, "Complete")
@@ -265,9 +309,9 @@ def _process_video_gpu(
         "outputPath": str(output_path),
         "outputSize": output_size,
         "dimensions": f"{final_w}x{final_h}",
-        "encoder": "NVENC",
-        "processor": "GPU",
-        "pipeline": "FFmpeg-FullGPU",
+        "encoder": encoder_used,
+        "processor": "GPU" if encoder_used == "NVENC" else "CPU",
+        "pipeline": f"FFmpeg-{encoder_used}",
         "fps": fps,
         "duration": duration
     }

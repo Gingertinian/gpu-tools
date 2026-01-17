@@ -82,10 +82,32 @@ def test_captioner(input_path: str, output_path: str):
     print(f"\nResult: {result}")
 
 
+def test_video_reframe(input_path: str, output_path: str):
+    """Test video_reframe processor."""
+    from video_reframe.processor_gpu import process_video_reframe
+
+    config = {
+        'aspectRatio': '9:16',
+        'blurIntensity': 25,
+        'brightness': 0,
+        'saturation': 0,
+        'contrast': 0,
+        'forceBlur': 0,
+        'logoName': 'none',
+        'logoSize': 15,
+    }
+
+    def progress(p, msg):
+        print(f"[{int(p * 100):3d}%] {msg}")
+
+    result = process_video_reframe(input_path, output_path, config, progress)
+    print(f"\nResult: {result}")
+
+
 def main():
     if len(sys.argv) < 4:
         print(__doc__)
-        print("\nAvailable tools: spoofer, vignettes, captioner")
+        print("\nAvailable tools: spoofer, vignettes, captioner, video_reframe")
         sys.exit(1)
 
     tool = sys.argv[1].lower()
@@ -107,16 +129,18 @@ def main():
         test_vignettes(input_path, output_path)
     elif tool == 'captioner':
         test_captioner(input_path, output_path)
+    elif tool == 'video_reframe':
+        test_video_reframe(input_path, output_path)
     else:
         print(f"Unknown tool: {tool}")
-        print("Available: spoofer, vignettes, captioner")
+        print("Available: spoofer, vignettes, captioner, video_reframe")
         sys.exit(1)
 
     if os.path.exists(output_path):
         size = os.path.getsize(output_path)
-        print(f"\n✓ Output created: {output_path} ({size:,} bytes)")
+        print(f"\n[OK] Output created: {output_path} ({size:,} bytes)")
     else:
-        print(f"\n✗ Output not created!")
+        print(f"\n[FAIL] Output not created!")
         sys.exit(1)
 
 

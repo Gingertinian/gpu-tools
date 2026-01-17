@@ -406,21 +406,9 @@ def _build_gpu_filter_complex(
     if blur_top_h > 0 or blur_bottom_h > 0:
         parts = []
 
-        # === CONTENT STREAM ===
-        # 1. Crop top/bottom from original (if forceBlur is set)
-        # 2. Scale to final width (maintaining aspect ratio of cropped content)
-        # 3. Apply color adjustments
-        if crop_top_px > 0:
-            # Crop from original, then scale
-            content_chain = f"[0:v]crop={orig_w}:{cropped_orig_h}:0:{crop_top_px},scale={scaled_w}:{scaled_h}:flags=lanczos{eq_filter}[content]"
-        else:
-            # No crop needed, just scale
-            content_chain = f"[0:v]scale={scaled_w}:{scaled_h}:flags=lanczos{eq_filter}[content]"
-        parts.append(content_chain)
+        # OPTIMIZATION: Use split filter to decode video ONCE, then branch
+        # This is MUCH faster than reading [0:v] twice
 
-        # === BLUR BACKGROUND STREAM ===
-        # CRITICAL: Use CROPPED content (middle part) for blur, NOT original video
-        # This ensures blur zones show reconstructed content from the visible middle
         extra_zoom = 1.0 + random.uniform(0.15, 0.35)  # 1.15x - 1.35x extra zoom
         rotation_deg = random.uniform(-5, 5)  # -5 to +5 degrees
 
@@ -440,25 +428,38 @@ def _build_gpu_filter_complex(
         bg_crop_x = max(0, (blur_scale_w - final_w) // 2 + crop_offset_x)
         bg_crop_y = max(0, (blur_scale_h - final_h) // 2 + crop_offset_y)
 
-        # Blur background: crop middle → scale up to fill frame → rotate → crop to final → blur
         if crop_top_px > 0:
-            # Use cropped content (middle part) as source for blur
-            blur_chain = (
-                f"[0:v]crop={orig_w}:{cropped_orig_h}:0:{crop_top_px},"
-                f"scale={blur_scale_w}:{blur_scale_h}:force_original_aspect_ratio=increase,"
+            # OPTIMIZED: Crop once, split into two streams
+            # Stream 1 (cropped1) -> content
+            # Stream 2 (cropped2) -> blur background
+            parts.append(
+                f"[0:v]crop={orig_w}:{cropped_orig_h}:0:{crop_top_px},split=2[cropped1][cropped2]"
+            )
+            # Content stream: scale + color adjustments
+            parts.append(
+                f"[cropped1]scale={scaled_w}:{scaled_h}:flags=lanczos{eq_filter}[content]"
+            )
+            # Blur stream: scale up + rotate + crop + blur
+            parts.append(
+                f"[cropped2]scale={blur_scale_w}:{blur_scale_h}:force_original_aspect_ratio=increase,"
                 f"rotate={rotation_deg}*PI/180:fillcolor=black:ow={blur_scale_w}:oh={blur_scale_h},"
                 f"crop={final_w}:{final_h}:{bg_crop_x}:{bg_crop_y},"
                 f"gblur=sigma={blur_sigma}[blurred]"
             )
         else:
-            # No crop, use original
-            blur_chain = (
-                f"[0:v]scale={blur_scale_w}:{blur_scale_h}:force_original_aspect_ratio=increase,"
+            # No crop needed - split original
+            parts.append(
+                f"[0:v]split=2[src1][src2]"
+            )
+            parts.append(
+                f"[src1]scale={scaled_w}:{scaled_h}:flags=lanczos{eq_filter}[content]"
+            )
+            parts.append(
+                f"[src2]scale={blur_scale_w}:{blur_scale_h}:force_original_aspect_ratio=increase,"
                 f"rotate={rotation_deg}*PI/180:fillcolor=black:ow={blur_scale_w}:oh={blur_scale_h},"
                 f"crop={final_w}:{final_h}:{bg_crop_x}:{bg_crop_y},"
                 f"gblur=sigma={blur_sigma}[blurred]"
             )
-        parts.append(blur_chain)
 
         # === COMPOSITE ===
         # Overlay cropped content on blurred background

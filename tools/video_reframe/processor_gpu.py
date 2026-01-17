@@ -119,6 +119,7 @@ def _get_logo_path(logo_name: str, logo_url: Optional[str] = None, temp_dir: Opt
     """
     # No logo requested
     if not logo_name or logo_name == 'none':
+        print(f"[GPU-Reframe] No logo requested (logo_name={logo_name})")
         return None
 
     # Custom logo URL provided - download it
@@ -132,18 +133,31 @@ def _get_logo_path(logo_name: str, logo_url: Optional[str] = None, temp_dir: Opt
     # Builtin logo - look in local paths
     if logo_name in BUILTIN_LOGOS or not logo_url:
         script_dir = Path(__file__).parent
+        # Check PNG first, then try other formats
         possible_paths = [
+            # Direct logo path in processor directory
             script_dir / 'logos' / f'{logo_name}.png',
-            script_dir / 'logos' / f'{logo_name}.svg',
+            script_dir / 'logos' / f'{logo_name}.jpg',
+            # Parent directories
             script_dir.parent / 'logos' / f'{logo_name}.png',
             script_dir.parent.parent / 'logos' / f'{logo_name}.png',
+            # Workspace paths (RunPod)
+            Path('/workspace/tools/video_reframe/logos') / f'{logo_name}.png',
             Path('/workspace/assets/logos') / f'{logo_name}.png',
             Path('/app/logos') / f'{logo_name}.png',
         ]
 
+        print(f"[GPU-Reframe] Looking for logo '{logo_name}' in paths:")
         for path in possible_paths:
+            print(f"[GPU-Reframe]   - {path} (exists: {path.exists()})")
             if path.exists():
+                print(f"[GPU-Reframe] Found logo at: {path}")
                 return path
+
+        # Fallback: if logo_name is farmium_icon but not found, use farmium_full
+        if logo_name == 'farmium_icon':
+            print(f"[GPU-Reframe] farmium_icon not found, trying farmium_full as fallback")
+            return _get_logo_path('farmium_full', None, temp_dir)
 
         print(f"[GPU-Reframe] Builtin logo not found: {logo_name}")
 
@@ -474,7 +488,10 @@ def _build_gpu_filter_complex(
     """
     Build FFmpeg filter_complex for GPU-accelerated processing.
 
-    FIXED: Now supports asymmetric blur zones and custom logo positioning.
+    FIXED (2026-01-17 v2):
+    - Top and bottom blur zones now use DIFFERENT random sections from the content
+    - Each blur zone has its own random zoom, rotation, and crop offset
+    - This creates visual variety between top and bottom blur areas
     """
     scaled_w = layout['scaled_w']
     scaled_h = layout['scaled_h']
@@ -490,6 +507,10 @@ def _build_gpu_filter_complex(
     blur_sigma = 8 + (blur_intensity / 100) * 12
     blur_sigma = max(5, min(blur_sigma, 20))
 
+    # Convert sigma to boxblur radius (O(1) performance)
+    blur_radius = int(blur_sigma * 1.5)
+    blur_radius = max(1, min(blur_radius, 30))
+
     # Build color adjustment string
     eq_parts = []
     if brightness_adj != 0:
@@ -504,52 +525,92 @@ def _build_gpu_filter_complex(
 
     # If we need blur zones
     if blur_top_h > 0 or blur_bottom_h > 0:
-        extra_zoom = 1.0 + random.uniform(0.15, 0.35)
-        rotation_deg = random.uniform(-5, 5)
+        # Generate DIFFERENT random parameters for top and bottom blur zones
+        # This ensures they look distinct from each other
 
-        blur_scale_w = int(final_w * extra_zoom)
-        blur_scale_h = int(final_h * extra_zoom)
+        # Top blur zone parameters
+        top_zoom = 1.0 + random.uniform(0.3, 0.6)
+        top_rotation = random.uniform(-10, 10)
+        top_offset_x = random.randint(-80, 80)
+        top_offset_y = random.randint(0, 200)  # Positive = use upper part of content
 
-        max_offset_x = max(0, (blur_scale_w - final_w) // 2 - 10)
-        max_offset_y = max(0, (blur_scale_h - final_h) // 2 - 10)
+        # Bottom blur zone parameters (DIFFERENT from top)
+        bottom_zoom = 1.0 + random.uniform(0.3, 0.6)
+        bottom_rotation = random.uniform(-10, 10)
+        bottom_offset_x = random.randint(-80, 80)
+        bottom_offset_y = random.randint(-200, 0)  # Negative = use lower part of content
 
-        crop_offset_x = random.randint(-max_offset_x, max_offset_x) if max_offset_x > 0 else 0
-        crop_offset_y = random.randint(-max_offset_y, max_offset_y) if max_offset_y > 0 else 0
+        print(f"[GPU-Reframe] Top blur: zoom={top_zoom:.2f}, rot={top_rotation:.1f}, offset=({top_offset_x}, {top_offset_y})")
+        print(f"[GPU-Reframe] Bottom blur: zoom={bottom_zoom:.2f}, rot={bottom_rotation:.1f}, offset=({bottom_offset_x}, {bottom_offset_y})")
 
-        bg_crop_x = max(0, (blur_scale_w - final_w) // 2 + crop_offset_x)
-        bg_crop_y = max(0, (blur_scale_h - final_h) // 2 + crop_offset_y)
-
-        # Convert sigma to boxblur radius (O(1) performance)
-        blur_radius = int(blur_sigma * 1.5)
-        blur_radius = max(1, min(blur_radius, 30))
+        # Calculate scaled sizes for blur sources
+        # We want to create blur zones from the content (middle section)
+        top_scale_h = max(blur_top_h * 2, int(scaled_h * top_zoom))
+        top_scale_w = int(final_w * top_zoom)
+        bottom_scale_h = max(blur_bottom_h * 2, int(scaled_h * bottom_zoom))
+        bottom_scale_w = int(final_w * bottom_zoom)
 
         if crop_top_px > 0 or crop_bottom_px > 0:
-            # FIXED: Asymmetric crop support
+            # Crop to get middle section, then split for content + blur sources
             parts.append(
-                f"[0:v]crop={orig_w}:{cropped_orig_h}:0:{crop_top_px},split=2[cropped1][cropped2]"
-            )
-            parts.append(
-                f"[cropped1]scale={scaled_w}:{scaled_h}:flags=lanczos{eq_filter}[content]"
-            )
-            parts.append(
-                f"[cropped2]scale={blur_scale_w}:{blur_scale_h}:force_original_aspect_ratio=increase,"
-                f"rotate={rotation_deg}*PI/180:fillcolor=black:ow={blur_scale_w}:oh={blur_scale_h},"
-                f"crop={final_w}:{final_h}:{bg_crop_x}:{bg_crop_y},"
-                f"boxblur=luma_radius={blur_radius}:chroma_radius={blur_radius}:luma_power=2[blurred]"
+                f"[0:v]crop={orig_w}:{cropped_orig_h}:0:{crop_top_px},split=3[for_content][for_blur_top][for_blur_bottom]"
             )
         else:
-            parts.append(f"[0:v]split=2[src1][src2]")
-            parts.append(f"[src1]scale={scaled_w}:{scaled_h}:flags=lanczos{eq_filter}[content]")
+            # No crop, split original
+            parts.append(f"[0:v]split=3[for_content][for_blur_top][for_blur_bottom]")
+
+        # Content: scale to fit in the middle
+        parts.append(
+            f"[for_content]scale={scaled_w}:{scaled_h}:flags=lanczos{eq_filter}[content]"
+        )
+
+        # Calculate crop positions for top blur (from upper portion of scaled content)
+        top_crop_x = max(0, min((top_scale_w - final_w) // 2 + top_offset_x, top_scale_w - final_w))
+        top_crop_y = max(0, min((top_scale_h - blur_top_h) // 2 + top_offset_y, top_scale_h - blur_top_h))
+
+        # Calculate crop positions for bottom blur (from lower portion of scaled content)
+        bottom_crop_x = max(0, min((bottom_scale_w - final_w) // 2 + bottom_offset_x, bottom_scale_w - final_w))
+        bottom_crop_y = max(0, min((bottom_scale_h - blur_bottom_h) // 2 + abs(bottom_offset_y), bottom_scale_h - blur_bottom_h))
+
+        if blur_top_h > 0:
+            # Top blur zone: scale up, rotate, crop to zone size, blur
             parts.append(
-                f"[src2]scale={blur_scale_w}:{blur_scale_h}:force_original_aspect_ratio=increase,"
-                f"rotate={rotation_deg}*PI/180:fillcolor=black:ow={blur_scale_w}:oh={blur_scale_h},"
-                f"crop={final_w}:{final_h}:{bg_crop_x}:{bg_crop_y},"
-                f"boxblur=luma_radius={blur_radius}:chroma_radius={blur_radius}:luma_power=2[blurred]"
+                f"[for_blur_top]scale={top_scale_w}:{top_scale_h}:force_original_aspect_ratio=increase,"
+                f"rotate={top_rotation}*PI/180:fillcolor=black:ow={top_scale_w}:oh={top_scale_h},"
+                f"crop={final_w}:{blur_top_h}:{top_crop_x}:{top_crop_y},"
+                f"boxblur=luma_radius={blur_radius}:chroma_radius={blur_radius}:luma_power=2[blur_top]"
             )
 
-        parts.append(
-            f"[blurred][content]overlay={content_x}:{content_y}:format=yuv420[composited]"
-        )
+        if blur_bottom_h > 0:
+            # Bottom blur zone: different params for visual variety
+            parts.append(
+                f"[for_blur_bottom]scale={bottom_scale_w}:{bottom_scale_h}:force_original_aspect_ratio=increase,"
+                f"rotate={bottom_rotation}*PI/180:fillcolor=black:ow={bottom_scale_w}:oh={bottom_scale_h},"
+                f"crop={final_w}:{blur_bottom_h}:{bottom_crop_x}:{bottom_crop_y},"
+                f"boxblur=luma_radius={blur_radius}:chroma_radius={blur_radius}:luma_power=2[blur_bottom]"
+            )
+
+        # Create black canvas
+        parts.append(f"color=black:size={final_w}x{final_h}:d=1:r=30[canvas]")
+
+        # Composite: overlay blur zones and content onto canvas
+        if blur_top_h > 0 and blur_bottom_h > 0:
+            # Both blur zones
+            parts.append(f"[canvas][blur_top]overlay=0:0:shortest=1[t1]")
+            parts.append(f"[t1][content]overlay={content_x}:{content_y}:shortest=1[t2]")
+            parts.append(f"[t2][blur_bottom]overlay=0:{final_h - blur_bottom_h}:shortest=1[composited]")
+        elif blur_top_h > 0:
+            # Only top blur
+            parts.append(f"[canvas][blur_top]overlay=0:0:shortest=1[t1]")
+            parts.append(f"[t1][content]overlay={content_x}:{content_y}:shortest=1[composited]")
+        elif blur_bottom_h > 0:
+            # Only bottom blur
+            parts.append(f"[canvas][content]overlay={content_x}:{content_y}:shortest=1[t1]")
+            parts.append(f"[t1][blur_bottom]overlay=0:{final_h - blur_bottom_h}:shortest=1[composited]")
+        else:
+            # No blur (shouldn't reach here)
+            parts.append(f"[canvas][content]overlay={content_x}:{content_y}:shortest=1[composited]")
+
         current_output = "[composited]"
     else:
         # No blur needed
@@ -560,23 +621,27 @@ def _build_gpu_filter_complex(
         parts = [chain]
         current_output = "[composited]"
 
-    # Add logo if present - FIXED: Use position from config
+    # Add logo if present
     if logo_path and logo_path.exists():
         logo_w = int(final_w * logo_size / 100)
-        # FIXED: Calculate position from normalized coords (0-1)
+        # Calculate position from normalized coords (0-1)
         logo_x = int(final_w * logo_pos_x - logo_w / 2)
         logo_y = int(final_h * logo_pos_y)
 
-        # Clamp to valid bounds
-        logo_x = max(0, min(logo_x, final_w - logo_w))
+        # Clamp to valid bounds with margin
+        logo_x = max(10, min(logo_x, final_w - logo_w - 10))
+        logo_y = max(10, min(logo_y, final_h - 100))
+
+        print(f"[GPU-Reframe] Logo overlay: pos=({logo_x}, {logo_y}), width={logo_w}, path={logo_path}")
 
         parts.append(
             f"[1:v]scale={logo_w}:-1:flags=lanczos,format=yuva420p[logo]"
         )
         parts.append(
-            f"{current_output}[logo]overlay={logo_x}:{logo_y}[out]"
+            f"{current_output}[logo]overlay={logo_x}:{logo_y}:shortest=1[out]"
         )
     else:
+        print(f"[GPU-Reframe] No logo to add (logo_path={logo_path})")
         parts.append(f"{current_output}copy[out]")
 
     return ';'.join(parts)
@@ -724,6 +789,8 @@ def _process_image_cupy(
 ) -> np.ndarray:
     """
     Process image entirely on GPU using CuPy.
+
+    FIXED (2026-01-17 v2): Top and bottom blur zones use DIFFERENT random sections.
     """
     scaled_w = layout['scaled_w']
     scaled_h = layout['scaled_h']
@@ -754,33 +821,64 @@ def _process_image_cupy(
 
     needs_blur = blur_top_h > 0 or blur_bottom_h > 0 or content_x > 0
 
+    # Start with black canvas
+    output = cp.zeros((final_h, final_w, 3), dtype=cp.float32)
+
     if needs_blur:
         content_h, content_w = content.shape[:2]
-        extra_zoom = 1.0 + random.uniform(0.15, 0.35)
-        rotation_deg = random.uniform(-8, 8)
-        offset_x = random.randint(-30, 30)
-        offset_y = random.randint(-30, 30)
 
-        scale_w = final_w / content_w
-        scale_h = final_h / content_h
-        scale = max(scale_w, scale_h) * extra_zoom
+        # Generate DIFFERENT random parameters for top and bottom blur zones
+        if blur_top_h > 0:
+            top_zoom = 1.0 + random.uniform(0.3, 0.6)
+            top_rotation = random.uniform(-10, 10)
+            top_offset_x = random.randint(-50, 50)
+            top_offset_y = random.randint(0, 150)  # Use upper part of content
 
-        bg_zoom = (scale, scale, 1)
-        zoomed = gpu_ndimage.zoom(content, bg_zoom, order=1)
+            top_scale = max(final_w / content_w, blur_top_h / content_h) * top_zoom
+            top_bg_zoom = (top_scale, top_scale, 1)
+            top_zoomed = gpu_ndimage.zoom(content, top_bg_zoom, order=1)
 
-        if abs(rotation_deg) > 0.5:
-            zoomed = gpu_ndimage.rotate(zoomed, rotation_deg, axes=(1, 0), reshape=False, mode='reflect')
+            if abs(top_rotation) > 0.5:
+                top_zoomed = gpu_ndimage.rotate(top_zoomed, top_rotation, axes=(1, 0), reshape=False, mode='reflect')
 
-        crop_x = max(0, min((zoomed.shape[1] - final_w) // 2 + offset_x, zoomed.shape[1] - final_w))
-        crop_y = max(0, min((zoomed.shape[0] - final_h) // 2 + offset_y, zoomed.shape[0] - final_h))
-        blurred_bg = zoomed[crop_y:crop_y + final_h, crop_x:crop_x + final_w]
+            top_crop_x = max(0, min((top_zoomed.shape[1] - final_w) // 2 + top_offset_x, max(0, top_zoomed.shape[1] - final_w)))
+            top_crop_y = max(0, min((top_zoomed.shape[0] - blur_top_h) // 2 + top_offset_y, max(0, top_zoomed.shape[0] - blur_top_h)))
+            top_blur_region = top_zoomed[top_crop_y:top_crop_y + blur_top_h, top_crop_x:top_crop_x + final_w]
 
-        for c in range(3):
-            blurred_bg[:, :, c] = gpu_ndimage.gaussian_filter(blurred_bg[:, :, c], sigma=blur_sigma)
-        output = blurred_bg
-    else:
-        output = cp.zeros((final_h, final_w, 3), dtype=cp.float32)
+            # Apply blur
+            for c in range(3):
+                top_blur_region[:, :, c] = gpu_ndimage.gaussian_filter(top_blur_region[:, :, c], sigma=blur_sigma)
 
+            # Ensure correct size
+            if top_blur_region.shape[0] >= blur_top_h and top_blur_region.shape[1] >= final_w:
+                output[0:blur_top_h, 0:final_w] = top_blur_region[:blur_top_h, :final_w]
+
+        if blur_bottom_h > 0:
+            bottom_zoom = 1.0 + random.uniform(0.3, 0.6)
+            bottom_rotation = random.uniform(-10, 10)
+            bottom_offset_x = random.randint(-50, 50)
+            bottom_offset_y = random.randint(-150, 0)  # Use lower part of content
+
+            bottom_scale = max(final_w / content_w, blur_bottom_h / content_h) * bottom_zoom
+            bottom_bg_zoom = (bottom_scale, bottom_scale, 1)
+            bottom_zoomed = gpu_ndimage.zoom(content, bottom_bg_zoom, order=1)
+
+            if abs(bottom_rotation) > 0.5:
+                bottom_zoomed = gpu_ndimage.rotate(bottom_zoomed, bottom_rotation, axes=(1, 0), reshape=False, mode='reflect')
+
+            bottom_crop_x = max(0, min((bottom_zoomed.shape[1] - final_w) // 2 + bottom_offset_x, max(0, bottom_zoomed.shape[1] - final_w)))
+            bottom_crop_y = max(0, min((bottom_zoomed.shape[0] - blur_bottom_h) // 2 + abs(bottom_offset_y), max(0, bottom_zoomed.shape[0] - blur_bottom_h)))
+            bottom_blur_region = bottom_zoomed[bottom_crop_y:bottom_crop_y + blur_bottom_h, bottom_crop_x:bottom_crop_x + final_w]
+
+            # Apply blur
+            for c in range(3):
+                bottom_blur_region[:, :, c] = gpu_ndimage.gaussian_filter(bottom_blur_region[:, :, c], sigma=blur_sigma)
+
+            # Ensure correct size
+            if bottom_blur_region.shape[0] >= blur_bottom_h and bottom_blur_region.shape[1] >= final_w:
+                output[final_h - blur_bottom_h:final_h, 0:final_w] = bottom_blur_region[:blur_bottom_h, :final_w]
+
+    # Place content in the middle
     output[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content[:scaled_h, :scaled_w]
     output_cpu = cp.asnumpy(output).astype(np.uint8)
 
@@ -798,6 +896,8 @@ def _process_image_cpu(
 ) -> np.ndarray:
     """
     CPU fallback for image processing.
+
+    FIXED (2026-01-17 v2): Top and bottom blur zones use DIFFERENT random sections.
     """
     scaled_w = layout['scaled_w']
     scaled_h = layout['scaled_h']
@@ -827,34 +927,66 @@ def _process_image_cpu(
 
     needs_blur = blur_top_h > 0 or blur_bottom_h > 0 or content_x > 0
 
+    # Start with black canvas
+    output = np.zeros((final_h, final_w, 3), dtype=np.uint8)
+
     if needs_blur:
         content_h, content_w = content.shape[:2]
-        extra_zoom = 1.0 + random.uniform(0.15, 0.35)
-        rotation_deg = random.uniform(-8, 8)
-        offset_x = random.randint(-30, 30)
-        offset_y = random.randint(-30, 30)
 
-        scale_w = final_w / content_w
-        scale_h = final_h / content_h
-        scale = max(scale_w, scale_h) * extra_zoom
+        # Generate DIFFERENT random parameters for top and bottom blur zones
+        if blur_top_h > 0:
+            top_zoom = 1.0 + random.uniform(0.3, 0.6)
+            top_rotation = random.uniform(-10, 10)
+            top_offset_x = random.randint(-50, 50)
+            top_offset_y = random.randint(0, 150)  # Use upper part of content
 
-        new_w = int(content_w * scale)
-        new_h = int(content_h * scale)
-        resized = cv2.resize(content, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            top_scale = max(final_w / content_w, blur_top_h / content_h) * top_zoom
+            top_new_w = int(content_w * top_scale)
+            top_new_h = int(content_h * top_scale)
+            top_resized = cv2.resize(content, (top_new_w, top_new_h), interpolation=cv2.INTER_LINEAR)
 
-        if abs(rotation_deg) > 0.5:
-            center = (new_w // 2, new_h // 2)
-            rot_matrix = cv2.getRotationMatrix2D(center, rotation_deg, 1.0)
-            resized = cv2.warpAffine(resized, rot_matrix, (new_w, new_h), borderMode=cv2.BORDER_REFLECT)
+            if abs(top_rotation) > 0.5:
+                center = (top_new_w // 2, top_new_h // 2)
+                rot_matrix = cv2.getRotationMatrix2D(center, top_rotation, 1.0)
+                top_resized = cv2.warpAffine(top_resized, rot_matrix, (top_new_w, top_new_h), borderMode=cv2.BORDER_REFLECT)
 
-        crop_x = max(0, min((new_w - final_w) // 2 + offset_x, new_w - final_w))
-        crop_y = max(0, min((new_h - final_h) // 2 + offset_y, new_h - final_h))
-        blurred_bg = resized[crop_y:crop_y + final_h, crop_x:crop_x + final_w]
+            top_crop_x = max(0, min((top_new_w - final_w) // 2 + top_offset_x, max(0, top_new_w - final_w)))
+            top_crop_y = max(0, min((top_new_h - blur_top_h) // 2 + top_offset_y, max(0, top_new_h - blur_top_h)))
+            top_blur_region = top_resized[top_crop_y:top_crop_y + blur_top_h, top_crop_x:top_crop_x + final_w]
 
-        blurred_bg = cv2.GaussianBlur(blurred_bg, (blur_ksize, blur_ksize), blur_sigma)
-        output = blurred_bg
-    else:
-        output = np.zeros((final_h, final_w, 3), dtype=np.uint8)
+            # Apply blur
+            top_blur_region = cv2.GaussianBlur(top_blur_region, (blur_ksize, blur_ksize), blur_sigma)
+
+            # Ensure correct size and place in output
+            if top_blur_region.shape[0] >= blur_top_h and top_blur_region.shape[1] >= final_w:
+                output[0:blur_top_h, 0:final_w] = top_blur_region[:blur_top_h, :final_w]
+
+        if blur_bottom_h > 0:
+            bottom_zoom = 1.0 + random.uniform(0.3, 0.6)
+            bottom_rotation = random.uniform(-10, 10)
+            bottom_offset_x = random.randint(-50, 50)
+            bottom_offset_y = random.randint(-150, 0)  # Use lower part of content
+
+            bottom_scale = max(final_w / content_w, blur_bottom_h / content_h) * bottom_zoom
+            bottom_new_w = int(content_w * bottom_scale)
+            bottom_new_h = int(content_h * bottom_scale)
+            bottom_resized = cv2.resize(content, (bottom_new_w, bottom_new_h), interpolation=cv2.INTER_LINEAR)
+
+            if abs(bottom_rotation) > 0.5:
+                center = (bottom_new_w // 2, bottom_new_h // 2)
+                rot_matrix = cv2.getRotationMatrix2D(center, bottom_rotation, 1.0)
+                bottom_resized = cv2.warpAffine(bottom_resized, rot_matrix, (bottom_new_w, bottom_new_h), borderMode=cv2.BORDER_REFLECT)
+
+            bottom_crop_x = max(0, min((bottom_new_w - final_w) // 2 + bottom_offset_x, max(0, bottom_new_w - final_w)))
+            bottom_crop_y = max(0, min((bottom_new_h - blur_bottom_h) // 2 + abs(bottom_offset_y), max(0, bottom_new_h - blur_bottom_h)))
+            bottom_blur_region = bottom_resized[bottom_crop_y:bottom_crop_y + blur_bottom_h, bottom_crop_x:bottom_crop_x + final_w]
+
+            # Apply blur
+            bottom_blur_region = cv2.GaussianBlur(bottom_blur_region, (blur_ksize, blur_ksize), blur_sigma)
+
+            # Ensure correct size and place in output
+            if bottom_blur_region.shape[0] >= blur_bottom_h and bottom_blur_region.shape[1] >= final_w:
+                output[final_h - blur_bottom_h:final_h, 0:final_w] = bottom_blur_region[:blur_bottom_h, :final_w]
 
     output[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content
     return output

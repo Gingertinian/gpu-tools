@@ -212,15 +212,23 @@ def upload_file(path: str, url: str, max_retries: int = 3) -> dict:
 
     # Verify file exists and has content
     if not os.path.exists(path):
+        print(f"[Upload] ERROR: File not found: {path}")
         raise FileNotFoundError(f"Output file not found: {path}")
 
     file_size = os.path.getsize(path)
     if file_size == 0:
+        print(f"[Upload] ERROR: File is empty: {path}")
         raise ValueError(f"Output file is empty: {path}")
+
+    # Extract destination key from URL for logging (hide signature)
+    url_path = url.split('?')[0].split('/')[-2:] if '?' in url else ['unknown']
+    dest_key = '/'.join(url_path)
+    print(f"[Upload] Starting: {os.path.basename(path)} ({file_size/1024/1024:.2f}MB) -> {dest_key}")
 
     last_error = None
     for attempt in range(max_retries):
         try:
+            start_time = time.time()
             with open(path, 'rb') as f:
                 response = requests.put(
                     url,
@@ -229,6 +237,10 @@ def upload_file(path: str, url: str, max_retries: int = 3) -> dict:
                     timeout=600
                 )
                 response.raise_for_status()
+
+            elapsed = time.time() - start_time
+            speed_mbps = (file_size / 1024 / 1024) / elapsed if elapsed > 0 else 0
+            print(f"[Upload] SUCCESS: {os.path.basename(path)} uploaded in {elapsed:.1f}s ({speed_mbps:.1f} MB/s) - Status: {response.status_code}")
 
             # Upload succeeded
             return {
@@ -239,12 +251,18 @@ def upload_file(path: str, url: str, max_retries: int = 3) -> dict:
             }
         except requests.exceptions.RequestException as e:
             last_error = e
+            error_detail = str(e)
+            if hasattr(e, 'response') and e.response is not None:
+                error_detail = f"HTTP {e.response.status_code}: {e.response.text[:200]}"
+            print(f"[Upload] FAILED attempt {attempt+1}/{max_retries}: {error_detail}")
             if attempt < max_retries - 1:
                 # Exponential backoff: 1s, 2s, 4s
                 wait_time = (2 ** attempt)
+                print(f"[Upload] Retrying in {wait_time}s...")
                 time.sleep(wait_time)
 
     # All retries failed
+    print(f"[Upload] FATAL: All {max_retries} attempts failed for {path}")
     raise RuntimeError(f"Upload failed after {max_retries} attempts: {last_error}")
 
 
@@ -2556,14 +2574,20 @@ def handler(job):
                 return {"error": "Video Reframe processor not available"}
             print(f"[VIDEO_REFRAME] Single mode - Config received: {json.dumps({k: v for k, v in config.items() if not str(k).startswith('_')}, default=str)}")
             output_path = os.path.join(temp_dir, "output.mp4")
+            print(f"[VIDEO_REFRAME] Initial output_path: {output_path}")
             result = process_video_reframe(
                 input_path, output_path, config,
                 progress_callback=progress_callback
             )
+            print(f"[VIDEO_REFRAME] Processor result: {result}")
             # IMPORTANT: video_reframe may change extension for images (mp4 -> jpg)
             # Use actual output path from result if available
             if result and result.get('outputPath'):
+                old_path = output_path
                 output_path = result['outputPath']
+                print(f"[VIDEO_REFRAME] Output path updated: {old_path} -> {output_path}")
+            else:
+                print(f"[VIDEO_REFRAME] WARNING: No outputPath in result, using original: {output_path}")
 
         # ==================== UNKNOWN TOOL ====================
         else:

@@ -302,7 +302,12 @@ def _process_video_gpu(
     print(f"[GPU-Reframe] Output: {final_w}x{final_h}, content={layout['scaled_w']}x{layout['scaled_h']}")
     print(f"[GPU-Reframe] Blur config: top_blur_pct={top_blur_pct}%, bottom_blur_pct={bottom_blur_pct}%, intensity={blur_intensity}")
     print(f"[GPU-Reframe] Blur zones (calculated): top={layout['blur_top']}px, bottom={layout['blur_bottom']}px")
-    print(f"[GPU-Reframe] Logo: name='{logo_name}', size={logo_size}%, pos=({logo_pos_x}, {logo_pos_y})")
+    # DEBUG: Log all logo-related config keys to diagnose position/size issues
+    logo_keys = ['logo_name', 'logoName', 'logo_size', 'logoSize', 'logo_position_x', 'logoPositionX',
+                 'logo_position_y', 'logoPositionY', 'logo_position', 'logoPosition', 'logo_url', 'logoUrl']
+    logo_config_debug = {k: config.get(k) for k in logo_keys if k in config}
+    print(f"[GPU-Reframe] DEBUG logo config keys in config: {logo_config_debug}")
+    print(f"[GPU-Reframe] Logo FINAL VALUES: name='{logo_name}', size={logo_size}%, pos=({logo_pos_x}, {logo_pos_y})")
 
     if progress_callback:
         progress_callback(0.10, "Building GPU pipeline...")

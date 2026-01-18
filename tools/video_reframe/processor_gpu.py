@@ -617,13 +617,16 @@ def _build_gpu_filter_complex(
     # Add logo if present
     if logo_path and logo_path.exists():
         logo_w = int(final_w * logo_size / 100)
+        # Logo height is same as width (square logos) since we scale with -1
+        logo_h = logo_w
         # Calculate position from normalized coords (0-1)
+        # Center the logo at the specified position (both X and Y)
         logo_x = int(final_w * logo_pos_x - logo_w / 2)
-        logo_y = int(final_h * logo_pos_y)
+        logo_y = int(final_h * logo_pos_y - logo_h / 2)
 
         # Clamp to valid bounds with margin
         logo_x = max(10, min(logo_x, final_w - logo_w - 10))
-        logo_y = max(10, min(logo_y, final_h - 100))
+        logo_y = max(10, min(logo_y, final_h - logo_h - 10))
 
         print(f"[GPU-Reframe] Logo overlay: pos=({logo_x}, {logo_y}), width={logo_w}, path={logo_path}")
 
@@ -1133,9 +1136,9 @@ def _apply_logo_to_image(
 
         # FIXED: Calculate position from normalized coordinates
         # logo_pos_x: 0.5 = center, 0 = left edge, 1 = right edge
-        # logo_pos_y: position of logo TOP edge (0 = top, 1 = bottom)
+        # logo_pos_y: 0.5 = center, 0 = top, 1 = bottom (logo is centered at this position)
         x = int(final_w * logo_pos_x - logo_w / 2)
-        y = int(final_h * logo_pos_y)
+        y = int(final_h * logo_pos_y - logo_h / 2)  # FIXED: Center logo vertically too
 
         # Clamp to valid bounds
         x = max(0, min(x, final_w - logo_w))

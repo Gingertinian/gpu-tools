@@ -275,9 +275,10 @@ def _process_video_gpu(
     logo_pos_y = _get_config(config, 'logoPositionY', 0.85)
 
     blur_intensity = _get_config(config, 'blurIntensity', 25)
-    brightness_adj = config.get('brightness', 0)
-    saturation_adj = config.get('saturation', 0)
-    contrast_adj = config.get('contrast', 0)
+    # FIXED: Use _get_config to support both camelCase and snake_case
+    brightness_adj = _get_config(config, 'brightness', 0)
+    saturation_adj = _get_config(config, 'saturation', 0)
+    contrast_adj = _get_config(config, 'contrast', 0)
 
     # FIXED: Blur zones - use independent top/bottom percentages
     # Backend sends topBlurPercent/bottomBlurPercent with values including 0
@@ -685,9 +686,10 @@ def _process_image_gpu(
     logo_pos_y = _get_config(config, 'logoPositionY', 0.85)
 
     blur_intensity = _get_config(config, 'blurIntensity', 25)
-    brightness_adj = config.get('brightness', 0)
-    saturation_adj = config.get('saturation', 0)
-    contrast_adj = config.get('contrast', 0)
+    # FIXED: Use _get_config to support both camelCase and snake_case
+    brightness_adj = _get_config(config, 'brightness', 0)
+    saturation_adj = _get_config(config, 'saturation', 0)
+    contrast_adj = _get_config(config, 'contrast', 0)
 
     # FIXED: Independent blur percentages - handle 0 correctly
     top_blur_pct = _get_config(config, 'topBlurPercent', 0)

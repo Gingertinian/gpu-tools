@@ -78,27 +78,16 @@ VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v', '.wmv', '.f
 
 
 # =============================================================================
-# CONFIG HELPERS - Support both camelCase and snake_case
+# CONFIG HELPERS
 # =============================================================================
 
-def _get_config(config: dict, camel_key: str, default=None):
+def _get_config(config: dict, key: str, default=None):
     """
-    Get config value supporting both camelCase and snake_case.
-    Backend converts camelCase to snake_case, so we need to check both.
-
-    Example:
-        _get_config(config, 'logoSize', 15)
-        # Checks config['logoSize'] first, then config['logo_size']
+    Get config value. Handles 0 and False values correctly.
+    All keys are camelCase as sent by the backend.
     """
-    # Try camelCase first (original format)
-    if camel_key in config:
-        return config[camel_key]
-
-    # Convert camelCase to snake_case and try
-    snake_key = ''.join(['_' + c.lower() if c.isupper() else c for c in camel_key]).lstrip('_')
-    if snake_key in config:
-        return config[snake_key]
-
+    if key in config and config[key] is not None:
+        return config[key]
     return default
 
 

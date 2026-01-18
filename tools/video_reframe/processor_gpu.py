@@ -258,33 +258,33 @@ def _process_video_gpu(
     # DEBUG: Print raw config received
     print(f"[GPU-Reframe] Raw config received: {json.dumps({k: v for k, v in config.items() if not k.startswith('_')}, default=str)}")
 
-    # Parse config with support for both snake_case and camelCase
+    # Parse config - all keys are camelCase as sent by the backend
     # CRITICAL FIX (2026-01-17): Use _get_config() helper to handle 0 values correctly
     # Python's `or` treats 0 as falsy, so `0 or 25 = 25` which is WRONG
     aspect_str = _parse_aspect_ratio(
-        _get_config(config, 'aspect_ratio', 'aspectRatio', '9:16')
+        _get_config(config, 'aspectRatio', '9:16')
     )
     final_w, final_h = ASPECT_RATIOS.get(aspect_str, (1080, 1920))
 
     # Logo config - FIXED: Use logoUrl and position from config
-    logo_name = _get_config(config, 'logo_name', 'logoName', 'farmium_full')
-    logo_url = _get_config(config, 'logo_url', 'logoUrl', None)
-    logo_size = _get_config(config, 'logo_size', 'logoSize', 15)
+    logo_name = _get_config(config, 'logoName', 'farmium_full')
+    logo_url = _get_config(config, 'logoUrl', None)
+    logo_size = _get_config(config, 'logoSize', 15)
     # FIXED: Use individual position values from config (0-1 range)
-    logo_pos_x = _get_config(config, 'logo_position_x', 'logoPositionX', 0.5)
-    logo_pos_y = _get_config(config, 'logo_position_y', 'logoPositionY', 0.85)
+    logo_pos_x = _get_config(config, 'logoPositionX', 0.5)
+    logo_pos_y = _get_config(config, 'logoPositionY', 0.85)
 
-    blur_intensity = _get_config(config, 'blur_intensity', 'blurIntensity', 25)
+    blur_intensity = _get_config(config, 'blurIntensity', 25)
     brightness_adj = config.get('brightness', 0)
     saturation_adj = config.get('saturation', 0)
     contrast_adj = config.get('contrast', 0)
 
     # FIXED: Blur zones - use independent top/bottom percentages
     # Backend sends topBlurPercent/bottomBlurPercent with values including 0
-    top_blur_pct = _get_config(config, 'top_blur_percent', 'topBlurPercent', 0)
-    bottom_blur_pct = _get_config(config, 'bottom_blur_percent', 'bottomBlurPercent', 0)
+    top_blur_pct = _get_config(config, 'topBlurPercent', 0)
+    bottom_blur_pct = _get_config(config, 'bottomBlurPercent', 0)
     # Force blur can still be used as combined fallback
-    force_blur = _get_config(config, 'force_blur', 'forceBlur', 0)
+    force_blur = _get_config(config, 'forceBlur', 0)
 
     # If force_blur is set but individual aren't, split it
     if force_blur > 0 and top_blur_pct == 0 and bottom_blur_pct == 0:
@@ -674,25 +674,25 @@ def _process_image_gpu(
     print(f"[GPU-Reframe] Raw config received: {json.dumps({k: v for k, v in config.items() if not k.startswith('_')}, default=str)}")
 
     # Parse config - FIXED: Use _get_config() helper to handle 0 values correctly
-    aspect_str = _parse_aspect_ratio(_get_config(config, 'aspect_ratio', 'aspectRatio', '9:16'))
+    aspect_str = _parse_aspect_ratio(_get_config(config, 'aspectRatio', '9:16'))
     final_w, final_h = ASPECT_RATIOS.get(aspect_str, (1080, 1920))
 
     # Logo config - FIXED: Use _get_config() to handle 0 values correctly
-    logo_name = _get_config(config, 'logo_name', 'logoName', 'farmium_full')
-    logo_url = _get_config(config, 'logo_url', 'logoUrl', None)
-    logo_size = _get_config(config, 'logo_size', 'logoSize', 15)
-    logo_pos_x = _get_config(config, 'logo_position_x', 'logoPositionX', 0.5)
-    logo_pos_y = _get_config(config, 'logo_position_y', 'logoPositionY', 0.85)
+    logo_name = _get_config(config, 'logoName', 'farmium_full')
+    logo_url = _get_config(config, 'logoUrl', None)
+    logo_size = _get_config(config, 'logoSize', 15)
+    logo_pos_x = _get_config(config, 'logoPositionX', 0.5)
+    logo_pos_y = _get_config(config, 'logoPositionY', 0.85)
 
-    blur_intensity = _get_config(config, 'blur_intensity', 'blurIntensity', 25)
+    blur_intensity = _get_config(config, 'blurIntensity', 25)
     brightness_adj = config.get('brightness', 0)
     saturation_adj = config.get('saturation', 0)
     contrast_adj = config.get('contrast', 0)
 
     # FIXED: Independent blur percentages - handle 0 correctly
-    top_blur_pct = _get_config(config, 'top_blur_percent', 'topBlurPercent', 0)
-    bottom_blur_pct = _get_config(config, 'bottom_blur_percent', 'bottomBlurPercent', 0)
-    force_blur = _get_config(config, 'force_blur', 'forceBlur', 0)
+    top_blur_pct = _get_config(config, 'topBlurPercent', 0)
+    bottom_blur_pct = _get_config(config, 'bottomBlurPercent', 0)
+    force_blur = _get_config(config, 'forceBlur', 0)
 
     if force_blur > 0 and top_blur_pct == 0 and bottom_blur_pct == 0:
         top_blur_pct = force_blur / 2
@@ -996,23 +996,13 @@ def _process_image_cpu(
 # HELPER FUNCTIONS
 # =============================================================================
 
-def _get_config(config: dict, snake_key: str, camel_key: str, default):
+def _get_config(config: dict, key: str, default=None):
     """
-    Get config value with support for both snake_case and camelCase keys.
-
-    CRITICAL: This handles 0 values correctly, unlike Python's `or` operator.
-    Example: `config.get('logoSize') or 15` returns 15 when logoSize=0 (WRONG)
-             `_get_config(config, 'logo_size', 'logoSize', 15)` returns 0 (CORRECT)
-
-    Priority: snake_case key > camelCase key > default
+    Get config value. Handles 0 values correctly (unlike Python's 'or' operator).
+    All keys are camelCase as sent by the backend.
     """
-    # Check snake_case first
-    if snake_key in config and config[snake_key] is not None:
-        return config[snake_key]
-    # Then camelCase
-    if camel_key in config and config[camel_key] is not None:
-        return config[camel_key]
-    # Fall back to default
+    if key in config and config[key] is not None:
+        return config[key]
     return default
 
 

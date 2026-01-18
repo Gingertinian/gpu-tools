@@ -76,7 +76,7 @@ jobs:
       - name: Restart RunPod workers
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
-          PROD_ENDPOINT_ID: "6z4nqrlojnu0gb"
+          PROD_ENDPOINT_ID: "v5n08urt0qn7hn"
           DEV_ENDPOINT_ID: "b32yhnf147dgbo"
         run: |
           # Determine which endpoint to update based on branch
@@ -93,11 +93,14 @@ jobs:
           # GPU IDs: AMPERE_24 (A5000/3090/4090), AMPERE_48 (A6000), AMPERE_16 (A4000)
           GPU_IDS="AMPERE_24,AMPERE_48,AMPERE_16"
 
+          # Template ID that points to ghcr.io/gingertinian/gpu-tools:latest
+          TEMPLATE_ID="hjmrqomin1"
+
           # Scale down to 0 workers (force restart)
           echo "Scaling down workers to 0..."
           curl -s -X POST "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" \
             -H "Content-Type: application/json" \
-            -d "{\"query\": \"mutation { saveEndpoint(input: { id: \\\"${ENDPOINT_ID}\\\", name: \\\"farmium-gpu-tools -fb\\\", templateId: \\\"3wwhlpg6mw\\\", workersMax: 0, workersMin: 0, idleTimeout: 10, gpuIds: \\\"${GPU_IDS}\\\" }) { id workersMax } }\"}"
+            -d "{\"query\": \"mutation { saveEndpoint(input: { id: \\\"${ENDPOINT_ID}\\\", name: \\\"farmium-gpu-tools -fb\\\", templateId: \\\"${TEMPLATE_ID}\\\", workersMax: 0, workersMin: 0, idleTimeout: 10, gpuIds: \\\"${GPU_IDS}\\\" }) { id workersMax } }\"}"
 
           sleep 5
 
@@ -105,6 +108,6 @@ jobs:
           echo "Scaling workers back up to ${MAX_WORKERS}..."
           curl -s -X POST "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" \
             -H "Content-Type: application/json" \
-            -d "{\"query\": \"mutation { saveEndpoint(input: { id: \\\"${ENDPOINT_ID}\\\", name: \\\"farmium-gpu-tools -fb\\\", templateId: \\\"3wwhlpg6mw\\\", workersMax: ${MAX_WORKERS}, workersMin: 0, idleTimeout: 10, gpuIds: \\\"${GPU_IDS}\\\" }) { id workersMax } }\"}"
+            -d "{\"query\": \"mutation { saveEndpoint(input: { id: \\\"${ENDPOINT_ID}\\\", name: \\\"farmium-gpu-tools -fb\\\", templateId: \\\"${TEMPLATE_ID}\\\", workersMax: ${MAX_WORKERS}, workersMin: 0, idleTimeout: 10, gpuIds: \\\"${GPU_IDS}\\\" }) { id workersMax } }\"}"
 
           echo "Workers restarted successfully!"

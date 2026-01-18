@@ -1606,6 +1606,7 @@ def process_batch_mode(job, job_input: dict) -> dict:
     print(f"[Batch Mode] GPU: {gpu_info['gpu_name']}, Type: {gpu_info['gpu_type']}")
     print(f"[Batch Mode] GPUs: {gpu_count}, Max parallel: {max_parallel}")
     print(f"[Batch Mode] Processing {total_files} files with processor: {processor}")
+    print(f"[Batch Mode] Config received: {json.dumps({k: v for k, v in config.items() if not str(k).startswith('_')}, default=str)}")
 
     runpod.serverless.progress_update(job, {
         "progress": 5,
@@ -2553,6 +2554,7 @@ def handler(job):
         elif tool == "video_reframe":
             if process_video_reframe is None:
                 return {"error": "Video Reframe processor not available"}
+            print(f"[VIDEO_REFRAME] Single mode - Config received: {json.dumps({k: v for k, v in config.items() if not str(k).startswith('_')}, default=str)}")
             output_path = os.path.join(temp_dir, "output.mp4")
             result = process_video_reframe(
                 input_path, output_path, config,

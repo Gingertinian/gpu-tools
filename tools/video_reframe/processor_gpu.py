@@ -534,22 +534,9 @@ def _build_gpu_filter_complex(
     if blur_top_h > 0 or blur_bottom_h > 0:
         print(f"[GPU-Reframe] Blur zones: top={blur_top_h}px, bottom={blur_bottom_h}px, content={scaled_h}px")
         print(f"[GPU-Reframe] Content position: y={content_y}px")
-
-        # Build content filter (with optional crop if video is taller than content area)
-        if crop_top_px > 0 or crop_bottom_px > 0:
-            content_filter = f"crop={orig_w}:{orig_h - crop_top_px - crop_bottom_px}:0:{crop_top_px},scale={scaled_w}:{scaled_h}:flags=fast_bilinear{eq_filter}"
-        else:
-            content_filter = f"scale={scaled_w}:{scaled_h}:flags=fast_bilinear{eq_filter}"
+        print(f"[GPU-Reframe] Crop: top={crop_top_px}px, bottom={crop_bottom_px}px, remaining={cropped_orig_h}px")
 
         # OPTIMIZED BLUR PIPELINE - 4x faster
-        #
-        # Instead of blurring at full 1080x1920 resolution (slow!), we:
-        # 1. Scale to 1/4 resolution (270x480)
-        # 2. Apply blur (16x fewer pixels = much faster)
-        # 3. Scale back to full resolution (blur hides upscale artifacts)
-        #
-        # This gives same visual result but MUCH faster processing
-
         # Calculate low-res dimensions (1/4 size, ensure even)
         blur_scale_w = (final_w // 4) - ((final_w // 4) % 2)
         blur_scale_h = (final_h // 4) - ((final_h // 4) % 2)
@@ -558,19 +545,55 @@ def _build_gpu_filter_complex(
 
         print(f"[GPU-Reframe] FAST blur: {blur_scale_w}x{blur_scale_h} (1/4 res), radius={scaled_blur_radius}")
 
-        # Split into 2: one for blur background, one for content
-        parts.append(f"[0:v]split=2[v_bg][v_content]")
+        # FIXED (2026-01-18): Blur must use CROPPED content, not original video
+        # The blur background should NOT show the parts that were cropped/removed
+        # Flow: crop first -> split -> one for blur (zoomed + rotated), one for content
 
-        # Background: scale to LOW res, blur, then scale to full output
-        # This is ~16x faster than blurring at full resolution
-        parts.append(
-            f"[v_bg]scale={blur_scale_w}:{blur_scale_h}:flags=fast_bilinear,"
-            f"boxblur=luma_radius={scaled_blur_radius}:chroma_radius={scaled_blur_radius},"
-            f"scale={final_w}:{final_h}:flags=fast_bilinear[blur_bg]"
-        )
+        # Random rotation for blur background (1-3 degrees, positive or negative)
+        blur_rotation = random.uniform(1, 3) * random.choice([-1, 1])
+        blur_rotation_rad = blur_rotation * math.pi / 180
 
-        # Content: scale to fit width
-        parts.append(f"[v_content]{content_filter}[content]")
+        # Calculate zoom needed to cover corners after rotation
+        # For angle θ, zoom factor ≈ 1 / (cos(θ) - sin(θ)*aspect_ratio) but simplified:
+        # zoom = 1 + 0.05 * |angle_degrees| gives ~5% extra per degree (safe margin)
+        rotation_zoom = 1 + 0.05 * abs(blur_rotation)
+        zoomed_blur_w = int(blur_scale_w * rotation_zoom)
+        zoomed_blur_h = int(blur_scale_h * rotation_zoom)
+
+        print(f"[GPU-Reframe] Blur rotation: {blur_rotation:.1f}° (zoom: {rotation_zoom:.2f}x)")
+
+        if crop_top_px > 0 or crop_bottom_px > 0:
+            # Step 1: Crop the video FIRST to remove top/bottom
+            parts.append(f"[0:v]crop={orig_w}:{cropped_orig_h}:0:{crop_top_px}[cropped]")
+
+            # Step 2: Split cropped video - one for blur background, one for content
+            parts.append(f"[cropped]split=2[for_blur][for_content]")
+
+            # Step 3: Blur background - scale up with zoom, rotate, blur, crop to final size
+            # The extra zoom compensates for rotation so no black corners appear
+            parts.append(
+                f"[for_blur]scale={zoomed_blur_w}:{zoomed_blur_h}:flags=fast_bilinear,"
+                f"rotate={blur_rotation_rad:.4f}:c=black,"
+                f"boxblur=luma_radius={scaled_blur_radius}:chroma_radius={scaled_blur_radius},"
+                f"crop={blur_scale_w}:{blur_scale_h},"
+                f"scale={final_w}:{final_h}:flags=fast_bilinear[blur_bg]"
+            )
+
+            # Step 4: Scale content to fit in content area
+            parts.append(f"[for_content]scale={scaled_w}:{scaled_h}:flags=fast_bilinear{eq_filter}[content]")
+        else:
+            # No crop needed - split original and use for both blur and content
+            parts.append(f"[0:v]split=2[for_blur][for_content]")
+
+            parts.append(
+                f"[for_blur]scale={zoomed_blur_w}:{zoomed_blur_h}:flags=fast_bilinear,"
+                f"rotate={blur_rotation_rad:.4f}:c=black,"
+                f"boxblur=luma_radius={scaled_blur_radius}:chroma_radius={scaled_blur_radius},"
+                f"crop={blur_scale_w}:{blur_scale_h},"
+                f"scale={final_w}:{final_h}:flags=fast_bilinear[blur_bg]"
+            )
+
+            parts.append(f"[for_content]scale={scaled_w}:{scaled_h}:flags=fast_bilinear{eq_filter}[content]")
 
         # Composite: overlay content on blur background
         parts.append(f"[blur_bg][content]overlay={content_x}:{content_y}[composited]")
@@ -602,12 +625,14 @@ def _build_gpu_filter_complex(
             f"[1:v]scale={logo_w}:-1:flags=lanczos,format=yuva420p[logo]"
         )
         # Use eof_action=repeat to loop logo (static image) for entire video duration
+        # CRITICAL: setsar=1 forces square pixels - without this, video displays as wrong aspect ratio
         parts.append(
-            f"{current_output}[logo]overlay={logo_x}:{logo_y}:eof_action=repeat[out]"
+            f"{current_output}[logo]overlay={logo_x}:{logo_y}:eof_action=repeat,setsar=1[out]"
         )
     else:
         print(f"[GPU-Reframe] No logo to add (logo_path={logo_path})")
-        parts.append(f"{current_output}copy[out]")
+        # CRITICAL: setsar=1 forces square pixels - without this, video displays as wrong aspect ratio
+        parts.append(f"{current_output}setsar=1[out]")
 
     return ';'.join(parts)
 
@@ -1002,47 +1027,46 @@ def _calculate_layout(
     """
     Calculate layout for reframe.
 
-    - Blur zones are exact percentages of final height (user's choice)
-    - Content fills width (1080px), height is cropped to fit content area
-    - Maintains width, crops height as needed
+    FIXED (2026-01-18): Blur percentages now control crop from ORIGINAL video:
+    - top_blur_pct = % of original video to crop from TOP
+    - bottom_blur_pct = % of original video to crop from BOTTOM
+    - The cropped portions become blur zones in output
+    - Center content fills the remaining space
     """
-    # Blur zones are percentage of FINAL output height
-    blur_top = int(final_h * min(top_blur_pct, 50) / 100)
-    blur_bottom = int(final_h * min(bottom_blur_pct, 50) / 100)
+    # Crop is percentage of ORIGINAL video height (what user wants to remove)
+    crop_top_px = int(orig_h * min(top_blur_pct, 45) / 100)
+    crop_bottom_px = int(orig_h * min(bottom_blur_pct, 45) / 100)
 
     # Ensure even values for FFmpeg
+    crop_top_px = crop_top_px - (crop_top_px % 2)
+    crop_bottom_px = crop_bottom_px - (crop_bottom_px % 2)
+
+    # Remaining content height after crop
+    cropped_orig_h = orig_h - crop_top_px - crop_bottom_px
+    cropped_orig_h = max(cropped_orig_h, int(orig_h * 0.2))  # Minimum 20%
+
+    # Scale cropped content to fill output width
+    scale = final_w / orig_w
+    scaled_w = final_w
+    scaled_h = int(cropped_orig_h * scale)
+    scaled_h = scaled_h - (scaled_h % 2)
+
+    # Blur zones in output: proportional to crop percentages
+    # If we cropped 26% from top, blur zone is ~26% of output height
+    total_blur_h = final_h - scaled_h
+    if top_blur_pct + bottom_blur_pct > 0:
+        blur_top = int(total_blur_h * top_blur_pct / (top_blur_pct + bottom_blur_pct))
+        blur_bottom = total_blur_h - blur_top
+    else:
+        blur_top = total_blur_h // 2
+        blur_bottom = total_blur_h - blur_top
+
+    # Ensure even
     blur_top = blur_top - (blur_top % 2)
     blur_bottom = blur_bottom - (blur_bottom % 2)
 
-    # Content area height (space between blur zones)
-    content_h = final_h - blur_top - blur_bottom
-    content_h = max(content_h, int(final_h * 0.2))  # Minimum 20%
-    content_h = content_h - (content_h % 2)
-
-    # Scale to fill width, then crop height to fit content area
-    scaled_w = final_w
-    scale = final_w / orig_w
-    scaled_h_natural = int(orig_h * scale)  # Natural height if we scale by width
-
-    if scaled_h_natural <= content_h:
-        # Video is shorter than content area - use natural height, center vertically
-        scaled_h = scaled_h_natural
-        content_y = blur_top + (content_h - scaled_h) // 2
-        crop_top_px = 0
-        crop_bottom_px = 0
-    else:
-        # Video is taller than content area - crop to fit
-        scaled_h = content_h
-        content_y = blur_top
-        # Calculate how much to crop from original
-        needed_orig_h = int(content_h / scale)
-        crop_total = orig_h - needed_orig_h
-        crop_top_px = crop_total // 2
-        crop_bottom_px = crop_total - crop_top_px
-
-    # Ensure even
-    scaled_h = scaled_h - (scaled_h % 2)
-    content_y = content_y - (content_y % 2)
+    # Content position (after top blur zone)
+    content_y = blur_top
 
     return {
         'scaled_w': scaled_w,
@@ -1054,7 +1078,7 @@ def _calculate_layout(
         'scale': scale,
         'crop_top_px': crop_top_px,
         'crop_bottom_px': crop_bottom_px,
-        'cropped_orig_h': orig_h - crop_top_px - crop_bottom_px,
+        'cropped_orig_h': cropped_orig_h,
     }
 
 

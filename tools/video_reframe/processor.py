@@ -81,13 +81,28 @@ VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v', '.wmv', '.f
 # CONFIG HELPERS
 # =============================================================================
 
+def _camel_to_snake(name: str) -> str:
+    """Convert camelCase to snake_case."""
+    import re
+    s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
+    return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+
 def _get_config(config: dict, key: str, default=None):
     """
     Get config value. Handles 0 and False values correctly.
-    All keys are camelCase as sent by the backend.
+    Supports both camelCase and snake_case keys for compatibility with backend conversion.
+
+    Backend may send either:
+    - camelCase: topBlurPercent (direct from frontend)
+    - snake_case: top_blur_percent (converted by getProcessingConfig)
     """
+    # Try camelCase first
     if key in config and config[key] is not None:
         return config[key]
+    # Try snake_case version
+    snake_key = _camel_to_snake(key)
+    if snake_key in config and config[snake_key] is not None:
+        return config[snake_key]
     return default
 
 

@@ -510,9 +510,9 @@ def _process_video_reframe(
             logo_data['position'] = logo_position
             print(f"[VideoReframe] Logo prepared: {logo_data['image'].shape[1]}x{logo_data['image'].shape[0]} at pos ({logo_position[0]:.2f}, {logo_position[1]:.2f})")
 
-    # Random generator with seed for reproducibility
+    # Generate stable blur parameters (no color/flip changes, smooth motion)
     rng = random.Random(video_index + 42)
-    blur_params = _generate_blur_params(rng)
+    blur_params = _generate_blur_params(rng, stable=True)
 
     # Start FFmpeg process for output
     ffmpeg_process = _start_ffmpeg_writer(
@@ -530,6 +530,8 @@ def _process_video_reframe(
     # Blur cache
     cache_blur_top = None
     cache_blur_bottom = None
+    cache_blur_left = None
+    cache_blur_right = None
 
     # Layout values
     scaled_w = layout['scaled_w']
@@ -538,6 +540,8 @@ def _process_video_reframe(
     content_y = layout['content_y']
     blur_top_h = layout['blur_top']
     blur_bottom_h = layout['blur_bottom']
+    blur_left_w = layout.get('blur_left', 0)
+    blur_right_w = layout.get('blur_right', 0)
 
     frame_idx = 0
     encoder_used = 'NVENC' if use_gpu else 'CPU'
@@ -548,11 +552,8 @@ def _process_video_reframe(
             if not ret:
                 break
 
-            # Check if we need to update blur
-            update_blur = (frame_idx % blur_update_interval == 0)
-
-            if update_blur:
-                blur_params = _generate_blur_params(rng)
+            # Update blur every 2 frames for smooth motion
+            update_blur = (frame_idx % 2 == 0) or frame_idx == 0
 
             # Process frame
             if use_gpu:
@@ -575,7 +576,7 @@ def _process_video_reframe(
                 # Convert content back to CPU for blur zone creation and output
                 content_cpu = gpu.to_cpu(content)
 
-                # Generate blur zones
+                # Generate vertical blur zones (top/bottom)
                 if blur_top_h > 0:
                     if update_blur or cache_blur_top is None:
                         cache_blur_top = _create_blur_zone_gpu(
@@ -584,8 +585,15 @@ def _process_video_reframe(
                         )
                     output_frame[0:blur_top_h, :] = cache_blur_top
 
-                # Place content
-                output_frame[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content_cpu
+                # Place content (handle center-crop if content is wider than frame)
+                if content_x < 0:
+                    # Content wider than frame - center crop
+                    crop_x = -content_x
+                    cropped_content = content_cpu[:, crop_x:crop_x + final_w]
+                    output_frame[content_y:content_y + scaled_h, 0:final_w] = cropped_content
+                else:
+                    # Content fits in frame
+                    output_frame[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content_cpu
 
                 # Bottom blur zone
                 if blur_bottom_h > 0:
@@ -595,6 +603,23 @@ def _process_video_reframe(
                             blur_intensity, blur_params
                         )
                     output_frame[content_y + scaled_h:, :] = cache_blur_bottom
+
+                # Generate horizontal blur zones (left/right) for horizontal videos
+                if blur_left_w > 0:
+                    if update_blur or cache_blur_left is None:
+                        cache_blur_left = _create_blur_zone_horizontal_gpu(
+                            gpu, effects, content_cpu, blur_left_w, final_h, 'left',
+                            blur_intensity, blur_params
+                        )
+                    output_frame[:, 0:blur_left_w] = cache_blur_left
+
+                if blur_right_w > 0:
+                    if update_blur or cache_blur_right is None:
+                        cache_blur_right = _create_blur_zone_horizontal_gpu(
+                            gpu, effects, content_cpu, blur_right_w, final_h, 'right',
+                            blur_intensity, blur_params
+                        )
+                    output_frame[:, content_x + scaled_w:] = cache_blur_right
             else:
                 # CPU processing
                 content = cv2.resize(frame, (scaled_w, scaled_h), interpolation=cv2.INTER_LANCZOS4)
@@ -602,6 +627,7 @@ def _process_video_reframe(
                 if brightness_adj != 0 or contrast_adj != 0 or saturation_adj != 0:
                     content = _apply_color_adjustments(content, brightness_adj, saturation_adj, contrast_adj)
 
+                # Vertical blur zones (top/bottom)
                 if blur_top_h > 0:
                     if update_blur or cache_blur_top is None:
                         cache_blur_top = _create_blur_zone_cpu(
@@ -610,7 +636,15 @@ def _process_video_reframe(
                         )
                     output_frame[0:blur_top_h, :] = cache_blur_top
 
-                output_frame[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content
+                # Place content (handle center-crop if content is wider than frame)
+                if content_x < 0:
+                    # Content wider than frame - center crop
+                    crop_x = -content_x
+                    cropped_content = content[:, crop_x:crop_x + final_w]
+                    output_frame[content_y:content_y + scaled_h, 0:final_w] = cropped_content
+                else:
+                    # Content fits in frame
+                    output_frame[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content
 
                 if blur_bottom_h > 0:
                     if update_blur or cache_blur_bottom is None:
@@ -619,6 +653,23 @@ def _process_video_reframe(
                             blur_intensity, blur_params
                         )
                     output_frame[content_y + scaled_h:, :] = cache_blur_bottom
+
+                # Horizontal blur zones (left/right) for horizontal videos
+                if blur_left_w > 0:
+                    if update_blur or cache_blur_left is None:
+                        cache_blur_left = _create_blur_zone_horizontal_cpu(
+                            effects, content, blur_left_w, final_h, 'left',
+                            blur_intensity, blur_params
+                        )
+                    output_frame[:, 0:blur_left_w] = cache_blur_left
+
+                if blur_right_w > 0:
+                    if update_blur or cache_blur_right is None:
+                        cache_blur_right = _create_blur_zone_horizontal_cpu(
+                            effects, content, blur_right_w, final_h, 'right',
+                            blur_intensity, blur_params
+                        )
+                    output_frame[:, content_x + scaled_w:] = cache_blur_right
 
             # Apply logo overlay
             if logo_data is not None:
@@ -691,6 +742,8 @@ def _process_frame_gpu(
     content_y = layout['content_y']
     blur_top_h = layout['blur_top']
     blur_bottom_h = layout['blur_bottom']
+    blur_left_w = layout.get('blur_left', 0)
+    blur_right_w = layout.get('blur_right', 0)
 
     # Allocate output
     output_frame = np.zeros((final_h, final_w, 3), dtype=np.uint8)
@@ -714,7 +767,7 @@ def _process_frame_gpu(
     # Convert to CPU for final composition
     content_cpu = gpu.to_cpu(content)
 
-    # Generate blur zones
+    # Generate vertical blur zones (top/bottom)
     if blur_top_h > 0:
         blur_top = _create_blur_zone_gpu(
             gpu, effects, content_cpu, final_w, blur_top_h, 'top',
@@ -722,8 +775,15 @@ def _process_frame_gpu(
         )
         output_frame[0:blur_top_h, :] = blur_top
 
-    # Place content
-    output_frame[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content_cpu
+    # Place content (handle center-crop if content is wider than frame)
+    if content_x < 0:
+        # Content wider than frame - center crop
+        crop_x = -content_x
+        cropped_content = content_cpu[:, crop_x:crop_x + final_w]
+        output_frame[content_y:content_y + scaled_h, 0:final_w] = cropped_content
+    else:
+        # Content fits in frame
+        output_frame[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content_cpu
 
     # Bottom blur zone
     if blur_bottom_h > 0:
@@ -732,6 +792,21 @@ def _process_frame_gpu(
             blur_intensity, blur_params
         )
         output_frame[content_y + scaled_h:, :] = blur_bottom
+
+    # Generate horizontal blur zones (left/right) for horizontal videos
+    if blur_left_w > 0:
+        blur_left = _create_blur_zone_horizontal_gpu(
+            gpu, effects, content_cpu, blur_left_w, final_h, 'left',
+            blur_intensity, blur_params
+        )
+        output_frame[:, 0:blur_left_w] = blur_left
+
+    if blur_right_w > 0:
+        blur_right = _create_blur_zone_horizontal_gpu(
+            gpu, effects, content_cpu, blur_right_w, final_h, 'right',
+            blur_intensity, blur_params
+        )
+        output_frame[:, content_x + scaled_w:] = blur_right
 
     # Apply logo
     if logo_data is not None:
@@ -760,6 +835,8 @@ def _process_frame_cpu(
     content_y = layout['content_y']
     blur_top_h = layout['blur_top']
     blur_bottom_h = layout['blur_bottom']
+    blur_left_w = layout.get('blur_left', 0)
+    blur_right_w = layout.get('blur_right', 0)
 
     # Allocate output
     output_frame = np.zeros((final_h, final_w, 3), dtype=np.uint8)
@@ -771,7 +848,7 @@ def _process_frame_cpu(
     if brightness_adj != 0 or contrast_adj != 0 or saturation_adj != 0:
         content = _apply_color_adjustments(content, brightness_adj, saturation_adj, contrast_adj)
 
-    # Generate blur zones
+    # Generate vertical blur zones (top/bottom)
     if blur_top_h > 0:
         blur_top = _create_blur_zone_cpu(
             effects, content, final_w, blur_top_h, 'top',
@@ -779,8 +856,15 @@ def _process_frame_cpu(
         )
         output_frame[0:blur_top_h, :] = blur_top
 
-    # Place content
-    output_frame[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content
+    # Place content (handle center-crop if content is wider than frame)
+    if content_x < 0:
+        # Content wider than frame - center crop
+        crop_x = -content_x
+        cropped_content = content[:, crop_x:crop_x + final_w]
+        output_frame[content_y:content_y + scaled_h, 0:final_w] = cropped_content
+    else:
+        # Content fits in frame
+        output_frame[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content
 
     # Bottom blur zone
     if blur_bottom_h > 0:
@@ -789,6 +873,21 @@ def _process_frame_cpu(
             blur_intensity, blur_params
         )
         output_frame[content_y + scaled_h:, :] = blur_bottom
+
+    # Generate horizontal blur zones (left/right) for horizontal videos
+    if blur_left_w > 0:
+        blur_left = _create_blur_zone_horizontal_cpu(
+            effects, content, blur_left_w, final_h, 'left',
+            blur_intensity, blur_params
+        )
+        output_frame[:, 0:blur_left_w] = blur_left
+
+    if blur_right_w > 0:
+        blur_right = _create_blur_zone_horizontal_cpu(
+            effects, content, blur_right_w, final_h, 'right',
+            blur_intensity, blur_params
+        )
+        output_frame[:, content_x + scaled_w:] = blur_right
 
     # Apply logo
     if logo_data is not None:
@@ -954,6 +1053,159 @@ def _create_blur_zone_cpu(
     return blur_section
 
 
+def _create_blur_zone_horizontal_gpu(
+    gpu: 'GPUProcessor',
+    effects: 'GPUBlurEffects',
+    content: np.ndarray,
+    target_w: int,
+    target_h: int,
+    position: str,
+    blur_strength: int,
+    params: dict
+) -> np.ndarray:
+    """Create horizontal blur zone (left/right) using GPU operations."""
+    if target_w <= 0:
+        return np.zeros((target_h, 0, 3), dtype=np.uint8)
+
+    content_h, content_w = content.shape[:2]
+
+    # Extract source region from left or right side of content
+    source_ratio = 0.65
+    source_w = max(int(content_w * source_ratio), min(content_w, max(target_w * 2, 100)))
+    source_w = max(10, min(source_w, content_w))
+
+    if position == 'left':
+        source = content[:, 0:source_w].copy()
+    else:  # right
+        start_x = max(0, content_w - source_w)
+        source = content[:, start_x:].copy()
+
+    # Transfer to GPU
+    gpu_source = gpu.to_gpu(source)
+
+    # Apply zoom
+    zoom = max(target_w / source.shape[1], target_h / source.shape[0]) * params['zoom']
+    zoomed_w = int(source.shape[1] * zoom)
+    zoomed_h = int(source.shape[0] * zoom)
+
+    if zoomed_w <= 0 or zoomed_h <= 0:
+        return np.zeros((target_h, target_w, 3), dtype=np.uint8)
+
+    gpu_source = gpu.resize(gpu_source, (zoomed_w, zoomed_h), interpolation='linear')
+
+    # Crop to target size (center crop)
+    crop_x = max(0, (zoomed_w - target_w) // 2)
+    crop_y = max(0, (zoomed_h - target_h) // 2)
+
+    # Need to get back to CPU for slicing, then back to GPU
+    source_cpu = gpu.to_cpu(gpu_source)
+    blur_section = source_cpu[crop_y:crop_y + target_h, crop_x:crop_x + target_w].copy()
+
+    # Ensure exact dimensions
+    if blur_section.shape[0] != target_h or blur_section.shape[1] != target_w:
+        blur_section = cv2.resize(blur_section, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+    # Transfer back to GPU for effects
+    gpu_blur = gpu.to_gpu(blur_section)
+
+    # Apply effects on GPU
+    if position == 'left' and params['hflip']:
+        gpu_blur = effects.flip_horizontal(gpu_blur)
+
+    if params['vflip']:
+        gpu_blur = effects.flip_vertical(gpu_blur)
+
+    if params['color_shift'] != 0:
+        gpu_blur = effects.color_shift(gpu_blur, params['color_shift'])
+
+    if params['saturation'] != 1.0 or params['brightness'] != 1.0:
+        gpu_blur = effects.adjust_saturation_brightness(
+            gpu_blur, params['saturation'], params['brightness']
+        )
+
+    if params['tilt_angle'] != 0:
+        gpu_blur = effects.tilt(gpu_blur, params['tilt_angle'])
+
+    gpu_blur = effects.darken(gpu_blur, params['darken'])
+
+    # Apply Gaussian blur
+    if blur_strength > 0:
+        gpu_blur = effects.gaussian_blur(gpu_blur, blur_strength)
+
+    return gpu.to_cpu(gpu_blur)
+
+
+def _create_blur_zone_horizontal_cpu(
+    effects: BlurEffects,
+    content: np.ndarray,
+    target_w: int,
+    target_h: int,
+    position: str,
+    blur_strength: int,
+    params: dict
+) -> np.ndarray:
+    """Create horizontal blur zone (left/right) using CPU operations."""
+    if target_w <= 0:
+        return np.zeros((target_h, 0, 3), dtype=np.uint8)
+
+    content_h, content_w = content.shape[:2]
+
+    # Extract source region from left or right side of content
+    source_ratio = 0.65
+    source_w = max(int(content_w * source_ratio), min(content_w, max(target_w * 2, 100)))
+    source_w = max(10, min(source_w, content_w))
+
+    if position == 'left':
+        source = content[:, 0:source_w].copy()
+    else:  # right
+        start_x = max(0, content_w - source_w)
+        source = content[:, start_x:].copy()
+
+    # Apply zoom
+    zoom = max(target_w / source.shape[1], target_h / source.shape[0]) * params['zoom']
+    zoomed_w = int(source.shape[1] * zoom)
+    zoomed_h = int(source.shape[0] * zoom)
+
+    if zoomed_w <= 0 or zoomed_h <= 0:
+        return np.zeros((target_h, target_w, 3), dtype=np.uint8)
+
+    source = cv2.resize(source, (zoomed_w, zoomed_h), interpolation=cv2.INTER_LINEAR)
+
+    # Crop to target size
+    crop_x = max(0, (zoomed_w - target_w) // 2)
+    crop_y = max(0, (zoomed_h - target_h) // 2)
+    blur_section = source[crop_y:crop_y + target_h, crop_x:crop_x + target_w]
+
+    # Ensure exact dimensions
+    if blur_section.shape[0] != target_h or blur_section.shape[1] != target_w:
+        blur_section = cv2.resize(blur_section, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+    # Apply effects
+    if position == 'left' and params['hflip']:
+        blur_section = effects.flip_horizontal(blur_section)
+
+    if params['vflip']:
+        blur_section = effects.flip_vertical(blur_section)
+
+    if params['color_shift'] != 0:
+        blur_section = effects.color_shift(blur_section, params['color_shift'])
+
+    if params['saturation'] != 1.0 or params['brightness'] != 1.0:
+        blur_section = effects.adjust_saturation_brightness(
+            blur_section, params['saturation'], params['brightness']
+        )
+
+    if params['tilt_angle'] != 0:
+        blur_section = effects.tilt(blur_section, params['tilt_angle'])
+
+    blur_section = effects.darken(blur_section, params['darken'])
+
+    if blur_strength > 0:
+        blur_section = effects.gaussian_blur(blur_section, blur_strength)
+
+    return blur_section
+
+
 # =============================================================================
 # UTILITY FUNCTIONS
 # =============================================================================
@@ -1020,29 +1272,66 @@ def _calculate_layout(
         top_blur_percent: Specific top blur percentage (0-100)
         bottom_blur_percent: Specific bottom blur percentage (0-100)
 
+    For HORIZONTAL videos going to VERTICAL output:
+        - Scale to fill HEIGHT (preserve video height)
+        - Add blur on LEFT and RIGHT sides
+
+    For VERTICAL videos going to VERTICAL output:
+        - Scale to fill WIDTH
+        - Add blur on TOP and BOTTOM
+
     Priority:
         1. If top_blur_percent or bottom_blur_percent > 0: Use individual percentages
         2. Else if force_blur_percent > 0: Apply equal blur top/bottom
         3. Else: Auto-calculate based on aspect ratio difference
     """
-    # Start with auto-calculated layout based on aspect ratio
-    scale = final_w / orig_w
-    scaled_w = final_w
-    scaled_h = int(orig_h * scale)
-    scaled_h = scaled_h - (scaled_h % 2)
+    orig_aspect = orig_w / orig_h
+    final_aspect = final_w / final_h
 
-    if scaled_h > final_h:
-        scale = final_h / orig_h
-        scaled_h = final_h
-        scaled_w = int(orig_w * scale)
-        scaled_w = scaled_w - (scaled_w % 2)
+    # Detect if source is horizontal and target is vertical
+    is_horizontal_to_vertical = orig_aspect > 1.0 and final_aspect < 1.0
 
-    # Auto-calculated blur from aspect ratio difference
-    blur_space = final_h - scaled_h
-    blur_top = blur_space // 2
-    blur_bottom = blur_space - blur_top
+    # Initialize blur values
+    blur_top = 0
+    blur_bottom = 0
+    blur_left = 0
+    blur_right = 0
 
-    # Check if individual blur percentages are specified
+    if is_horizontal_to_vertical:
+        # HORIZONTAL video -> VERTICAL output
+        # Strategy: Scale to fill WIDTH, keep full video visible, add blur TOP and BOTTOM
+        # Video is centered with blurred zones above and below
+        scale = final_w / orig_w
+        scaled_w = final_w
+        scaled_h = int(orig_h * scale)
+        scaled_h = scaled_h - (scaled_h % 2)
+
+        # Calculate blur zones for top and bottom
+        blur_space_v = final_h - scaled_h
+        blur_top = blur_space_v // 2
+        blur_bottom = blur_space_v - blur_top
+        print(f"[Reframe] Horizontal video: content={scaled_w}x{scaled_h}, blur top/bottom={blur_top}/{blur_bottom}px")
+
+    else:
+        # VERTICAL or SQUARE video -> any output
+        # Original logic: scale to fill WIDTH, add blur top/bottom
+        scale = final_w / orig_w
+        scaled_w = final_w
+        scaled_h = int(orig_h * scale)
+        scaled_h = scaled_h - (scaled_h % 2)
+
+        if scaled_h > final_h:
+            scale = final_h / orig_h
+            scaled_h = final_h
+            scaled_w = int(orig_w * scale)
+            scaled_w = scaled_w - (scaled_w % 2)
+
+        # Auto-calculated blur from aspect ratio difference
+        blur_space = final_h - scaled_h
+        blur_top = blur_space // 2
+        blur_bottom = blur_space - blur_top
+
+    # Check if individual blur percentages are specified (override auto-calculation)
     has_individual_blur = (top_blur_percent > 0 or bottom_blur_percent > 0)
 
     if has_individual_blur:
@@ -1053,6 +1342,8 @@ def _calculate_layout(
         # Calculate blur heights in pixels
         blur_top = int(final_h * top_pct / 100)
         blur_bottom = int(final_h * bottom_pct / 100)
+        blur_left = 0
+        blur_right = 0
 
         # Recalculate content size to fit in remaining space
         content_space = final_h - blur_top - blur_bottom
@@ -1067,7 +1358,7 @@ def _calculate_layout(
 
         print(f"[Reframe] Individual blur: top={top_pct}% ({blur_top}px), bottom={bottom_pct}% ({blur_bottom}px)")
 
-    elif force_blur_percent > 0 and blur_space == 0:
+    elif force_blur_percent > 0 and blur_top == 0 and blur_bottom == 0 and blur_left == 0 and blur_right == 0:
         # Legacy: force equal blur when content matches aspect (force_blur_percent)
         blur_percent = min(force_blur_percent, 40)
         content_percent = 1.0 - (2 * blur_percent / 100)
@@ -1088,22 +1379,43 @@ def _calculate_layout(
         'content_y': content_y,
         'blur_top': blur_top,
         'blur_bottom': blur_bottom,
-        'needs_blur': blur_top > 0 or blur_bottom > 0
+        'blur_left': blur_left,
+        'blur_right': blur_right,
+        'needs_blur': blur_top > 0 or blur_bottom > 0 or blur_left > 0 or blur_right > 0
     }
 
 
-def _generate_blur_params(rng: random.Random) -> dict:
-    """Generate random parameters for animated blur effect."""
-    return {
-        'hflip': rng.random() < 0.3,
-        'vflip': rng.random() < 0.2,
-        'color_shift': rng.randint(-15, 15),
-        'saturation': rng.uniform(0.7, 1.2),
-        'brightness': rng.uniform(0.6, 0.9),
-        'tilt_angle': rng.uniform(-8, 8),
-        'zoom': rng.uniform(1.2, 1.5),
-        'darken': rng.uniform(0.5, 0.8),
-    }
+def _generate_blur_params(rng: random.Random, stable: bool = True) -> dict:
+    """Generate parameters for blur effect.
+
+    Args:
+        rng: Random generator for reproducibility
+        stable: If True, use stable/subtle parameters. If False, use animated variation.
+    """
+    if stable:
+        # Stable blur - no random color/orientation changes, just clean blur
+        return {
+            'hflip': False,
+            'vflip': False,
+            'color_shift': 0,
+            'saturation': 1.0,
+            'brightness': 0.85,  # Slightly darker
+            'tilt_angle': 0,
+            'zoom': 1.3,
+            'darken': 0.7,
+        }
+    else:
+        # Animated blur with subtle variation
+        return {
+            'hflip': rng.random() < 0.3,
+            'vflip': rng.random() < 0.2,
+            'color_shift': rng.randint(-15, 15),
+            'saturation': rng.uniform(0.7, 1.2),
+            'brightness': rng.uniform(0.6, 0.9),
+            'tilt_angle': rng.uniform(-8, 8),
+            'zoom': rng.uniform(1.2, 1.5),
+            'darken': rng.uniform(0.5, 0.8),
+        }
 
 
 def _apply_color_adjustments(

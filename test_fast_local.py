@@ -17,7 +17,7 @@ from spoofer.processor_fast import process_spoofer_fast
 # Test configuration
 INPUT_IMAGE = r'C:\Users\erudito\Pictures\Screenshots\Screenshot 2026-01-02 144608.png'
 OUTPUT_DIR = r'C:\Users\erudito\Downloads'
-COPIES = 1000  # Test with 1000 copies
+VARIATIONS = 1000  # Test with 1000 variations
 
 def main():
     print("=" * 60)
@@ -28,7 +28,7 @@ def main():
         print(f"Error: Input image not found: {INPUT_IMAGE}")
         sys.exit(1)
 
-    output_path = os.path.join(OUTPUT_DIR, f"fast_test_{COPIES}copies_{int(time.time())}.zip")
+    output_path = os.path.join(OUTPUT_DIR, f"fast_test_{VARIATIONS}variations_{int(time.time())}.zip")
 
     config = {
         'spatial': {
@@ -50,7 +50,7 @@ def main():
             'quality': 90,
         },
         'options': {
-            'copies': COPIES,
+            'variations': VARIATIONS,  # Also accepts 'copies' for backward compatibility
             'force916': 1,
             'flip': 1,
         }
@@ -64,7 +64,7 @@ def main():
 
     print(f"\nInput: {INPUT_IMAGE}")
     print(f"Output: {output_path}")
-    print(f"Copies: {COPIES}")
+    print(f"Variations: {VARIATIONS}")
     print()
 
     start_time = time.time()
@@ -76,9 +76,9 @@ def main():
     print("=" * 60)
     print("  RESULTS")
     print("=" * 60)
-    print(f"  Copies generated: {result.get('copies_generated', 0)}")
+    print(f"  Variations generated: {result.get('variations_generated', 0)}")
     print(f"  Total time: {elapsed:.2f}s")
-    print(f"  Time per copy: {result.get('time_per_copy', elapsed/COPIES):.3f}s")
+    print(f"  Time per variation: {result.get('time_per_variation', elapsed/VARIATIONS):.3f}s")
     print(f"  CPU cores used: {result.get('cpu_cores_used', 'N/A')}")
     print(f"  Output: {output_path}")
 
@@ -90,7 +90,7 @@ def main():
 
     # Compare with expected
     print("\nPerformance comparison:")
-    print(f"  - Target: <1 minute for 200 copies")
+    print(f"  - Target: <1 minute for 200 variations")
     print(f"  - Actual: {elapsed:.1f}s ({elapsed/60:.1f} min)")
 
     if elapsed < 60:

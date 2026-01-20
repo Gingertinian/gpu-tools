@@ -575,6 +575,12 @@ class AsyncPipelineProcessor:
         # Shutdown flag
         self.shutdown = False
 
+        # Download cache for spoofer batch mode (same input, multiple variations)
+        # Key: input_path, Value: threading.Event (set when download complete)
+        self._download_cache: Dict[str, threading.Event] = {}
+        self._download_cache_lock = threading.Lock()
+        self._download_cache_errors: Dict[str, str] = {}  # Track download errors
+
         # Thread pools
         self.download_executor: Optional[ThreadPoolExecutor] = None
         self.process_executor: Optional[ThreadPoolExecutor] = None
@@ -590,17 +596,54 @@ class AsyncPipelineProcessor:
         }
 
     def _download_worker(self, item: WorkItem) -> None:
-        """Download a single file and add to process queue"""
+        """Download a single file and add to process queue.
+
+        Uses caching to avoid downloading the same input file multiple times
+        (important for spoofer batch mode with variations).
+        """
         start_time = time.time()
+        input_path = item.input_path
+        should_download = False
+        download_event = None
+
+        # Check download cache - avoid downloading same file multiple times
+        with self._download_cache_lock:
+            if input_path in self._download_cache:
+                # Another worker is downloading or has downloaded this file
+                download_event = self._download_cache[input_path]
+            else:
+                # First worker for this input path - we'll do the download
+                download_event = threading.Event()
+                self._download_cache[input_path] = download_event
+                should_download = True
 
         try:
-            download_file(item.input_url, item.input_path)
-            item.input_size = os.path.getsize(item.input_path) if os.path.exists(item.input_path) else 0
-            item.download_complete = True
-            item.download_time = time.time() - start_time
+            if should_download:
+                # We're responsible for downloading this file
+                download_file(item.input_url, item.input_path)
+                item.input_size = os.path.getsize(item.input_path) if os.path.exists(item.input_path) else 0
+                item.download_time = time.time() - start_time
 
-            speed_mbps = (item.input_size / 1024 / 1024) / item.download_time if item.download_time > 0 else 0
-            print(f"[Download {item.index}] {item.input_size/1024/1024:.2f}MB in {item.download_time:.2f}s ({speed_mbps:.2f} MB/s)")
+                speed_mbps = (item.input_size / 1024 / 1024) / item.download_time if item.download_time > 0 else 0
+                print(f"[Download {item.index}] {item.input_size/1024/1024:.2f}MB in {item.download_time:.2f}s ({speed_mbps:.2f} MB/s)")
+
+                # Signal that download is complete
+                download_event.set()
+            else:
+                # Wait for another worker to finish downloading
+                print(f"[Download {item.index}] Waiting for cached download of {os.path.basename(input_path)}...")
+                download_event.wait(timeout=300)  # 5 min timeout
+
+                # Check if download failed
+                with self._download_cache_lock:
+                    if input_path in self._download_cache_errors:
+                        raise Exception(self._download_cache_errors[input_path])
+
+                item.input_size = os.path.getsize(item.input_path) if os.path.exists(item.input_path) else 0
+                item.download_time = time.time() - start_time
+                print(f"[Download {item.index}] Using cached file (waited {item.download_time:.2f}s)")
+
+            item.download_complete = True
 
             # Add to process queue immediately
             self.process_queue.put(item)
@@ -613,6 +656,12 @@ class AsyncPipelineProcessor:
             item.download_complete = False
 
             print(f"[Download {item.index}] FAILED: {str(e)[:100]}")
+
+            # Record error in cache so other workers waiting on this file know it failed
+            if should_download:
+                with self._download_cache_lock:
+                    self._download_cache_errors[input_path] = str(e)
+                download_event.set()  # Signal completion (even if failed)
 
             # Record failure
             with self.stats_lock:
@@ -922,8 +971,18 @@ class AsyncPipelineProcessor:
         print(f"[AsyncPipeline] Estimated Time: ~{estimated_time:.1f}s ({estimated_time/60:.1f} min)")
         print(f"[AsyncPipeline] =======================================================")
 
+        # Check for spoofer variations - need to expand work items
+        # Supports both 'variations' and legacy 'copies' for backward compatibility
+        variations = config.get("variations") or config.get("copies") or config.get("options", {}).get("variations") or config.get("options", {}).get("copies", 1)
+        is_spoofer_batch = tool == "spoofer" and variations > 1
+
+        if is_spoofer_batch:
+            print(f"[AsyncPipeline] SPOOFER BATCH MODE: {len(input_urls)} inputs × {variations} variations = {len(input_urls) * variations} outputs")
+
         # Prepare work items
         work_items = []
+        work_index = 0
+
         for i, (input_url, output_url) in enumerate(zip(input_urls, output_urls)):
             ext = get_file_extension(input_url, config)
 
@@ -937,16 +996,52 @@ class AsyncPipelineProcessor:
             else:
                 output_ext = ext
 
-            item = WorkItem(
-                index=i,
-                input_url=input_url,
-                output_url=output_url,
-                input_path=os.path.join(self.temp_dir, f"input_{i}{ext}"),
-                output_path=os.path.join(self.temp_dir, f"output_{i}{output_ext}"),
-                tool=tool,
-                config=config
-            )
-            work_items.append(item)
+            if is_spoofer_batch:
+                # For spoofer with variations > 1, create N work items per input
+                # Each variation gets a unique seed and output path
+                for var_idx in range(variations):
+                    var_config = {
+                        **config,
+                        "variations": 1,  # Process single variation per work item
+                        "copies": 1,  # Legacy support
+                        "_variation_index": var_idx,
+                        "_seed": int(time.time() * 1000) + work_index * 12345,  # Unique seed per variation
+                    }
+                    # Remove options.copies/variations if present (set to 1)
+                    if "options" in var_config:
+                        var_config["options"] = {**var_config["options"], "variations": 1, "copies": 1}
+
+                    item = WorkItem(
+                        index=work_index,
+                        input_url=input_url,  # Same input URL for all variations
+                        output_url=f"{output_url.rsplit('.', 1)[0]}_v{var_idx:04d}.{output_url.rsplit('.', 1)[1]}" if '.' in output_url else f"{output_url}_v{var_idx:04d}",
+                        input_path=os.path.join(self.temp_dir, f"input_{i}{ext}"),  # Share input file
+                        output_path=os.path.join(self.temp_dir, f"output_{i}_v{var_idx:04d}{output_ext}"),
+                        tool=tool,
+                        config=var_config
+                    )
+                    work_items.append(item)
+                    work_index += 1
+            else:
+                # Standard 1:1 mapping for non-batch tools
+                item = WorkItem(
+                    index=work_index,
+                    input_url=input_url,
+                    output_url=output_url,
+                    input_path=os.path.join(self.temp_dir, f"input_{i}{ext}"),
+                    output_path=os.path.join(self.temp_dir, f"output_{i}{output_ext}"),
+                    tool=tool,
+                    config=config
+                )
+                work_items.append(item)
+                work_index += 1
+
+        # Update total items count for progress tracking
+        self.total_items = len(work_items)
+        self.results = [None] * self.total_items
+
+        if is_spoofer_batch:
+            print(f"[AsyncPipeline] Created {self.total_items} work items for spoofer batch")
 
         # Start thread pools
         self.download_executor = ThreadPoolExecutor(max_workers=self.download_workers)
@@ -1738,9 +1833,9 @@ def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipel
             else:
                 output_ext = input_ext if input_ext else ".jpg"
 
-            # For spoofer with copies > 1, output is a directory of files
-            copies = config.get("copies") or config.get("options", {}).get("copies", 1)
-            is_batch_spoofer = tool == "spoofer" and copies > 1
+            # For spoofer with variations > 1, output is a directory of files
+            variations = config.get("variations") or config.get("copies") or config.get("options", {}).get("variations") or config.get("options", {}).get("copies", 1)
+            is_batch_spoofer = tool == "spoofer" and variations > 1
 
             if is_batch_spoofer:
                 # Spoofer batch mode: output to a subdirectory
@@ -2412,8 +2507,8 @@ def handler(job):
 
         # Tool-specific output extension handling
         if tool == "spoofer":
-            copies = config.get("copies") or config.get("options", {}).get("copies", 1)
-            if copies > 1:
+            variations = config.get("variations") or config.get("copies") or config.get("options", {}).get("variations") or config.get("options", {}).get("copies", 1)
+            if variations > 1:
                 output_ext = ".zip"
         elif tool == "bg_remove":
             output_ext = ".png"  # Always PNG for transparency

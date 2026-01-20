@@ -2383,17 +2383,17 @@ def process_batch_spoofer(
     input_path: str,
     output_path: str,
     config: Dict[str, Any],
-    copies: int,
+    variations: int,
     progress_callback: Optional[Callable[[float, str], None]] = None
 ) -> Dict[str, Any]:
     """
-    Process image and generate multiple unique copies as ZIP.
+    Process image and generate multiple unique variations as ZIP.
 
     Args:
         input_path: Path to input image
         output_path: Path for output ZIP file
         config: Transform configuration
-        copies: Number of copies to generate
+        variations: Number of variations to generate (processed files, not copies)
         progress_callback: Optional progress callback
 
     Returns:
@@ -2408,7 +2408,7 @@ def process_batch_spoofer(
     print(f"[DEBUG] process_batch_spoofer called with:")
     print(f"[DEBUG]   input_path: {input_path}")
     print(f"[DEBUG]   output_path: {output_path}")
-    print(f"[DEBUG]   copies: {copies}")
+    print(f"[DEBUG]   variations: {variations}")
     print(f"[DEBUG]   config keys: {list(config.keys())}")
 
     report_progress(0.05, "Loading image...")
@@ -2427,7 +2427,7 @@ def process_batch_spoofer(
         except Exception:
             pass
 
-    report_progress(0.1, f"Generating {copies} copies...")
+    report_progress(0.1, f"Generating {variations} variations...")
 
     # Flatten config for processing
     params = {}
@@ -2474,24 +2474,24 @@ def process_batch_spoofer(
 
     phash_min = options.get('phashMinDistance', PHASH_MIN_DISTANCE)
     verify_phash = options.get('verifyPhash', True)
-    compare_copies = options.get('compareCopies', True)
+    compare_variations = options.get('compareVariations', options.get('compareCopies', True))
 
-    # Generate copies
+    # Generate variations
     base_time = time.time_ns()
     results = []
     phash_distances = []
-    copy_distances = []
+    variation_distances = []
     existing_phashes = []
 
     # Prepare ZIP in memory
     zip_buffer = io.BytesIO()
 
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
-        for i in range(copies):
+        for i in range(variations):
             try:
                 # Progress
-                progress = 0.1 + (i / copies) * 0.8
-                report_progress(progress, f"Processing copy {i+1}/{copies}...")
+                progress = 0.1 + (i / variations) * 0.8
+                report_progress(progress, f"Processing variation {i+1}/{variations}...")
 
                 # Generate unique seed
                 seed = generate_unique_seed(input_path, i, base_time + i * 1000)
@@ -2504,13 +2504,13 @@ def process_batch_spoofer(
                 for retry in range(max_retries):
                     retry_seed = seed + retry * 10000
 
-                    result_img, distance, copy_dist, result_phash = process_single_copy(
+                    result_img, distance, var_dist, result_phash = process_single_copy(
                         original_img,
                         original_phash,
                         params,
                         i,
                         retry_seed,
-                        existing_phashes if compare_copies else [],
+                        existing_phashes if compare_variations else [],
                         phash_min
                     )
 
@@ -2518,28 +2518,28 @@ def process_batch_spoofer(
                     meets_threshold = True
                     if verify_phash and distance > 0:
                         meets_threshold = distance >= phash_min
-                        if compare_copies and copy_dist < 999:
-                            meets_threshold = meets_threshold and copy_dist >= phash_min
+                        if compare_variations and var_dist < 999:
+                            meets_threshold = meets_threshold and var_dist >= phash_min
 
                     # Track best
                     if distance > best_distance:
                         best_distance = distance
-                        best_result = (result_img, distance, copy_dist, result_phash)
+                        best_result = (result_img, distance, var_dist, result_phash)
 
                     if meets_threshold:
                         break
 
                 # Use best result
                 if best_result:
-                    result_img, distance, copy_dist, result_phash = best_result
+                    result_img, distance, var_dist, result_phash = best_result
 
                     if result_phash is not None:
                         existing_phashes.append(result_phash)
 
                     if distance > 0:
                         phash_distances.append(distance)
-                    if copy_dist < 999:
-                        copy_distances.append(copy_dist)
+                    if var_dist < 999:
+                        variation_distances.append(var_dist)
 
                 # Generate filename
                 py_rng = random.Random(seed)
@@ -2574,7 +2574,7 @@ def process_batch_spoofer(
 
     # Calculate statistics
     stats = {
-        'copies_generated': len(results),
+        'variations_generated': len(results),
         'files': results,
     }
 
@@ -2583,8 +2583,8 @@ def process_batch_spoofer(
         stats['phash_min'] = min(phash_distances)
         stats['phash_max'] = max(phash_distances)
 
-    if copy_distances:
-        stats['copy_distance_min'] = min(copy_distances)
+    if variation_distances:
+        stats['variation_distance_min'] = min(variation_distances)
 
     return stats
 
@@ -2734,20 +2734,25 @@ def process_spoofer(
             shutil.rmtree(temp_dir, ignore_errors=True)
             raise
 
-    # Check if batch mode (copies > 1)
-    copies = config.get('copies') or config.get('options', {}).get('copies', 1)
+    # Check if batch mode (variations > 1) - supports both 'variations' and legacy 'copies'
+    variations = (
+        config.get('variations') or
+        config.get('copies') or
+        config.get('options', {}).get('variations') or
+        config.get('options', {}).get('copies', 1)
+    )
     output_mode = config.get('outputMode', 'file')
     output_dir = config.get('outputDir')
 
     if is_video:
-        if copies > 1 or output_mode == 'directory':
+        if variations > 1 or output_mode == 'directory':
             # BATCH VIDEO MODE: Create multiple variations
-            return process_batch_video(input_path, output_path, config, copies, progress_callback)
+            return process_batch_video(input_path, output_path, config, variations, progress_callback)
         else:
             return process_video(input_path, output_path, config, report_progress)
     else:
-        if copies > 1:
-            return process_batch_spoofer(input_path, output_path, config, copies, progress_callback)
+        if variations > 1:
+            return process_batch_spoofer(input_path, output_path, config, variations, progress_callback)
         else:
             return process_single_image(input_path, output_path, config, report_progress)
 
@@ -2756,7 +2761,7 @@ def process_batch_video(
     input_path: str,
     output_path: str,
     config: Dict[str, Any],
-    copies: int,
+    variations: int,
     progress_callback: Optional[Callable[[float, str], None]] = None
 ) -> Dict[str, Any]:
     """
@@ -2767,7 +2772,7 @@ def process_batch_video(
         input_path: Path to input video
         output_path: Output directory path (when outputMode='directory') or base path
         config: Processing configuration
-        copies: Number of copies/variations to create
+        variations: Number of variations to create (processed files, not copies)
         progress_callback: Progress callback function
     """
     import tempfile
@@ -2777,8 +2782,8 @@ def process_batch_video(
         if progress_callback:
             progress_callback(progress, message)
 
-    copies = max(1, int(copies))
-    report_progress(0.05, f"Preparing batch video processing ({copies} variations)...")
+    variations = max(1, int(variations))
+    report_progress(0.05, f"Preparing batch video processing ({variations} variations)...")
 
     # Determine output directory
     output_mode = config.get('outputMode', 'file')
@@ -2801,31 +2806,31 @@ def process_batch_video(
 
     # Create list of output paths for each variation
     video_tasks = []
-    for i in range(copies):
+    for i in range(variations):
         output_file = os.path.join(out_dir, f"{base_name}_v{i+1}.mp4")
-        # Each copy gets a unique seed for different transforms
-        copy_config = {
+        # Each variation gets a unique seed for different transforms
+        var_config = {
             **config,
             '_seed': int(time.time() * 1000) + i * 12345,
-            '_copy_index': i
+            '_variation_index': i
         }
         video_tasks.append({
             'input': input_path,
             'output': output_file,
-            'config': copy_config
+            'config': var_config
         })
 
-    report_progress(0.1, f"Processing {copies} video variations in parallel...")
+    report_progress(0.1, f"Processing {variations} video variations in parallel...")
 
     # Use process_videos_parallel for efficient multi-NVENC processing
-    # Pass the video ONCE with variations=copies to generate unique filenames
+    # Pass the video ONCE with variations count to generate unique filenames
     result = process_videos_parallel(
         [input_path],  # Single input video
         out_dir,
         config,
         progress_callback=progress_callback,
         max_parallel=None,  # Auto-detect based on GPU
-        variations=copies  # Create N unique variations
+        variations=variations  # Create N unique variations
     )
 
     if result.get('error'):
@@ -2860,7 +2865,7 @@ def process_batch_video(
     return {
         'status': 'completed',
         'mode': 'batch_video',
-        'copies_requested': copies,
+        'variations_requested': variations,
         'videos_processed': completed,
         'videos_failed': failed,
         'output_files': output_files,
@@ -3306,17 +3311,17 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 3:
-        print("Usage: python processor.py input_file output_file [copies]")
+        print("Usage: python processor.py input_file output_file [variations]")
         sys.exit(1)
 
-    copies = int(sys.argv[3]) if len(sys.argv) > 3 else 1
+    variations = int(sys.argv[3]) if len(sys.argv) > 3 else 1
 
     test_config = {
         'spatial': {'crop': 1.5, 'microResize': 1.2, 'rotation': 0.8},
         'tonal': {'brightness': 0.04, 'contrast': 0.04, 'saturation': 0.06},
         'visual': {'noise': 3},
         'compression': {'quality': 90, 'doubleCompress': 1},
-        'options': {'copies': copies, 'force916': 1, 'flip': 1}
+        'options': {'variations': variations, 'force916': 1, 'flip': 1}
     }
 
     def progress(p, msg):

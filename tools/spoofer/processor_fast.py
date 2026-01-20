@@ -4,7 +4,7 @@ Spoofer Processor - FAST MODE (CPU Optimized with Fault Tolerance)
 Key optimizations:
 1. CPU Multiprocessing - Use ALL available cores (no cap)
 2. ProcessPoolExecutor with as_completed - fault tolerant
-3. Automatic retry for failed copies (up to 3 attempts)
+3. Automatic retry for failed variations (up to 3 attempts)
 4. pHash disabled by default (40-50% speedup)
 5. Single compression with artifacts (25-35% speedup)
 6. Skip transforms with 0 values
@@ -12,9 +12,9 @@ Key optimizations:
 
 Fault Tolerance:
 - If a worker crashes, executor spawns a new one automatically
-- Failed copies are retried up to 3 times
-- Progress continues even if some copies fail
-- Returns partial results if some copies permanently fail
+- Failed variations are retried up to 3 times
+- Progress continues even if some variations fail
+- Returns partial results if some variations permanently fail
 
 Target: 200 photos in 15-20 seconds on 8+ cores
 """
@@ -435,7 +435,7 @@ def process_batch_fast(
     input_path: str,
     output_path: str,
     config: Dict[str, Any],
-    copies: int,
+    variations: int,
     progress_callback: Optional[Callable[[float, str], None]] = None
 ) -> Dict[str, Any]:
     """
@@ -444,14 +444,14 @@ def process_batch_fast(
     Key features:
     - Uses ALL available CPU cores (no artificial cap)
     - ProcessPoolExecutor with as_completed for real-time progress
-    - Automatic retry (up to 3 attempts) for failed copies
-    - Graceful degradation: returns partial results if some copies fail
+    - Automatic retry (up to 3 attempts) for failed variations
+    - Graceful degradation: returns partial results if some variations fail
 
     Args:
         input_path: Path to input image
         output_path: Path for output ZIP
         config: Transform configuration
-        copies: Number of copies
+        variations: Number of variations to generate (processed files, not copies)
         progress_callback: Optional progress callback
 
     Returns:
@@ -479,11 +479,11 @@ def process_batch_fast(
     img_bytes = img_buffer.getvalue()
 
     num_cores = cpu_count()
-    num_workers = min(num_cores, copies)  # Use ALL cores, no cap
+    num_workers = min(num_cores, variations)  # Use ALL cores, no cap
 
     # Get mode for applying multipliers
     mode = config.get('mode', 'balanced')
-    report(0.1, f"Preparing {copies} copies with {num_workers} CPU cores (mode: {mode})...")
+    report(0.1, f"Preparing {variations} variations with {num_workers} CPU cores (mode: {mode})...")
 
     # Build params (use fast defaults for unspecified)
     params = dict(FAST_DEFAULTS)
@@ -522,8 +522,8 @@ def process_batch_fast(
 
     # Track results and failures
     results = {}  # idx -> (filename, jpg_bytes)
-    failed_indices = set(range(copies))  # Start with all indices as "pending"
-    retry_counts = {i: 0 for i in range(copies)}
+    failed_indices = set(range(variations))  # Start with all indices as "pending"
+    retry_counts = {i: 0 for i in range(variations)}
 
     def create_worker_args(idx: int, attempt: int = 0) -> tuple:
         """Create args for a specific copy index."""
@@ -535,7 +535,7 @@ def process_batch_fast(
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         # Submit all initial jobs
         future_to_idx = {}
-        for idx in range(copies):
+        for idx in range(variations):
             args = create_worker_args(idx)
             future = executor.submit(process_single_copy_worker, args)
             future_to_idx[future] = idx
@@ -578,10 +578,10 @@ def process_batch_fast(
             # Progress update (throttled to avoid spam)
             current_time = time.time()
             if current_time - last_progress_time >= 0.2:  # Update every 200ms max
-                progress = 0.15 + (completed_count / copies) * 0.75
+                progress = 0.15 + (completed_count / variations) * 0.75
                 successful = len(results)
                 failed = completed_count - successful
-                status = f"Processed {completed_count}/{copies}"
+                status = f"Processed {completed_count}/{variations}"
                 if failed > 0:
                     status += f" ({failed} retrying...)"
                 report(progress, status)
@@ -614,20 +614,20 @@ def process_batch_fast(
 
     elapsed = time.time() - start_time
     successful_count = len(filenames)
-    failed_count = copies - successful_count
+    failed_count = variations - successful_count
 
-    status_msg = f"Complete in {elapsed:.1f}s - {successful_count}/{copies} successful"
+    status_msg = f"Complete in {elapsed:.1f}s - {successful_count}/{variations} successful"
     if failed_count > 0:
         status_msg += f" ({failed_count} failed)"
     report(1.0, status_msg)
 
     return {
-        'copies_generated': successful_count,
-        'copies_failed': failed_count,
-        'copies_requested': copies,
+        'variations_generated': successful_count,
+        'variations_failed': failed_count,
+        'variations_requested': variations,
         'files': filenames,
         'processing_time': elapsed,
-        'time_per_copy': elapsed / max(1, successful_count),
+        'time_per_variation': elapsed / max(1, successful_count),
         'cpu_cores_used': num_workers,
         'output_mode': output_mode,
         'fault_tolerant': True
@@ -643,11 +643,16 @@ def process_spoofer_fast(
     """
     Main entry point for fast spoofer processing.
     """
-    # Check both config.copies (from workflows) and config.options.copies (from tool view)
-    copies = config.get('copies') or config.get('options', {}).get('copies', 1)
+    # Check config.variations first, fallback to config.copies or config.options for backward compatibility
+    variations = (
+        config.get('variations') or
+        config.get('copies') or
+        config.get('options', {}).get('variations') or
+        config.get('options', {}).get('copies', 1)
+    )
 
-    if copies > 1:
-        return process_batch_fast(input_path, output_path, config, copies, progress_callback)
+    if variations > 1:
+        return process_batch_fast(input_path, output_path, config, variations, progress_callback)
     else:
         # Single image - use regular fast transforms
         def report(p, m=""):
@@ -704,7 +709,7 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 3:
-        print("Usage: python processor_fast.py input_file output_file [copies]")
+        print("Usage: python processor_fast.py input_file output_file [variations]")
         print("\nFeatures:")
         print("  - Uses ALL CPU cores (no cap)")
         print("  - ProcessPoolExecutor with fault tolerance")
@@ -712,14 +717,14 @@ if __name__ == "__main__":
         print("  - Graceful degradation on failures")
         sys.exit(1)
 
-    copies = int(sys.argv[3]) if len(sys.argv) > 3 else 100
+    variations = int(sys.argv[3]) if len(sys.argv) > 3 else 100
 
     test_config = {
         'spatial': {'crop': 1.5, 'microResize': 1.2, 'rotation': 0.8},
         'tonal': {'brightness': 0.04, 'contrast': 0.04, 'saturation': 0.06},
         'visual': {'noise': 3, 'tint': 1.5},
         'compression': {'quality': 90},
-        'options': {'copies': copies, 'force916': 1, 'flip': 1}
+        'options': {'variations': variations, 'force916': 1, 'flip': 1}
     }
 
     def progress(p, msg):
@@ -728,16 +733,16 @@ if __name__ == "__main__":
     print(f"\n{'='*60}")
     print(f"Spoofer FAST Mode - Fault Tolerant Processing")
     print(f"CPU Cores: {cpu_count()}")
-    print(f"Copies: {copies}")
+    print(f"Variations: {variations}")
     print(f"{'='*60}\n")
 
     result = process_spoofer_fast(sys.argv[1], sys.argv[2], test_config, progress)
 
     print(f"\n{'='*60}")
     print(f"Results:")
-    print(f"  Generated: {result.get('copies_generated', 0)}/{result.get('copies_requested', copies)}")
-    print(f"  Failed: {result.get('copies_failed', 0)}")
+    print(f"  Generated: {result.get('variations_generated', 0)}/{result.get('variations_requested', variations)}")
+    print(f"  Failed: {result.get('variations_failed', 0)}")
     print(f"  Time: {result.get('processing_time', 0):.2f}s")
-    print(f"  Speed: {result.get('time_per_copy', 0):.3f}s per copy")
+    print(f"  Speed: {result.get('time_per_variation', 0):.3f}s per variation")
     print(f"  Cores used: {result.get('cpu_cores_used', 0)}")
     print(f"{'='*60}")

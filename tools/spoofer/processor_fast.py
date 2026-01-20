@@ -39,6 +39,33 @@ TARGET_RESOLUTIONS = {
     'low': (720, 1280)
 }
 
+# ==================== MODE PRESETS ====================
+# Multipliers applied to base transform values based on mode
+# Light: subtle changes (0.3-0.5x) - for content reuse
+# Balanced: default (1.0x) - good balance of uniqueness and quality
+# Aggressive: maximum variation (2.0-3.0x) - different hash each time
+
+MODE_MULTIPLIERS = {
+    'light': {
+        'spatial': 0.3,      # Very subtle spatial changes
+        'tonal': 0.4,        # Minimal color shifts
+        'visual': 0.3,       # Light noise/tint
+        'variation': 0.2,    # Low randomization range
+    },
+    'balanced': {
+        'spatial': 1.0,      # Default spatial transforms
+        'tonal': 1.0,        # Default color adjustments
+        'visual': 1.0,       # Default noise/tint
+        'variation': 0.3,    # Moderate randomization range
+    },
+    'aggressive': {
+        'spatial': 2.5,      # Strong spatial transforms (more crop, rotation)
+        'tonal': 2.0,        # Noticeable color shifts
+        'visual': 2.5,       # High noise/tint
+        'variation': 0.5,    # Wide randomization range
+    }
+}
+
 # Fast mode defaults - skip expensive transforms
 FAST_DEFAULTS = {
     'crop': 1.5,
@@ -65,6 +92,43 @@ FAST_DEFAULTS = {
 }
 
 
+def get_mode_multipliers(mode: str) -> dict:
+    """Get mode multipliers, defaulting to 'balanced' if unknown mode."""
+    return MODE_MULTIPLIERS.get(mode, MODE_MULTIPLIERS['balanced'])
+
+
+def apply_mode_to_params(params: dict, mode: str) -> dict:
+    """
+    Apply mode multipliers to transform parameters.
+    This ensures visible differences between light/balanced/aggressive modes.
+    """
+    multipliers = get_mode_multipliers(mode)
+    result = dict(params)
+
+    # Spatial transforms
+    spatial_mult = multipliers['spatial']
+    for key in ['crop', 'micro_resize', 'rotation']:
+        if key in result and result[key] > 0:
+            result[key] = result[key] * spatial_mult
+
+    # Tonal transforms
+    tonal_mult = multipliers['tonal']
+    for key in ['brightness', 'gamma', 'contrast', 'saturation']:
+        if key in result and result[key] > 0:
+            result[key] = result[key] * tonal_mult
+
+    # Visual transforms
+    visual_mult = multipliers['visual']
+    for key in ['tint', 'noise']:
+        if key in result and result[key] > 0:
+            result[key] = result[key] * visual_mult
+
+    # Store variation multiplier for randomize_params
+    result['_variation_mult'] = multipliers['variation']
+
+    return result
+
+
 def generate_seed(img_path: str, idx: int, base_time: int) -> int:
     """Generate unique seed for reproducible randomization."""
     hash_input = f"{img_path}_{idx}_{base_time}_{os.getpid()}"
@@ -72,9 +136,17 @@ def generate_seed(img_path: str, idx: int, base_time: int) -> int:
 
 
 def randomize_params(base: Dict, rng: random.Random, var: float = 0.3) -> Dict:
-    """Randomize parameters within ±variation."""
+    """
+    Randomize parameters within ±variation.
+    Uses _variation_mult from base if available (set by mode preset).
+    """
+    # Use mode-specific variation if available
+    var = base.get('_variation_mult', var)
+
     result = {}
     for key, val in base.items():
+        if key.startswith('_'):  # Skip internal keys
+            continue
         if isinstance(val, (int, float)) and val > 0:
             factor = 1.0 + rng.uniform(-var, var)
             result[key] = int(val * factor) if isinstance(val, int) else val * factor
@@ -409,7 +481,9 @@ def process_batch_fast(
     num_cores = cpu_count()
     num_workers = min(num_cores, copies)  # Use ALL cores, no cap
 
-    report(0.1, f"Preparing {copies} copies with {num_workers} CPU cores...")
+    # Get mode for applying multipliers
+    mode = config.get('mode', 'balanced')
+    report(0.1, f"Preparing {copies} copies with {num_workers} CPU cores (mode: {mode})...")
 
     # Build params (use fast defaults for unspecified)
     params = dict(FAST_DEFAULTS)
@@ -436,6 +510,10 @@ def process_batch_fast(
     params['flip'] = options.get('flip', 1)
     params['force_916'] = options.get('force916', 1)
     random_names = options.get('randomNames', 0)
+
+    # Apply mode multipliers to make differences visible
+    params = apply_mode_to_params(params, mode)
+    print(f"[Spoofer Fast] Mode '{mode}' applied - crop: {params.get('crop'):.2f}, rotation: {params.get('rotation'):.2f}, noise: {params.get('noise'):.2f}")
 
     base_name = os.path.splitext(os.path.basename(input_path))[0]
     base_time = time.time_ns()
@@ -582,7 +660,8 @@ def process_spoofer_fast(
         if img.mode != 'RGB':
             img = img.convert('RGB')
 
-        report(0.3, "Applying transforms...")
+        mode = config.get('mode', 'balanced')
+        report(0.3, f"Applying transforms (mode: {mode})...")
         seed = int(time.time() * 1000) % (2**31)
 
         # Build params
@@ -607,6 +686,9 @@ def process_spoofer_fast(
             'flip': options.get('flip', 1),
             'force_916': options.get('force916', 1),
         })
+
+        # Apply mode multipliers
+        params = apply_mode_to_params(params, mode)
 
         result = apply_fast_transforms(img, params, seed)
 

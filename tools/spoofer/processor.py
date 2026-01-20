@@ -813,6 +813,9 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
         except Exception:
             original_width, original_height, duration = 1920, 1080, 0
 
+        # Apply mode multipliers to config before building filters
+        config = apply_mode_to_config(config)
+
         # Build filter chain
         filters = []
         spatial = config.get('spatial', {})
@@ -1400,6 +1403,98 @@ PHOTO_DEFAULTS = {
     'flip': 1,
     'force_916': 1,
 }
+
+# ==================== MODE PRESETS ====================
+# Multipliers applied to base transform values based on mode
+# Light: subtle changes (0.3-0.5x) - for content reuse
+# Balanced: default (1.0x) - good balance of uniqueness and quality
+# Aggressive: maximum variation (2.0-3.0x) - different hash each time
+
+MODE_MULTIPLIERS = {
+    'light': {
+        'spatial': 0.3,      # Very subtle spatial changes
+        'tonal': 0.4,        # Minimal color shifts
+        'visual': 0.3,       # Light noise/tint
+        'variation': 0.2,    # Low randomization range
+    },
+    'balanced': {
+        'spatial': 1.0,      # Default spatial transforms
+        'tonal': 1.0,        # Default color adjustments
+        'visual': 1.0,       # Default noise/tint
+        'variation': 0.3,    # Moderate randomization range
+    },
+    'aggressive': {
+        'spatial': 2.5,      # Strong spatial transforms (more crop, rotation)
+        'tonal': 2.0,        # Noticeable color shifts
+        'visual': 2.5,       # High noise/tint
+        'variation': 0.5,    # Wide randomization range
+    }
+}
+
+
+def get_mode_multipliers(mode: str) -> Dict[str, float]:
+    """Get mode multipliers, defaulting to 'balanced' if unknown mode."""
+    return MODE_MULTIPLIERS.get(mode, MODE_MULTIPLIERS['balanced'])
+
+
+def apply_mode_to_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Apply mode multipliers to transform values in config.
+    This ensures visible differences between light/balanced/aggressive modes.
+
+    Args:
+        config: Original config dict with spatial, tonal, visual sections
+
+    Returns:
+        Modified config with transform values scaled by mode multipliers
+    """
+    mode = config.get('mode', 'balanced')
+    multipliers = get_mode_multipliers(mode)
+
+    print(f"[Spoofer] Applying mode '{mode}' multipliers: {multipliers}")
+
+    # Deep copy to avoid modifying original
+    result = {}
+    for key, value in config.items():
+        if isinstance(value, dict):
+            result[key] = dict(value)
+        else:
+            result[key] = value
+
+    # Apply spatial multiplier
+    spatial = result.get('spatial', {})
+    spatial_mult = multipliers['spatial']
+    for key in ['crop', 'microResize', 'rotation', 'subpixel', 'warp', 'barrel', 'blockShift', 'microRescale']:
+        if key in spatial and spatial[key] > 0:
+            original = spatial[key]
+            spatial[key] = spatial[key] * spatial_mult
+            print(f"[Spoofer]   spatial.{key}: {original} -> {spatial[key]:.2f}")
+    result['spatial'] = spatial
+
+    # Apply tonal multiplier
+    tonal = result.get('tonal', {})
+    tonal_mult = multipliers['tonal']
+    for key in ['brightness', 'gamma', 'contrast', 'saturation', 'vignette']:
+        if key in tonal and tonal[key] > 0:
+            original = tonal[key]
+            tonal[key] = tonal[key] * tonal_mult
+            print(f"[Spoofer]   tonal.{key}: {original} -> {tonal[key]:.3f}")
+    result['tonal'] = tonal
+
+    # Apply visual multiplier
+    visual = result.get('visual', {})
+    visual_mult = multipliers['visual']
+    for key in ['tint', 'chromatic', 'noise']:
+        if key in visual and visual[key] > 0:
+            original = visual[key]
+            visual[key] = visual[key] * visual_mult
+            print(f"[Spoofer]   visual.{key}: {original} -> {visual[key]:.2f}")
+    result['visual'] = visual
+
+    # Store variation multiplier for randomize_params
+    result['_variation_mult'] = multipliers['variation']
+
+    return result
 
 
 def process_single_image_worker(args: Tuple) -> Dict[str, Any]:

@@ -1042,51 +1042,81 @@ def _calculate_layout(
     """
     Calculate layout for reframe.
 
-    FIXED (2026-01-18): Blur percentages now control crop from ORIGINAL video:
-    - top_blur_pct = % of original video to crop from TOP
-    - bottom_blur_pct = % of original video to crop from BOTTOM
-    - The cropped portions become blur zones in output
-    - Center content fills the remaining space
+    FIXED (2026-01-22): Blur percentages are now relative to OUTPUT FRAME height.
+    This ensures consistent visual appearance across videos with different resolutions/aspects.
+
+    Example: 10% top blur always creates a 192px blur zone (10% of 1920px output)
+    regardless of whether the input is 1080p, 720p, or ultrawide.
+
+    The content is scaled to fit in the remaining space after blur zones.
     """
-    # Crop is percentage of ORIGINAL video height (what user wants to remove)
-    crop_top_px = int(orig_h * min(top_blur_pct, 45) / 100)
-    crop_bottom_px = int(orig_h * min(bottom_blur_pct, 45) / 100)
+    # Blur zones are percentage of OUTPUT frame height (consistent across all videos)
+    blur_top = int(final_h * min(top_blur_pct, 45) / 100)
+    blur_bottom = int(final_h * min(bottom_blur_pct, 45) / 100)
 
     # Ensure even values for FFmpeg
-    crop_top_px = crop_top_px - (crop_top_px % 2)
-    crop_bottom_px = crop_bottom_px - (crop_bottom_px % 2)
-
-    # Remaining content height after crop
-    cropped_orig_h = orig_h - crop_top_px - crop_bottom_px
-    cropped_orig_h = max(cropped_orig_h, int(orig_h * 0.2))  # Minimum 20%
-
-    # Scale cropped content to fill output width
-    scale = final_w / orig_w
-    scaled_w = final_w
-    scaled_h = int(cropped_orig_h * scale)
-    scaled_h = scaled_h - (scaled_h % 2)
-
-    # Blur zones in output: proportional to crop percentages
-    # If we cropped 26% from top, blur zone is ~26% of output height
-    total_blur_h = final_h - scaled_h
-    if top_blur_pct + bottom_blur_pct > 0:
-        blur_top = int(total_blur_h * top_blur_pct / (top_blur_pct + bottom_blur_pct))
-        blur_bottom = total_blur_h - blur_top
-    else:
-        blur_top = total_blur_h // 2
-        blur_bottom = total_blur_h - blur_top
-
-    # Ensure even
     blur_top = blur_top - (blur_top % 2)
     blur_bottom = blur_bottom - (blur_bottom % 2)
 
-    # Content position (after top blur zone)
+    # Available space for content after blur zones
+    content_space_h = final_h - blur_top - blur_bottom
+
+    # Scale content to fit: fill width, then check if height fits
+    scale = final_w / orig_w
+    scaled_w = final_w
+    scaled_h = int(orig_h * scale)
+
+    # If scaled content is taller than available space, shrink to fit
+    if scaled_h > content_space_h:
+        # Need to shrink content to fit in available space
+        scale = content_space_h / orig_h
+        scaled_h = content_space_h
+        scaled_w = int(orig_w * scale)
+        # Center horizontally if narrower than final width
+        scaled_w = min(scaled_w, final_w)
+
+    # Ensure even dimensions
+    scaled_w = scaled_w - (scaled_w % 2)
+    scaled_h = scaled_h - (scaled_h % 2)
+
+    # Calculate crop from original video (how much to remove to fit)
+    # This is derived from the scaling, not user input
+    if scaled_h < int(orig_h * final_w / orig_w):
+        # Content was shrunk, calculate how much of original to crop
+        original_scaled_h = int(orig_h * final_w / orig_w)
+        total_crop = original_scaled_h - scaled_h
+        # Distribute crop proportionally based on blur percentages
+        if top_blur_pct + bottom_blur_pct > 0:
+            crop_ratio = top_blur_pct / (top_blur_pct + bottom_blur_pct)
+        else:
+            crop_ratio = 0.5
+        crop_top_px = int(total_crop * crop_ratio / (final_w / orig_w))
+        crop_bottom_px = int(total_crop * (1 - crop_ratio) / (final_w / orig_w))
+    else:
+        crop_top_px = 0
+        crop_bottom_px = 0
+
+    # Ensure even crop values
+    crop_top_px = crop_top_px - (crop_top_px % 2)
+    crop_bottom_px = crop_bottom_px - (crop_bottom_px % 2)
+
+    # Calculate cropped original height (for FFmpeg crop filter)
+    cropped_orig_h = orig_h - crop_top_px - crop_bottom_px
+    cropped_orig_h = max(cropped_orig_h, int(orig_h * 0.2))  # Minimum 20%
+
+    # Content position: centered horizontally, after top blur zone vertically
+    content_x = (final_w - scaled_w) // 2
     content_y = blur_top
+
+    print(f"[GPU-Reframe] Layout: input={orig_w}x{orig_h}, output={final_w}x{final_h}")
+    print(f"[GPU-Reframe] Blur zones (output %): top={top_blur_pct}%={blur_top}px, bottom={bottom_blur_pct}%={blur_bottom}px")
+    print(f"[GPU-Reframe] Content: {scaled_w}x{scaled_h} at ({content_x}, {content_y})")
+    print(f"[GPU-Reframe] Crop from original: top={crop_top_px}px, bottom={crop_bottom_px}px")
 
     return {
         'scaled_w': scaled_w,
         'scaled_h': scaled_h,
-        'content_x': 0,
+        'content_x': content_x,
         'content_y': content_y,
         'blur_top': blur_top,
         'blur_bottom': blur_bottom,

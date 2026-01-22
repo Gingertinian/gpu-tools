@@ -1273,8 +1273,10 @@ def _calculate_layout(
         bottom_blur_percent: Specific bottom blur percentage (0-100)
 
     For HORIZONTAL videos going to VERTICAL output:
-        - Scale to fill HEIGHT (preserve video height)
-        - Add blur on LEFT and RIGHT sides
+        - Scale to fill WIDTH
+        - Add blur on TOP and BOTTOM
+        - Blur percentages are relative to the CONTENT AREA (not full frame)
+          This ensures consistent visual appearance across different video resolutions
 
     For VERTICAL videos going to VERTICAL output:
         - Scale to fill WIDTH
@@ -1297,77 +1299,110 @@ def _calculate_layout(
     blur_left = 0
     blur_right = 0
 
+    # First, calculate the natural scaled size (fitting width)
+    scale = final_w / orig_w
+    scaled_w = final_w
+    scaled_h = int(orig_h * scale)
+    scaled_h = scaled_h - (scaled_h % 2)
+
+    if scaled_h > final_h:
+        # Content is taller than frame - scale to fit height instead
+        scale = final_h / orig_h
+        scaled_h = final_h
+        scaled_w = int(orig_w * scale)
+        scaled_w = scaled_w - (scaled_w % 2)
+
+    # Calculate natural blur space (difference between frame and content)
+    natural_blur_space = final_h - scaled_h
+    natural_blur_top = natural_blur_space // 2
+    natural_blur_bottom = natural_blur_space - natural_blur_top
+
     if is_horizontal_to_vertical:
-        # HORIZONTAL video -> VERTICAL output
-        # Strategy: Scale to fill WIDTH, keep full video visible, add blur TOP and BOTTOM
-        # Video is centered with blurred zones above and below
-        scale = final_w / orig_w
-        scaled_w = final_w
-        scaled_h = int(orig_h * scale)
-        scaled_h = scaled_h - (scaled_h % 2)
-
-        # Calculate blur zones for top and bottom
-        blur_space_v = final_h - scaled_h
-        blur_top = blur_space_v // 2
-        blur_bottom = blur_space_v - blur_top
-        print(f"[Reframe] Horizontal video: content={scaled_w}x{scaled_h}, blur top/bottom={blur_top}/{blur_bottom}px")
-
+        print(f"[Reframe] Horizontal video ({orig_w}x{orig_h}): natural content={scaled_w}x{scaled_h}, natural blur top/bottom={natural_blur_top}/{natural_blur_bottom}px")
     else:
-        # VERTICAL or SQUARE video -> any output
-        # Original logic: scale to fill WIDTH, add blur top/bottom
-        scale = final_w / orig_w
-        scaled_w = final_w
-        scaled_h = int(orig_h * scale)
-        scaled_h = scaled_h - (scaled_h % 2)
-
-        if scaled_h > final_h:
-            scale = final_h / orig_h
-            scaled_h = final_h
-            scaled_w = int(orig_w * scale)
-            scaled_w = scaled_w - (scaled_w % 2)
-
-        # Auto-calculated blur from aspect ratio difference
-        blur_space = final_h - scaled_h
-        blur_top = blur_space // 2
-        blur_bottom = blur_space - blur_top
+        print(f"[Reframe] Vertical/Square video ({orig_w}x{orig_h}): content={scaled_w}x{scaled_h}")
 
     # Check if individual blur percentages are specified (override auto-calculation)
     has_individual_blur = (top_blur_percent > 0 or bottom_blur_percent > 0)
 
     if has_individual_blur:
-        # Use individual blur percentages (from frontend)
+        # FIXED: Calculate blur as percentage of the CONTENT AREA where blur is possible
+        # This ensures 10% blur looks the same regardless of video resolution
+        #
+        # For horizontal videos:
+        #   - The "blurable area" is the natural blur space (frame height - content height)
+        #   - User's percentage is applied to this area, ensuring consistent visual appearance
+        #   - If user wants MORE blur than natural space, we shrink the content
+        #
+        # For vertical videos that already fill the frame:
+        #   - We need to shrink content to create blur space
+        #   - Percentage is relative to the frame height
+
         top_pct = min(top_blur_percent, 50)  # Cap at 50%
         bottom_pct = min(bottom_blur_percent, 50)  # Cap at 50%
 
-        # Calculate blur heights in pixels
-        blur_top = int(final_h * top_pct / 100)
-        blur_bottom = int(final_h * bottom_pct / 100)
-        blur_left = 0
-        blur_right = 0
+        if is_horizontal_to_vertical and natural_blur_space > 0:
+            # For horizontal videos: blur % is relative to the OUTPUT FRAME
+            # This ensures consistent blur size across different horizontal video resolutions
+            # A 10% blur will always be 10% of 1920px = 192px regardless of input video
+            blur_top = int(final_h * top_pct / 100)
+            blur_bottom = int(final_h * bottom_pct / 100)
 
-        # Recalculate content size to fit in remaining space
-        content_space = final_h - blur_top - blur_bottom
-        if content_space < scaled_h:
-            # Content needs to shrink to fit
-            new_scale = content_space / orig_h
-            scaled_h = content_space
-            scaled_h = scaled_h - (scaled_h % 2)
-            scaled_w = int(orig_w * new_scale)
-            scaled_w = min(scaled_w, final_w)
-            scaled_w = scaled_w - (scaled_w % 2)
+            # Calculate remaining space for content
+            content_space = final_h - blur_top - blur_bottom
 
-        print(f"[Reframe] Individual blur: top={top_pct}% ({blur_top}px), bottom={bottom_pct}% ({blur_bottom}px)")
+            # Check if content fits in remaining space
+            if content_space < scaled_h:
+                # Need to shrink content to fit
+                # Scale proportionally to maintain aspect ratio
+                shrink_scale = content_space / scaled_h
+                scaled_h = content_space
+                scaled_h = scaled_h - (scaled_h % 2)
+                scaled_w = int(final_w * shrink_scale)
+                scaled_w = min(scaled_w, final_w)
+                scaled_w = scaled_w - (scaled_w % 2)
+                print(f"[Reframe] Content shrunk to fit blur zones: {scaled_w}x{scaled_h}")
 
-    elif force_blur_percent > 0 and blur_top == 0 and blur_bottom == 0 and blur_left == 0 and blur_right == 0:
+            print(f"[Reframe] Horizontal video blur: top={top_pct}% ({blur_top}px), bottom={bottom_pct}% ({blur_bottom}px), content={scaled_w}x{scaled_h}")
+        else:
+            # For vertical/square videos: blur % is relative to frame height
+            blur_top = int(final_h * top_pct / 100)
+            blur_bottom = int(final_h * bottom_pct / 100)
+            blur_left = 0
+            blur_right = 0
+
+            # Recalculate content size to fit in remaining space
+            content_space = final_h - blur_top - blur_bottom
+            if content_space < scaled_h:
+                # Content needs to shrink to fit
+                new_scale = content_space / orig_h
+                scaled_h = content_space
+                scaled_h = scaled_h - (scaled_h % 2)
+                scaled_w = int(orig_w * new_scale)
+                scaled_w = min(scaled_w, final_w)
+                scaled_w = scaled_w - (scaled_w % 2)
+
+            print(f"[Reframe] Vertical video blur: top={top_pct}% ({blur_top}px), bottom={bottom_pct}% ({blur_bottom}px)")
+
+    elif force_blur_percent > 0:
         # Legacy: force equal blur when content matches aspect (force_blur_percent)
         blur_percent = min(force_blur_percent, 40)
         content_percent = 1.0 - (2 * blur_percent / 100)
         scaled_h = int(final_h * content_percent)
         scaled_h = scaled_h - (scaled_h % 2)
+        # Recalculate scaled_w based on new scaled_h
+        new_scale = scaled_h / orig_h
+        scaled_w = int(orig_w * new_scale)
+        scaled_w = min(scaled_w, final_w)
+        scaled_w = scaled_w - (scaled_w % 2)
         blur_space = final_h - scaled_h
         blur_top = blur_space // 2
         blur_bottom = blur_space - blur_top
         print(f"[Reframe] Force blur: {blur_percent}% top/bottom, content={scaled_w}x{scaled_h}")
+    else:
+        # Use natural blur values (auto-calculated)
+        blur_top = natural_blur_top
+        blur_bottom = natural_blur_bottom
 
     content_x = (final_w - scaled_w) // 2
     content_y = blur_top

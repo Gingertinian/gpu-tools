@@ -621,14 +621,15 @@ def _build_gpu_filter_complex(
         logo_h = logo_w
         # Calculate position from normalized coords (0-1)
         # Center the logo at the specified position (both X and Y)
-        logo_x = int(final_w * logo_pos_x - logo_w / 2)
-        logo_y = int(final_h * logo_pos_y - logo_h / 2)
+        # FIXED: Use round() instead of int() for more accurate positioning
+        logo_x = round(final_w * logo_pos_x - logo_w / 2)
+        logo_y = round(final_h * logo_pos_y - logo_h / 2)
 
         # Clamp to valid bounds with margin
         logo_x = max(10, min(logo_x, final_w - logo_w - 10))
         logo_y = max(10, min(logo_y, final_h - logo_h - 10))
 
-        print(f"[GPU-Reframe] Logo overlay: pos=({logo_x}, {logo_y}), width={logo_w}, path={logo_path}")
+        print(f"[GPU-Reframe] Logo overlay: pos=({logo_x}, {logo_y}), width={logo_w}, normalized=({logo_pos_x}, {logo_pos_y}), path={logo_path}")
 
         parts.append(
             f"[1:v]scale={logo_w}:-1:flags=lanczos,format=yuva420p[logo]"
@@ -1042,76 +1043,78 @@ def _calculate_layout(
     """
     Calculate layout for reframe.
 
-    FIXED (2026-01-22): Blur percentages are now relative to OUTPUT FRAME height.
-    This ensures consistent visual appearance across videos with different resolutions/aspects.
+    FIXED (2026-01-22 v2): Blur percentages control distribution of blur zones.
 
-    Example: 10% top blur always creates a 192px blur zone (10% of 1920px output)
-    regardless of whether the input is 1080p, 720p, or ultrawide.
+    For horizontal videos going to vertical output:
+    - Content is scaled to fill width (maintaining aspect ratio)
+    - The remaining vertical space becomes blur zones
+    - User's blur percentages control how this space is DISTRIBUTED between top/bottom
+    - Example: top=1%, bottom=1% with equal percentages = centered content
+    - Example: top=10%, bottom=30% = content pushed toward top (more blur at bottom)
 
-    The content is scaled to fit in the remaining space after blur zones.
+    This ensures:
+    1. Consistent behavior across different video resolutions
+    2. User can fine-tune vertical position via blur percentage ratio
+    3. Small equal percentages (1%/1%) result in centered content, not pushed to top
     """
-    # Blur zones are percentage of OUTPUT frame height (consistent across all videos)
-    blur_top = int(final_h * min(top_blur_pct, 45) / 100)
-    blur_bottom = int(final_h * min(bottom_blur_pct, 45) / 100)
-
-    # Ensure even values for FFmpeg
-    blur_top = blur_top - (blur_top % 2)
-    blur_bottom = blur_bottom - (blur_bottom % 2)
-
-    # Available space for content after blur zones
-    content_space_h = final_h - blur_top - blur_bottom
-
-    # Scale content to fit: fill width, then check if height fits
+    # First, calculate natural content size (scale to fill width)
     scale = final_w / orig_w
     scaled_w = final_w
     scaled_h = int(orig_h * scale)
-
-    # If scaled content is taller than available space, shrink to fit
-    if scaled_h > content_space_h:
-        # Need to shrink content to fit in available space
-        scale = content_space_h / orig_h
-        scaled_h = content_space_h
-        scaled_w = int(orig_w * scale)
-        # Center horizontally if narrower than final width
-        scaled_w = min(scaled_w, final_w)
 
     # Ensure even dimensions
     scaled_w = scaled_w - (scaled_w % 2)
     scaled_h = scaled_h - (scaled_h % 2)
 
-    # Calculate crop from original video (how much to remove to fit)
-    # This is derived from the scaling, not user input
-    if scaled_h < int(orig_h * final_w / orig_w):
-        # Content was shrunk, calculate how much of original to crop
-        original_scaled_h = int(orig_h * final_w / orig_w)
-        total_crop = original_scaled_h - scaled_h
-        # Distribute crop proportionally based on blur percentages
-        if top_blur_pct + bottom_blur_pct > 0:
-            crop_ratio = top_blur_pct / (top_blur_pct + bottom_blur_pct)
+    # Calculate total blur space (difference between output height and content height)
+    total_blur_space = final_h - scaled_h
+
+    # No cropping needed - we want full video content visible
+    crop_top_px = 0
+    crop_bottom_px = 0
+    cropped_orig_h = orig_h
+
+    if total_blur_space > 0:
+        # We have blur space to distribute
+        if top_blur_pct > 0 or bottom_blur_pct > 0:
+            # User specified blur percentages - use them to distribute the space
+            total_pct = top_blur_pct + bottom_blur_pct
+            if total_pct > 0:
+                # Distribute blur space proportionally
+                blur_top = int(total_blur_space * top_blur_pct / total_pct)
+                blur_bottom = total_blur_space - blur_top
+            else:
+                # Both are 0, center the content
+                blur_top = total_blur_space // 2
+                blur_bottom = total_blur_space - blur_top
         else:
-            crop_ratio = 0.5
-        crop_top_px = int(total_crop * crop_ratio / (final_w / orig_w))
-        crop_bottom_px = int(total_crop * (1 - crop_ratio) / (final_w / orig_w))
+            # No blur percentages specified - center the content
+            blur_top = total_blur_space // 2
+            blur_bottom = total_blur_space - blur_top
     else:
-        crop_top_px = 0
-        crop_bottom_px = 0
+        # Content fills or exceeds frame height
+        blur_top = 0
+        blur_bottom = 0
+        # If content is taller than frame, we need to crop
+        if scaled_h > final_h:
+            # Scale down to fit height
+            scale = final_h / orig_h
+            scaled_h = final_h
+            scaled_w = int(orig_w * scale)
+            scaled_w = scaled_w - (scaled_w % 2)
 
-    # Ensure even crop values
-    crop_top_px = crop_top_px - (crop_top_px % 2)
-    crop_bottom_px = crop_bottom_px - (crop_bottom_px % 2)
+    # Ensure even values for FFmpeg
+    blur_top = blur_top - (blur_top % 2)
+    blur_bottom = blur_bottom - (blur_bottom % 2)
 
-    # Calculate cropped original height (for FFmpeg crop filter)
-    cropped_orig_h = orig_h - crop_top_px - crop_bottom_px
-    cropped_orig_h = max(cropped_orig_h, int(orig_h * 0.2))  # Minimum 20%
-
-    # Content position: centered horizontally, after top blur zone vertically
+    # Content position: centered horizontally, positioned after top blur zone
     content_x = (final_w - scaled_w) // 2
     content_y = blur_top
 
     print(f"[GPU-Reframe] Layout: input={orig_w}x{orig_h}, output={final_w}x{final_h}")
-    print(f"[GPU-Reframe] Blur zones (output %): top={top_blur_pct}%={blur_top}px, bottom={bottom_blur_pct}%={blur_bottom}px")
-    print(f"[GPU-Reframe] Content: {scaled_w}x{scaled_h} at ({content_x}, {content_y})")
-    print(f"[GPU-Reframe] Crop from original: top={crop_top_px}px, bottom={crop_bottom_px}px")
+    print(f"[GPU-Reframe] Content scaled: {scaled_w}x{scaled_h}, total blur space: {total_blur_space}px")
+    print(f"[GPU-Reframe] Blur distribution: top={top_blur_pct}%→{blur_top}px, bottom={bottom_blur_pct}%→{blur_bottom}px")
+    print(f"[GPU-Reframe] Content position: ({content_x}, {content_y})")
 
     return {
         'scaled_w': scaled_w,
@@ -1167,14 +1170,15 @@ def _apply_logo_to_image(
         # FIXED: Calculate position from normalized coordinates
         # logo_pos_x: 0.5 = center, 0 = left edge, 1 = right edge
         # logo_pos_y: 0.5 = center, 0 = top, 1 = bottom (logo is centered at this position)
-        x = int(final_w * logo_pos_x - logo_w / 2)
-        y = int(final_h * logo_pos_y - logo_h / 2)  # FIXED: Center logo vertically too
+        # FIXED: Use round() instead of int() for more accurate positioning
+        x = round(final_w * logo_pos_x - logo_w / 2)
+        y = round(final_h * logo_pos_y - logo_h / 2)
 
         # Clamp to valid bounds
         x = max(0, min(x, final_w - logo_w))
         y = max(0, min(y, final_h - logo_h))
 
-        print(f"[GPU-Reframe] Placing logo at ({x}, {y}), size {logo_w}x{logo_h}")
+        print(f"[GPU-Reframe] Placing logo at ({x}, {y}), size {logo_w}x{logo_h}, pos=({logo_pos_x}, {logo_pos_y})")
 
         # Apply with alpha blending if available
         if logo.shape[-1] == 4:
@@ -1182,7 +1186,8 @@ def _apply_logo_to_image(
             logo_rgb = logo[:, :, :3]
 
             roi = img[y:y+logo_h, x:x+logo_w]
-            blended = (logo_rgb * alpha + roi * (1 - alpha)).astype(np.uint8)
+            # FIXED: Add np.clip to prevent overflow artifacts
+            blended = np.clip(logo_rgb * alpha + roi * (1 - alpha), 0, 255).astype(np.uint8)
             img[y:y+logo_h, x:x+logo_w] = blended
         else:
             img[y:y+logo_h, x:x+logo_w] = logo

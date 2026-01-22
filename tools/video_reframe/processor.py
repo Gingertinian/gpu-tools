@@ -1641,19 +1641,30 @@ def _apply_logo(frame: np.ndarray, logo_data: dict, frame_w: int, frame_h: int):
 
     # Get position from config, default to center-bottom (0.5, 0.85)
     position = logo_data.get('position', (0.5, 0.85))
-    pos_x, pos_y = position if isinstance(position, (list, tuple)) else (0.5, 0.85)
+
+    # Robust type validation for position
+    if isinstance(position, (list, tuple)) and len(position) >= 2:
+        try:
+            pos_x = float(position[0])
+            pos_y = float(position[1])
+        except (ValueError, TypeError):
+            pos_x, pos_y = 0.5, 0.85
+    else:
+        pos_x, pos_y = 0.5, 0.85
 
     # Convert normalized position to pixel coordinates
     # Position is the CENTER of the logo
-    x = int(pos_x * frame_w - lw / 2)
-    y = int(pos_y * frame_h - lh / 2)
+    # FIXED: Use round() instead of int() for more accurate positioning
+    x = round(pos_x * frame_w - lw / 2)
+    y = round(pos_y * frame_h - lh / 2)
 
     # Clamp to frame bounds
-    x = max(0, min(frame_w - lw, x))
-    y = max(0, min(frame_h - lh, y))
+    x = max(0, min(x, frame_w - lw))
+    y = max(0, min(y, frame_h - lh))
 
     roi = frame[y:y + lh, x:x + lw]
-    blended = (alpha_3d * logo + (1 - alpha_3d) * roi).astype(np.uint8)
+    # FIXED: Add np.clip to prevent overflow artifacts in alpha blending
+    blended = np.clip(alpha_3d * logo + (1 - alpha_3d) * roi, 0, 255).astype(np.uint8)
     frame[y:y + lh, x:x + lw] = blended
 
 

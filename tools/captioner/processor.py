@@ -737,8 +737,21 @@ def process_captioner(
     """
     import shutil
 
+    # Debug: Print raw config BEFORE normalization
+    print(f"[Captioner] RAW config keys: {list(config.keys())}")
+    print(f"[Captioner] RAW text: {repr(config.get('text', 'NOT FOUND'))}")
+    print(f"[Captioner] RAW captions: {repr(config.get('captions', 'NOT FOUND'))}")
+    print(f"[Captioner] RAW caption_mode: {repr(config.get('caption_mode', 'NOT FOUND'))}")
+    print(f"[Captioner] RAW captionMode: {repr(config.get('captionMode', 'NOT FOUND'))}")
+
     # Normalize config keys (snake_case -> camelCase)
     config = normalize_config(config)
+
+    # Debug: Print config AFTER normalization
+    print(f"[Captioner] NORMALIZED config keys: {list(config.keys())}")
+    print(f"[Captioner] NORMALIZED text: {repr(config.get('text', 'NOT FOUND'))}")
+    print(f"[Captioner] NORMALIZED captions: {repr(config.get('captions', 'NOT FOUND'))}")
+    print(f"[Captioner] NORMALIZED captionMode: {repr(config.get('captionMode', 'NOT FOUND'))}")
 
     def report_progress(progress: float, message: str = ""):
         if progress_callback:
@@ -755,7 +768,13 @@ def process_captioner(
     # Debug logging for batch mode troubleshooting
     caption_mode = config.get('captionMode', 'single')
     captions = config.get('captions', [])
-    print(f"[Captioner] Mode: {caption_mode}, imageIndex: {image_index}, captions count: {len(captions)}")
+    text = config.get('text', '')
+    print(f"[Captioner] Mode: {caption_mode}, imageIndex: {image_index}, captions count: {len(captions)}, text: {repr(text[:50] if text else '')}")
+
+    # Debug: Show actual caption that will be used
+    actual_caption = get_caption_for_index(config, image_index)
+    print(f"[Captioner] ACTUAL caption to render: {repr(actual_caption[:100] if actual_caption else 'EMPTY')}")
+
     if caption_mode == 'batch' and captions:
         print(f"[Captioner] Using caption {image_index % len(captions)}: {captions[image_index % len(captions)][:50]}...")
 

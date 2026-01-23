@@ -537,31 +537,63 @@ def process_single_video_caption_worker(args: Tuple) -> Dict[str, Any]:
         height = int(video_stream.get('height', 1080))
         duration = float(video_info.get('format', {}).get('duration', 0))
 
-        # Build caption filter (simplified for parallel processing)
-        text = config.get('text', '')
+        # Get caption text - support batch mode with cycling
+        text = get_caption_for_index(config, video_index)
+
+        # Config values
         position = config.get('position', 'bottom')
         font_size = config.get('fontSize', 48)
         color = config.get('textColor', config.get('color', '#FFFFFF'))
         stroke_color = config.get('strokeColor', '#000000')
         stroke_width = config.get('strokeWidth', 2)
+        shadow = config.get('shadow', False)
 
-        # Position calculations
+        # Get font path - use TikTok font by default
+        font_name = config.get('font', 'TikTokBold.otf')
+        font_path = FONT_MAP.get(font_name, FONT_MAP.get('default', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'))
+
+        # Position calculations - support custom position with normalized coords
         if position == 'top':
-            y_expr = '20'
+            y_expr = f"{int(height * 0.15)}"
         elif position == 'center':
             y_expr = '(h-text_h)/2'
         elif position == 'bottom':
-            y_expr = 'h-text_h-20'
+            y_expr = f"{int(height * 0.85)}-text_h"
+        elif position == 'custom':
+            # Custom position uses normalized coords (0-1)
+            pos_x = config.get('positionX', 0.5)
+            pos_y = config.get('positionY', 0.5)
+            y_expr = f"{int(height * pos_y)}-text_h/2"
         else:
-            y_expr = 'h-text_h-20'
+            y_expr = f"{int(height * 0.85)}-text_h"
 
-        # Escape text for FFmpeg
+        # Escape text for FFmpeg (handle special characters)
         text_escaped = text.replace('\\', '\\\\').replace("'", "\\'").replace(':', '\\:').replace('%', '%%')
+        # Handle ##Title## format - remove for video (simpler rendering)
+        text_escaped = text_escaped.replace('##', '').replace('&&&', ' ')
 
-        # Build drawtext filter
-        drawtext = f"drawtext=text='{text_escaped}':fontsize={font_size}:fontcolor={color}:x=(w-text_w)/2:y={y_expr}"
+        # Build drawtext filter with fontfile
+        drawtext_parts = [
+            f"text='{text_escaped}'",
+            f"fontfile='{font_path}'",
+            f"fontsize={font_size}",
+            f"fontcolor={color}",
+            f"x=(w-text_w)/2",
+            f"y={y_expr}"
+        ]
+
+        # Add stroke/border
         if stroke_color and stroke_width > 0:
-            drawtext += f":borderw={stroke_width}:bordercolor={stroke_color}"
+            drawtext_parts.append(f"borderw={stroke_width}")
+            drawtext_parts.append(f"bordercolor={stroke_color}")
+
+        # Add shadow
+        if shadow:
+            drawtext_parts.append("shadowcolor=black@0.5")
+            drawtext_parts.append("shadowx=2")
+            drawtext_parts.append("shadowy=2")
+
+        drawtext = f"drawtext={':'.join(drawtext_parts)}"
 
         # FFmpeg command with GPU selection
         # -gpu flag specifies which GPU to use for h264_nvenc encoding
@@ -576,10 +608,23 @@ def process_single_video_caption_worker(args: Tuple) -> Dict[str, Any]:
             output_path
         ]
 
+        print(f"[Video Caption Worker] GPU {gpu_id}, video {video_index}: '{text[:50]}...' with font {font_path}")
         process = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
 
         if process.returncode != 0:
-            return {'status': 'failed', 'index': video_index, 'gpu_id': gpu_id, 'error': process.stderr[-500:]}
+            # Try fallback to CPU encoding if NVENC fails
+            print(f"[Video Caption Worker] NVENC failed, trying CPU fallback: {process.stderr[-200:]}")
+            cmd_cpu = [
+                'ffmpeg', '-y',
+                '-i', input_path,
+                '-vf', drawtext,
+                '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
+                '-c:a', 'aac', '-b:a', '128k',
+                output_path
+            ]
+            process = subprocess.run(cmd_cpu, capture_output=True, text=True, timeout=600)
+            if process.returncode != 0:
+                return {'status': 'failed', 'index': video_index, 'gpu_id': gpu_id, 'error': process.stderr[-500:]}
 
         return {'status': 'completed', 'index': video_index, 'output_path': output_path, 'duration': duration, 'gpu_id': gpu_id}
 

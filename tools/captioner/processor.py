@@ -809,7 +809,7 @@ def process_captioner(
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
     if is_video:
-        return process_video_caption(input_path, output_path, config, report_progress)
+        return process_video_caption(input_path, output_path, config, report_progress, image_index)
     else:
         return process_image_caption(input_path, output_path, config, report_progress, image_index)
 
@@ -898,12 +898,14 @@ def process_video_caption(
     input_path: str,
     output_path: str,
     config: Dict[str, Any],
-    report_progress: Callable[[float, str], None]
+    report_progress: Callable[[float, str], None],
+    image_index: int = 0
 ) -> Dict[str, Any]:
     """
     Add caption to video using FFmpeg drawtext filter.
 
     Supports GPU selection via config['gpuId'] parameter for multi-GPU systems.
+    Supports batch mode: in batch mode, cycles through captions array using image_index.
     """
 
     report_progress(0.1, "Analyzing video...")
@@ -916,13 +918,13 @@ def process_video_caption(
 
     report_progress(0.2, "Building caption filter...")
 
-    # Extract config
-    text = config.get('text', '')
+    # Extract config - support both frontend keys (font, textColor) and legacy keys (fontFamily, color)
+    text = get_caption_for_index(config, image_index)  # Support batch mode
     position = config.get('position', 'bottom')
     font_size = config.get('fontSize', 48)
-    font_family = config.get('fontFamily', 'Arial')
+    font_name = config.get('font', config.get('fontFamily', 'TikTokBold.otf'))  # frontend sends 'font'
     font_weight = config.get('fontWeight', 'normal')
-    color = config.get('color', '#FFFFFF')
+    color = config.get('textColor', config.get('color', '#FFFFFF'))  # frontend sends 'textColor'
     bg_color = config.get('backgroundColor')
     bg_opacity = config.get('backgroundOpacity', 80) / 100
     stroke_color = config.get('strokeColor', '#000000')
@@ -936,12 +938,13 @@ def process_video_caption(
     # GPU selection for multi-GPU systems (default to GPU 0)
     gpu_id = config.get('gpuId', config.get('gpu_id', 0))
 
-    # Get font path
-    font_key = f"{font_family} Bold" if font_weight == 'bold' else font_family
-    font_path = FONT_MAP.get(font_key, FONT_MAP.get(font_family, FONT_MAP['default']))
+    # Get font path - check FONT_MAP with font name directly (e.g., 'TikTokBold.otf')
+    font_path = FONT_MAP.get(font_name, FONT_MAP.get('default', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'))
 
-    if font_weight == 'bold' and font_key not in FONT_MAP:
-        font_path = FONT_MAP.get('default-bold', FONT_MAP['default'])
+    # Fallback: try with bold suffix if font_weight is bold
+    if font_weight == 'bold' and font_name not in FONT_MAP:
+        font_key = f"{font_name} Bold"
+        font_path = FONT_MAP.get(font_key, FONT_MAP.get('default-bold', font_path))
 
     # Escape text for FFmpeg
     text_escaped = escape_ffmpeg_text(text)

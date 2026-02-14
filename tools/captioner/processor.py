@@ -34,20 +34,23 @@ import subprocess
 import tempfile
 import zipfile
 from typing import Callable, Optional, Dict, Any, List, Tuple
+from io import BytesIO
+from urllib.parse import quote as url_quote
 from PIL import Image, ImageDraw, ImageFont
 import json
 import textwrap
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
 
 # Video extensions
-VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.webm', '.mkv', '.m4v'}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".webm", ".mkv", ".m4v"}
 
 # NVENC session limits by GPU type
 NVENC_SESSION_LIMITS = {
-    'consumer': 3,
-    'datacenter': 10,
-    'default': 2,
+    "consumer": 3,
+    "datacenter": 10,
+    "default": 2,
 }
 
 
@@ -64,22 +67,40 @@ def get_gpu_info() -> Dict[str, Any]:
             - gpu_type: Type of first GPU (for backwards compatibility)
             - nvenc_sessions: Sessions per GPU (for backwards compatibility)
     """
-    datacenter_keywords = ['A100', 'A6000', 'A5000', 'A4000', 'A4500', 'A40', 'A30', 'A10',
-                           'V100', 'T4', 'Quadro', 'Tesla', 'H100', 'L40', 'RTX 4090', 'RTX 6000']
+    datacenter_keywords = [
+        "A100",
+        "A6000",
+        "A5000",
+        "A4000",
+        "A4500",
+        "A40",
+        "A30",
+        "A10",
+        "V100",
+        "T4",
+        "Quadro",
+        "Tesla",
+        "H100",
+        "L40",
+        "RTX 4090",
+        "RTX 6000",
+    ]
 
     try:
         result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=index,name', '--format=csv,noheader'],
-            capture_output=True, text=True, timeout=10
+            ["nvidia-smi", "--query-gpu=index,name", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if result.returncode == 0:
-            lines = result.stdout.strip().split('\n')
+            lines = result.stdout.strip().split("\n")
             gpus = []
 
             for line in lines:
                 if not line.strip():
                     continue
-                parts = line.split(', ', 1)
+                parts = line.split(", ", 1)
                 if len(parts) >= 2:
                     gpu_index = int(parts[0].strip())
                     gpu_name = parts[1].strip()
@@ -88,43 +109,52 @@ def get_gpu_info() -> Dict[str, Any]:
                     gpu_name = line.strip()
 
                 is_datacenter = any(kw in gpu_name for kw in datacenter_keywords)
-                gpu_type = 'datacenter' if is_datacenter else 'consumer'
+                gpu_type = "datacenter" if is_datacenter else "consumer"
 
-                gpus.append({
-                    'index': gpu_index,
-                    'name': gpu_name,
-                    'type': gpu_type,
-                    'nvenc_sessions': NVENC_SESSION_LIMITS[gpu_type]
-                })
+                gpus.append(
+                    {
+                        "index": gpu_index,
+                        "name": gpu_name,
+                        "type": gpu_type,
+                        "nvenc_sessions": NVENC_SESSION_LIMITS[gpu_type],
+                    }
+                )
 
             if gpus:
-                total_sessions = sum(g['nvenc_sessions'] for g in gpus)
+                total_sessions = sum(g["nvenc_sessions"] for g in gpus)
                 return {
-                    'gpu_count': len(gpus),
-                    'gpus': gpus,
-                    'total_nvenc_sessions': total_sessions,
+                    "gpu_count": len(gpus),
+                    "gpus": gpus,
+                    "total_nvenc_sessions": total_sessions,
                     # Backwards compatibility (first GPU)
-                    'gpu_name': gpus[0]['name'],
-                    'gpu_type': gpus[0]['type'],
-                    'nvenc_sessions': gpus[0]['nvenc_sessions']
+                    "gpu_name": gpus[0]["name"],
+                    "gpu_type": gpus[0]["type"],
+                    "nvenc_sessions": gpus[0]["nvenc_sessions"],
                 }
     except Exception as e:
         print(f"[GPU Detection] Error: {e}")
 
     return {
-        'gpu_count': 1,
-        'gpus': [{'index': 0, 'name': 'Unknown', 'type': 'default', 'nvenc_sessions': NVENC_SESSION_LIMITS['default']}],
-        'total_nvenc_sessions': NVENC_SESSION_LIMITS['default'],
-        'gpu_name': 'Unknown',
-        'gpu_type': 'default',
-        'nvenc_sessions': NVENC_SESSION_LIMITS['default']
+        "gpu_count": 1,
+        "gpus": [
+            {
+                "index": 0,
+                "name": "Unknown",
+                "type": "default",
+                "nvenc_sessions": NVENC_SESSION_LIMITS["default"],
+            }
+        ],
+        "total_nvenc_sessions": NVENC_SESSION_LIMITS["default"],
+        "gpu_name": "Unknown",
+        "gpu_type": "default",
+        "nvenc_sessions": NVENC_SESSION_LIMITS["default"],
     }
 
 
 def extract_videos_from_zip(zip_path: str, extract_dir: str) -> List[str]:
     """Extract video files from a ZIP archive."""
     video_paths = []
-    with zipfile.ZipFile(zip_path, 'r') as zf:
+    with zipfile.ZipFile(zip_path, "r") as zf:
         for name in zf.namelist():
             ext = os.path.splitext(name)[1].lower()
             if ext in VIDEO_EXTENSIONS:
@@ -132,14 +162,18 @@ def extract_videos_from_zip(zip_path: str, extract_dir: str) -> List[str]:
                 video_paths.append(extracted_path)
     return video_paths
 
+
 # MediaPipe for face detection
 try:
     import mediapipe as mp
+
     # Verify mp.solutions exists (newer versions may have changed API)
-    if hasattr(mp, 'solutions') and hasattr(mp.solutions, 'face_detection'):
+    if hasattr(mp, "solutions") and hasattr(mp.solutions, "face_detection"):
         MEDIAPIPE_AVAILABLE = True
     else:
-        print("[Captioner] MediaPipe installed but mp.solutions.face_detection not available")
+        print(
+            "[Captioner] MediaPipe installed but mp.solutions.face_detection not available"
+        )
         MEDIAPIPE_AVAILABLE = False
         mp = None
 except ImportError:
@@ -150,24 +184,31 @@ except ImportError:
 # Font mapping (RunPod will have these installed)
 # TikTok fonts are bundled in /app/fonts/
 FONT_MAP = {
-    'Arial': '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
-    'Arial Bold': '/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf',
-    'Arial.ttf': '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
-    'Impact': '/usr/share/fonts/truetype/msttcorefonts/Impact.ttf',
-    'Impact.ttf': '/usr/share/fonts/truetype/msttcorefonts/Impact.ttf',
-    'Roboto': '/usr/share/fonts/truetype/roboto/Roboto-Regular.ttf',
-    'Roboto Bold': '/usr/share/fonts/truetype/roboto/Roboto-Bold.ttf',
+    "Arial": "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "Arial Bold": "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "Arial.ttf": "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "Impact": "/usr/share/fonts/truetype/msttcorefonts/Impact.ttf",
+    "Impact.ttf": "/usr/share/fonts/truetype/msttcorefonts/Impact.ttf",
+    "Roboto": "/usr/share/fonts/truetype/roboto/Roboto-Regular.ttf",
+    "Roboto Bold": "/usr/share/fonts/truetype/roboto/Roboto-Bold.ttf",
     # TikTok fonts (bundled in Docker)
-    'TikTokBold.otf': '/app/fonts/TikTokBold.otf',
-    'LightItalic.otf': '/app/fonts/LightItalic.otf',
-    'tiktok': '/app/fonts/TikTokBold.otf',
-    'tiktok-bold': '/app/fonts/TikTokBold.otf',
-    'tiktok-italic': '/app/fonts/LightItalic.otf',
+    "TikTokBold.otf": "/app/fonts/TikTokBold.otf",
+    "LightItalic.otf": "/app/fonts/LightItalic.otf",
+    "tiktok": "/app/fonts/TikTokBold.otf",
+    "tiktok-bold": "/app/fonts/TikTokBold.otf",
+    "tiktok-italic": "/app/fonts/LightItalic.otf",
     # Fallbacks
-    'default': '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
-    'default-bold': '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
-    'default-italic': '/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf'
+    "default": "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "default-bold": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "default-italic": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
 }
+
+LANCZOS_RESAMPLE = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+
+APPLE_EMOJI_CDN = os.getenv("CAPTIONER_EMOJI_CDN", "https://emojicdn.elk.sh")
+APPLE_EMOJI_STYLE = os.getenv("CAPTIONER_EMOJI_STYLE", "apple")
+EMOJI_REQUEST_TIMEOUT_SECONDS = float(os.getenv("CAPTIONER_EMOJI_TIMEOUT", "4"))
+_emoji_cache: Dict[Tuple[str, int], Image.Image] = {}
 
 
 import re
@@ -176,10 +217,11 @@ import random
 
 # ==================== CONFIG NORMALIZATION ====================
 
+
 def snake_to_camel(s: str) -> str:
     """Convert snake_case to camelCase."""
-    components = s.split('_')
-    return components[0] + ''.join(x.title() for x in components[1:])
+    components = s.split("_")
+    return components[0] + "".join(x.title() for x in components[1:])
 
 
 def normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -197,42 +239,43 @@ def normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
     # Map of snake_case -> camelCase for known keys
     key_map = {
-        'caption_mode': 'captionMode',
-        'image_index': 'imageIndex',
-        'avoid_faces': 'avoidFaces',
-        'font_size': 'fontSize',
-        'title_font_size': 'titleFontSize',
-        'stroke_width': 'strokeWidth',
-        'text_color': 'textColor',
-        'show_background': 'showBackground',
-        'background_color': 'backgroundColor',
-        'background_opacity': 'backgroundOpacity',
-        'stroke_color': 'strokeColor',
-        'text_width_ratio': 'textWidthRatio',
-        'block_spacing': 'blockSpacing',
-        'line_spacing': 'lineSpacing',
-        'random_tilt': 'randomTilt',
-        'tilt_range_min': 'tiltRangeMin',
-        'tilt_range_max': 'tiltRangeMax',
-        'position_x': 'positionX',
-        'position_y': 'positionY',
-        'custom_x': 'customX',
-        'custom_y': 'customY',
-        'center_every_enabled': 'centerEveryEnabled',
-        'center_every_n': 'centerEveryN',
-        'font_family': 'fontFamily',
-        'font_weight': 'fontWeight',
-        'start_time': 'startTime',
-        'end_time': 'endTime',
-        'max_width': 'maxWidth',
-        'apply_position_for_all': 'applyPositionForAll',
+        "caption_mode": "captionMode",
+        "image_index": "imageIndex",
+        "avoid_faces": "avoidFaces",
+        "font_size": "fontSize",
+        "title_font_size": "titleFontSize",
+        "stroke_width": "strokeWidth",
+        "text_color": "textColor",
+        "show_background": "showBackground",
+        "background_color": "backgroundColor",
+        "background_opacity": "backgroundOpacity",
+        "stroke_color": "strokeColor",
+        "text_width_ratio": "textWidthRatio",
+        "block_spacing": "blockSpacing",
+        "line_spacing": "lineSpacing",
+        "random_tilt": "randomTilt",
+        "tilt_range_min": "tiltRangeMin",
+        "tilt_range_max": "tiltRangeMax",
+        "position_x": "positionX",
+        "position_y": "positionY",
+        "custom_x": "customX",
+        "custom_y": "customY",
+        "center_every_enabled": "centerEveryEnabled",
+        "center_every_n": "centerEveryN",
+        "emoji_style": "emojiStyle",
+        "font_family": "fontFamily",
+        "font_weight": "fontWeight",
+        "start_time": "startTime",
+        "end_time": "endTime",
+        "max_width": "maxWidth",
+        "apply_position_for_all": "applyPositionForAll",
     }
 
     for key, value in config.items():
         # Check if it's a known snake_case key
         if key in key_map:
             normalized[key_map[key]] = value
-        elif '_' in key:
+        elif "_" in key:
             # Convert unknown snake_case to camelCase
             normalized[snake_to_camel(key)] = value
         else:
@@ -244,6 +287,7 @@ def normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
 # ==================== TEXT UTILITIES ====================
 
+
 def replace_quotes(text: str) -> str:
     """Replace straight quotes with curly quotes for better typography."""
     if not text:
@@ -251,17 +295,292 @@ def replace_quotes(text: str) -> str:
     text = str(text)
     in_double = False
     in_single = False
-    res = ''
+    res = ""
     for char in text:
         if char == '"':
             res += '"' if not in_double else '"'
             in_double = not in_double
         elif char == "'":
-            res += ''' if not in_single else '''
+            res += """ if not in_single else """
             in_single = not in_single
         else:
             res += char
     return res
+
+
+def safe_debug_repr(value: Any) -> str:
+    """Return an ASCII-safe representation for debug logs."""
+    try:
+        return ascii(value)
+    except Exception:
+        return "<unprintable>"
+
+
+def is_regional_indicator(codepoint: int) -> bool:
+    return 0x1F1E6 <= codepoint <= 0x1F1FF
+
+
+def is_skin_tone_modifier(codepoint: int) -> bool:
+    return 0x1F3FB <= codepoint <= 0x1F3FF
+
+
+def is_emoji_codepoint(codepoint: int) -> bool:
+    emoji_ranges = [
+        (0x1F300, 0x1FAFF),
+        (0x2600, 0x27BF),
+        (0xFE00, 0xFE0F),
+    ]
+    for start, end in emoji_ranges:
+        if start <= codepoint <= end:
+            return True
+    return False
+
+
+def consume_emoji_cluster(text: str, start_index: int) -> Tuple[Optional[str], int]:
+    if start_index >= len(text):
+        return None, start_index
+
+    first_cp = ord(text[start_index])
+
+    if is_regional_indicator(first_cp):
+        if start_index + 1 < len(text) and is_regional_indicator(
+            ord(text[start_index + 1])
+        ):
+            return text[start_index : start_index + 2], start_index + 2
+        return text[start_index], start_index + 1
+
+    if not is_emoji_codepoint(first_cp):
+        return None, start_index
+
+    cluster_chars = [text[start_index]]
+    i = start_index + 1
+
+    while i < len(text):
+        cp = ord(text[i])
+
+        if cp in (0xFE0F, 0x20E3) or is_skin_tone_modifier(cp):
+            cluster_chars.append(text[i])
+            i += 1
+            continue
+
+        if cp == 0x200D:
+            cluster_chars.append(text[i])
+            i += 1
+            if i < len(text):
+                cluster_chars.append(text[i])
+                i += 1
+            continue
+
+        break
+
+    return "".join(cluster_chars), i
+
+
+def tokenize_caption_text(text: str) -> List[Tuple[str, str]]:
+    tokens: List[Tuple[str, str]] = []
+    buffer = ""
+    i = 0
+
+    while i < len(text):
+        emoji_cluster, next_i = consume_emoji_cluster(text, i)
+        if emoji_cluster:
+            if buffer:
+                tokens.append(("text", buffer))
+                buffer = ""
+            tokens.append(("emoji", emoji_cluster))
+            i = next_i
+            continue
+
+        buffer += text[i]
+        i += 1
+
+    if buffer:
+        tokens.append(("text", buffer))
+
+    return tokens
+
+
+def get_font_line_height(font: Any) -> int:
+    try:
+        ascent, descent = font.getmetrics()
+        return max(1, int(ascent + descent))
+    except Exception:
+        bbox = font.getbbox("Ag")
+        return max(1, int(bbox[3] - bbox[1]))
+
+
+def estimate_emoji_size(font: Any) -> int:
+    font_size = int(getattr(font, "size", 48) or 48)
+    return max(12, int(font_size * 1.05))
+
+
+def measure_text_width(text: str, font: Any, emoji_size: Optional[int] = None) -> float:
+    if not text:
+        return 0.0
+
+    effective_emoji_size = emoji_size or estimate_emoji_size(font)
+    emoji_gap = max(1, int(effective_emoji_size * 0.08))
+    width = 0.0
+
+    for token_type, token_value in tokenize_caption_text(text):
+        if token_type == "text":
+            width += float(font.getlength(token_value))
+        else:
+            width += float(effective_emoji_size + emoji_gap)
+
+    return width
+
+
+def wrap_text_mixed(text: str, font: Any, max_width: int) -> str:
+    if not text:
+        return ""
+
+    wrapped_lines: List[str] = []
+    emoji_size = estimate_emoji_size(font)
+
+    for paragraph in str(text).split("\n"):
+        if paragraph == "":
+            wrapped_lines.append("")
+            continue
+
+        words = paragraph.split(" ")
+        current_line = words[0]
+
+        for word in words[1:]:
+            candidate = f"{current_line} {word}"
+            if measure_text_width(candidate, font, emoji_size) <= max_width:
+                current_line = candidate
+            else:
+                wrapped_lines.append(current_line)
+                current_line = word
+
+        wrapped_lines.append(current_line)
+
+    return "\n".join(wrapped_lines)
+
+
+def get_ios_emoji_image(emoji_text: str, size: int) -> Optional[Image.Image]:
+    cache_key = (emoji_text, size)
+    cached = _emoji_cache.get(cache_key)
+    if cached is not None:
+        return cached.copy()
+
+    encoded = url_quote(emoji_text, safe="")
+    url = f"{APPLE_EMOJI_CDN}/{encoded}?style={APPLE_EMOJI_STYLE}"
+
+    try:
+        response = requests.get(url, timeout=EMOJI_REQUEST_TIMEOUT_SECONDS)
+        if response.status_code != 200 or not response.content:
+            return None
+
+        image = Image.open(BytesIO(response.content)).convert("RGBA")
+        if image.size != (size, size):
+            image = image.resize((size, size), LANCZOS_RESAMPLE)
+
+        _emoji_cache[cache_key] = image
+        return image.copy()
+    except Exception:
+        return None
+
+
+def _draw_caption_tokens(
+    base_image: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    tokens: List[Tuple[str, str]],
+    x: float,
+    y: float,
+    font: ImageFont.ImageFont,
+    fill: Tuple[int, int, int, int],
+    emoji_size: int,
+    emoji_style: str,
+    draw_emojis: bool,
+) -> None:
+    cursor_x = float(x)
+    line_height = get_font_line_height(font)
+    emoji_gap = max(1, int(emoji_size * 0.08))
+
+    for token_type, token_value in tokens:
+        if token_type == "text":
+            draw.text((cursor_x, y), token_value, font=font, fill=fill)
+            cursor_x += float(font.getlength(token_value))
+            continue
+
+        if draw_emojis and emoji_style == "ios":
+            emoji_image = get_ios_emoji_image(token_value, emoji_size)
+            if emoji_image is not None:
+                emoji_y = int(round(y + max(0, (line_height - emoji_size) / 2)))
+                base_image.paste(
+                    emoji_image, (int(round(cursor_x)), emoji_y), emoji_image
+                )
+            else:
+                draw.text((cursor_x, y), token_value, font=font, fill=fill)
+
+        cursor_x += float(emoji_size + emoji_gap)
+
+
+def draw_mixed_text_line(
+    base_image: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    x: float,
+    y: float,
+    font: ImageFont.ImageFont,
+    text_color: Tuple[int, int, int, int],
+    emoji_style: str,
+    stroke_color: Optional[Tuple[int, int, int, int]] = None,
+    stroke_width: int = 0,
+    shadow: bool = False,
+) -> None:
+    tokens = tokenize_caption_text(text)
+    if not tokens:
+        return
+
+    emoji_size = estimate_emoji_size(font)
+
+    if shadow:
+        _draw_caption_tokens(
+            base_image=base_image,
+            draw=draw,
+            tokens=tokens,
+            x=x + 2,
+            y=y + 2,
+            font=font,
+            fill=(0, 0, 0, 128),
+            emoji_size=emoji_size,
+            emoji_style=emoji_style,
+            draw_emojis=False,
+        )
+
+    if stroke_color and stroke_width > 0:
+        for dx in range(-stroke_width, stroke_width + 1):
+            for dy in range(-stroke_width, stroke_width + 1):
+                if dx == 0 and dy == 0:
+                    continue
+                _draw_caption_tokens(
+                    base_image=base_image,
+                    draw=draw,
+                    tokens=tokens,
+                    x=x + dx,
+                    y=y + dy,
+                    font=font,
+                    fill=stroke_color,
+                    emoji_size=emoji_size,
+                    emoji_style=emoji_style,
+                    draw_emojis=False,
+                )
+
+    _draw_caption_tokens(
+        base_image=base_image,
+        draw=draw,
+        tokens=tokens,
+        x=x,
+        y=y,
+        font=font,
+        fill=text_color,
+        emoji_size=emoji_size,
+        emoji_style=emoji_style,
+        draw_emojis=True,
+    )
 
 
 # ==================== FACE DETECTION ====================
@@ -273,11 +592,16 @@ _face_detector = None
 def get_face_detector():
     """Lazy load MediaPipe face detector."""
     global _face_detector
-    if _face_detector is None and MEDIAPIPE_AVAILABLE:
-        mp_face_detection = mp.solutions.face_detection
+    if _face_detector is None and MEDIAPIPE_AVAILABLE and mp is not None:
+        mp_solutions = getattr(mp, "solutions", None)
+        mp_face_detection = (
+            getattr(mp_solutions, "face_detection", None) if mp_solutions else None
+        )
+        if mp_face_detection is None:
+            return _face_detector
         _face_detector = mp_face_detection.FaceDetection(
             model_selection=1,  # 0=short range (2m), 1=full range (5m)
-            min_detection_confidence=0.5
+            min_detection_confidence=0.5,
         )
     return _face_detector
 
@@ -305,7 +629,7 @@ def detect_faces(image: Image.Image) -> List[Dict[str, Any]]:
         return []
 
     # Convert PIL to RGB numpy array
-    img_rgb = image.convert('RGB')
+    img_rgb = image.convert("RGB")
     img_np = np.array(img_rgb)
 
     # Process with MediaPipe
@@ -315,13 +639,15 @@ def detect_faces(image: Image.Image) -> List[Dict[str, Any]]:
     if results.detections:
         for detection in results.detections:
             bbox = detection.location_data.relative_bounding_box
-            faces.append({
-                'x': bbox.xmin,
-                'y': bbox.ymin,
-                'width': bbox.width,
-                'height': bbox.height,
-                'confidence': detection.score[0] if detection.score else 0.5
-            })
+            faces.append(
+                {
+                    "x": bbox.xmin,
+                    "y": bbox.ymin,
+                    "width": bbox.width,
+                    "height": bbox.height,
+                    "confidence": detection.score[0] if detection.score else 0.5,
+                }
+            )
 
     return faces
 
@@ -334,7 +660,7 @@ def get_face_safe_position(
     image_height: int,
     preferred_position: str,
     preferred_alignment: str,
-    config: Dict[str, Any]
+    config: Dict[str, Any],
 ) -> Tuple[str, float, str]:
     """
     Calculate a caption position and alignment that avoids faces.
@@ -355,7 +681,11 @@ def get_face_safe_position(
     """
     if not faces:
         # No faces, use preferred position and alignment
-        return preferred_position, get_y_ratio_for_position(preferred_position, config), preferred_alignment
+        return (
+            preferred_position,
+            get_y_ratio_for_position(preferred_position, config),
+            preferred_alignment,
+        )
 
     # Safety margin around faces (30% of face size, similar to original)
     FACE_MARGIN = 0.30
@@ -366,17 +696,17 @@ def get_face_safe_position(
 
     # Define Y zones (positions as ratios, with safe margins from edges)
     y_zones = {
-        'top': 0.15,     # 15% from top (safe margin)
-        'center': 0.50,  # True center
-        'bottom': 0.82,  # 18% from bottom (safe margin)
+        "top": 0.15,  # 15% from top (safe margin)
+        "center": 0.50,  # True center
+        "bottom": 0.82,  # 18% from bottom (safe margin)
     }
 
     # Define X positions for each alignment
     def get_x_bounds(alignment: str) -> Tuple[float, float]:
         """Get left and right of caption as ratios (0-1) for alignment."""
-        if alignment == 'left':
+        if alignment == "left":
             return 0.05, 0.05 + caption_width_ratio
-        elif alignment == 'right':
+        elif alignment == "right":
             return 0.95 - caption_width_ratio, 0.95
         else:  # center
             half_width = caption_width_ratio / 2
@@ -385,7 +715,9 @@ def get_face_safe_position(
     def get_y_bounds(y_center_ratio: float) -> Tuple[float, float]:
         """Get top and bottom of caption as ratios (0-1)."""
         half_height = caption_ratio / 2
-        return max(0, y_center_ratio - half_height), min(1, y_center_ratio + half_height)
+        return max(0, y_center_ratio - half_height), min(
+            1, y_center_ratio + half_height
+        )
 
     def overlaps_face(y_ratio: float, alignment: str) -> bool:
         """Check if caption at this position/alignment overlaps any face."""
@@ -394,10 +726,10 @@ def get_face_safe_position(
 
         for face in faces:
             # Expand face rect with safety margin
-            face_left = face['x'] - face['width'] * FACE_MARGIN
-            face_right = face['x'] + face['width'] * (1 + FACE_MARGIN)
-            face_top = face['y'] - face['height'] * FACE_MARGIN
-            face_bottom = face['y'] + face['height'] * (1 + FACE_MARGIN)
+            face_left = face["x"] - face["width"] * FACE_MARGIN
+            face_right = face["x"] + face["width"] * (1 + FACE_MARGIN)
+            face_top = face["y"] - face["height"] * FACE_MARGIN
+            face_bottom = face["y"] + face["height"] * (1 + FACE_MARGIN)
 
             # Check 2D overlap
             horizontal_overlap = caption_left < face_right and caption_right > face_left
@@ -410,51 +742,51 @@ def get_face_safe_position(
 
     # Try preferred position and alignment first (default to center)
     y_ratio = y_zones.get(preferred_position, 0.50)
-    if preferred_position == 'custom':
-        y_ratio = config.get('customY', config.get('positionY', 0.5))
+    if preferred_position == "custom":
+        y_ratio = config.get("customY", config.get("positionY", 0.5))
 
     if not overlaps_face(y_ratio, preferred_alignment):
         return preferred_position, y_ratio, preferred_alignment
 
     # Try different alignments at preferred Y
-    for alt_align in ['center', 'left', 'right']:
+    for alt_align in ["center", "left", "right"]:
         if not overlaps_face(y_ratio, alt_align):
             return preferred_position, y_ratio, alt_align
 
     # Try different Y positions with all alignments (prioritize center first)
-    for y_pos in ['center', 'bottom', 'top']:
+    for y_pos in ["center", "bottom", "top"]:
         y = y_zones[y_pos]
-        for alignment in ['center', 'left', 'right']:
+        for alignment in ["center", "left", "right"]:
             if not overlaps_face(y, alignment):
                 return y_pos, y, alignment
 
     # Scan for any safe spot (avoiding extreme edges for visibility)
     # Use safer Y values: keep minimum 8% from top/bottom edges
     for y in [0.80, 0.75, 0.70, 0.65, 0.35, 0.30, 0.25, 0.20]:
-        for alignment in ['center', 'left', 'right']:
+        for alignment in ["center", "left", "right"]:
             if not overlaps_face(y, alignment):
-                return 'custom', y, alignment
+                return "custom", y, alignment
 
     # Last resort: try near edges but not at absolute edge
     for y in [0.88, 0.12]:
-        for alignment in ['center', 'left', 'right']:
+        for alignment in ["center", "left", "right"]:
             if not overlaps_face(y, alignment):
-                return 'custom', y, alignment
+                return "custom", y, alignment
 
     # Fallback: put at safe bottom position, center
-    return 'bottom', 0.88, 'center'
+    return "bottom", 0.88, "center"
 
 
 def get_y_ratio_for_position(position: str, config: Dict[str, Any]) -> float:
     """Get the Y ratio (0-1) for a named position. Default is center."""
-    if position == 'top':
+    if position == "top":
         return 0.15  # 15% from top (safe margin)
-    elif position == 'center':
+    elif position == "center":
         return 0.50
-    elif position == 'bottom':
+    elif position == "bottom":
         return 0.82  # 18% from bottom (safe margin)
-    elif position == 'custom':
-        return config.get('customY', config.get('positionY', 0.5))
+    elif position == "custom":
+        return config.get("customY", config.get("positionY", 0.5))
     else:
         return 0.50  # Default to center
 
@@ -472,7 +804,7 @@ def parse_caption_format(text: str) -> Dict[str, Any]:
     Example: "##BIG TITLE##This is body&&&with line break"
     Returns: {'title': 'BIG TITLE', 'body': 'This is body\nwith line break'}
     """
-    result = {'title': None, 'body': ''}
+    result = {"title": None, "body": ""}
 
     if not text:
         return result
@@ -481,13 +813,13 @@ def parse_caption_format(text: str) -> Dict[str, Any]:
     text = replace_quotes(text)
 
     # Extract ##Title## if present at start
-    title_match = re.match(r'^##(.+?)##\s*', text)
+    title_match = re.match(r"^##(.+?)##\s*", text)
     if title_match:
-        result['title'] = title_match.group(1)
-        text = text[title_match.end():]
+        result["title"] = title_match.group(1)
+        text = text[title_match.end() :]
 
     # Replace &&& with newlines
-    result['body'] = text.replace('&&&', '\n')
+    result["body"] = text.replace("&&&", "\n")
 
     return result
 
@@ -498,15 +830,15 @@ def get_caption_for_index(config: Dict[str, Any], index: int) -> str:
     In batch mode, cycles through captions array.
     In single mode, returns the text.
     """
-    caption_mode = config.get('captionMode', 'single')
+    caption_mode = config.get("captionMode", "single")
 
-    if caption_mode == 'batch':
-        captions = config.get('captions', [])
+    if caption_mode == "batch":
+        captions = config.get("captions", [])
         if captions:
             return captions[index % len(captions)]
-        return config.get('text', '')
+        return config.get("text", "")
     else:
-        return config.get('text', '')
+        return config.get("text", "")
 
 
 def process_single_video_caption_worker(args: Tuple) -> Dict[str, Any]:
@@ -522,114 +854,34 @@ def process_single_video_caption_worker(args: Tuple) -> Dict[str, Any]:
         gpu_id: GPU device ID for NVENC encoding (0, 1, 2, etc.)
     """
     input_path, output_path, config, video_index, gpu_id = args
-    import subprocess
-    import json
 
     try:
-        # Get video info
-        video_info_result = subprocess.run(
-            ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_streams', '-show_format', input_path],
-            capture_output=True, text=True
+        worker_config = dict(config)
+        worker_config["gpuId"] = gpu_id
+
+        result = process_video_caption(
+            input_path=input_path,
+            output_path=output_path,
+            config=worker_config,
+            report_progress=lambda _progress, _message: None,
+            image_index=video_index,
         )
-        video_info = json.loads(video_info_result.stdout) if video_info_result.returncode == 0 else {}
-        video_stream = next((s for s in video_info.get('streams', []) if s.get('codec_type') == 'video'), {})
-        width = int(video_stream.get('width', 1920))
-        height = int(video_stream.get('height', 1080))
-        duration = float(video_info.get('format', {}).get('duration', 0))
 
-        # Get caption text - support batch mode with cycling
-        text = get_caption_for_index(config, video_index)
-
-        # Config values
-        position = config.get('position', 'bottom')
-        font_size = config.get('fontSize', 48)
-        color = config.get('textColor', config.get('color', '#FFFFFF'))
-        stroke_color = config.get('strokeColor', '#000000')
-        stroke_width = config.get('strokeWidth', 2)
-        shadow = config.get('shadow', False)
-
-        # Get font path - use TikTok font by default
-        font_name = config.get('font', 'TikTokBold.otf')
-        font_path = FONT_MAP.get(font_name, FONT_MAP.get('default', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'))
-
-        # Position calculations - support custom position with normalized coords
-        if position == 'top':
-            y_expr = f"{int(height * 0.15)}"
-        elif position == 'center':
-            y_expr = '(h-text_h)/2'
-        elif position == 'bottom':
-            y_expr = f"{int(height * 0.85)}-text_h"
-        elif position == 'custom':
-            # Custom position uses normalized coords (0-1)
-            pos_x = config.get('positionX', 0.5)
-            pos_y = config.get('positionY', 0.5)
-            y_expr = f"{int(height * pos_y)}-text_h/2"
-        else:
-            y_expr = f"{int(height * 0.85)}-text_h"
-
-        # Escape text for FFmpeg (handle special characters)
-        text_escaped = text.replace('\\', '\\\\').replace("'", "\\'").replace(':', '\\:').replace('%', '%%')
-        # Handle ##Title## format - remove for video (simpler rendering)
-        text_escaped = text_escaped.replace('##', '').replace('&&&', ' ')
-
-        # Build drawtext filter with fontfile
-        drawtext_parts = [
-            f"text='{text_escaped}'",
-            f"fontfile='{font_path}'",
-            f"fontsize={font_size}",
-            f"fontcolor={color}",
-            f"x=(w-text_w)/2",
-            f"y={y_expr}"
-        ]
-
-        # Add stroke/border
-        if stroke_color and stroke_width > 0:
-            drawtext_parts.append(f"borderw={stroke_width}")
-            drawtext_parts.append(f"bordercolor={stroke_color}")
-
-        # Add shadow
-        if shadow:
-            drawtext_parts.append("shadowcolor=black@0.5")
-            drawtext_parts.append("shadowx=2")
-            drawtext_parts.append("shadowy=2")
-
-        drawtext = f"drawtext={':'.join(drawtext_parts)}"
-
-        # FFmpeg command with GPU selection
-        # -gpu flag specifies which GPU to use for h264_nvenc encoding
-        cmd = [
-            'ffmpeg', '-y',
-            '-hwaccel', 'cuda', '-hwaccel_device', str(gpu_id),
-            '-i', input_path,
-            '-vf', drawtext,
-            '-c:v', 'h264_nvenc', '-gpu', str(gpu_id), '-preset', 'p2',
-            '-b:v', '5000k', '-maxrate', '7500k',
-            '-c:a', 'aac', '-b:a', '128k',
-            output_path
-        ]
-
-        print(f"[Video Caption Worker] GPU {gpu_id}, video {video_index}: '{text[:50]}...' with font {font_path}")
-        process = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-
-        if process.returncode != 0:
-            # Try fallback to CPU encoding if NVENC fails
-            print(f"[Video Caption Worker] NVENC failed, trying CPU fallback: {process.stderr[-200:]}")
-            cmd_cpu = [
-                'ffmpeg', '-y',
-                '-i', input_path,
-                '-vf', drawtext,
-                '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
-                '-c:a', 'aac', '-b:a', '128k',
-                output_path
-            ]
-            process = subprocess.run(cmd_cpu, capture_output=True, text=True, timeout=600)
-            if process.returncode != 0:
-                return {'status': 'failed', 'index': video_index, 'gpu_id': gpu_id, 'error': process.stderr[-500:]}
-
-        return {'status': 'completed', 'index': video_index, 'output_path': output_path, 'duration': duration, 'gpu_id': gpu_id}
+        return {
+            "status": "completed",
+            "index": video_index,
+            "output_path": output_path,
+            "duration": result.get("duration", 0),
+            "gpu_id": gpu_id,
+        }
 
     except Exception as e:
-        return {'status': 'failed', 'index': video_index, 'gpu_id': gpu_id, 'error': str(e)}
+        return {
+            "status": "failed",
+            "index": video_index,
+            "gpu_id": gpu_id,
+            "error": str(e),
+        }
 
 
 def process_videos_parallel_caption(
@@ -637,7 +889,7 @@ def process_videos_parallel_caption(
     output_dir: str,
     config: Dict[str, Any],
     progress_callback: Optional[Callable[[float, str], None]] = None,
-    max_parallel: int = None
+    max_parallel: Optional[int] = None,
 ) -> Dict[str, Any]:
     """
     Process multiple videos with captions in parallel using multiple NVENC sessions.
@@ -648,21 +900,23 @@ def process_videos_parallel_caption(
     Implements round-robin GPU assignment to distribute work across all available GPUs.
     """
     if not video_paths:
-        return {'error': 'No videos to process'}
+        return {"error": "No videos to process"}
 
     # Detect all GPUs and calculate total parallel capacity
     gpu_info = get_gpu_info()
-    gpu_count = gpu_info.get('gpu_count', 1)
-    gpus = gpu_info.get('gpus', [{'index': 0, 'nvenc_sessions': 2}])
-    total_nvenc_sessions = gpu_info.get('total_nvenc_sessions', 2)
+    gpu_count = gpu_info.get("gpu_count", 1)
+    gpus = gpu_info.get("gpus", [{"index": 0, "nvenc_sessions": 2}])
+    total_nvenc_sessions = gpu_info.get("total_nvenc_sessions", 2)
 
     if max_parallel is None:
         max_parallel = total_nvenc_sessions
 
     # Log GPU configuration
-    gpu_names = [g.get('name', 'Unknown') for g in gpus]
+    gpu_names = [g.get("name", "Unknown") for g in gpus]
     print(f"[Parallel Caption] Detected {gpu_count} GPU(s): {', '.join(gpu_names)}")
-    print(f"[Parallel Caption] Total NVENC sessions available: {total_nvenc_sessions}, using: {max_parallel}")
+    print(
+        f"[Parallel Caption] Total NVENC sessions available: {total_nvenc_sessions}, using: {max_parallel}"
+    )
 
     # Build work items with round-robin GPU assignment
     # Each video gets assigned to a GPU in round-robin fashion
@@ -673,7 +927,7 @@ def process_videos_parallel_caption(
         output_path = os.path.join(output_dir, f"{name}_captioned{ext}")
 
         # Round-robin GPU assignment based on video index
-        gpu_id = gpus[i % gpu_count]['index']
+        gpu_id = gpus[i % gpu_count]["index"]
         work_items.append((video_path, output_path, config, i, gpu_id))
 
     total = len(work_items)
@@ -685,32 +939,39 @@ def process_videos_parallel_caption(
         if progress_callback:
             progress_callback(completed / total if total > 0 else 0, msg)
 
-    report_progress(f"Processing {total} videos across {gpu_count} GPU(s) with {max_parallel} parallel sessions...")
+    report_progress(
+        f"Processing {total} videos across {gpu_count} GPU(s) with {max_parallel} parallel sessions..."
+    )
 
     # Use ThreadPoolExecutor - FFmpeg handles GPU work in subprocesses
     # This is more efficient than ProcessPoolExecutor for I/O-bound subprocess calls
     with ThreadPoolExecutor(max_workers=max_parallel) as executor:
-        future_to_item = {executor.submit(process_single_video_caption_worker, item): item for item in work_items}
+        future_to_item = {
+            executor.submit(process_single_video_caption_worker, item): item
+            for item in work_items
+        }
 
         for future in as_completed(future_to_item):
             result = future.result()
             results.append(result)
-            if result['status'] == 'completed':
+            if result["status"] == "completed":
                 completed += 1
             else:
                 failed += 1
-            gpu_used = result.get('gpu_id', 0)
-            report_progress(f"Completed {completed}/{total} videos ({failed} failed) [Last: GPU {gpu_used}]")
+            gpu_used = result.get("gpu_id", 0)
+            report_progress(
+                f"Completed {completed}/{total} videos ({failed} failed) [Last: GPU {gpu_used}]"
+            )
 
     return {
-        'status': 'completed',
-        'total': total,
-        'completed': completed,
-        'failed': failed,
-        'results': results,
-        'parallel_sessions': max_parallel,
-        'gpu_count': gpu_count,
-        'gpus_used': gpu_names
+        "status": "completed",
+        "total": total,
+        "completed": completed,
+        "failed": failed,
+        "results": results,
+        "parallel_sessions": max_parallel,
+        "gpu_count": gpu_count,
+        "gpus_used": gpu_names,
     }
 
 
@@ -718,7 +979,7 @@ def process_captioner(
     input_path: str,
     output_path: str,
     config: Dict[str, Any],
-    progress_callback: Optional[Callable[[float, str], None]] = None
+    progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> Dict[str, Any]:
     """
     Process image or video with text captions.
@@ -739,19 +1000,31 @@ def process_captioner(
 
     # Debug: Print raw config BEFORE normalization
     print(f"[Captioner] RAW config keys: {list(config.keys())}")
-    print(f"[Captioner] RAW text: {repr(config.get('text', 'NOT FOUND'))}")
-    print(f"[Captioner] RAW captions: {repr(config.get('captions', 'NOT FOUND'))}")
-    print(f"[Captioner] RAW caption_mode: {repr(config.get('caption_mode', 'NOT FOUND'))}")
-    print(f"[Captioner] RAW captionMode: {repr(config.get('captionMode', 'NOT FOUND'))}")
+    print(f"[Captioner] RAW text: {safe_debug_repr(config.get('text', 'NOT FOUND'))}")
+    print(
+        f"[Captioner] RAW captions: {safe_debug_repr(config.get('captions', 'NOT FOUND'))}"
+    )
+    print(
+        f"[Captioner] RAW caption_mode: {safe_debug_repr(config.get('caption_mode', 'NOT FOUND'))}"
+    )
+    print(
+        f"[Captioner] RAW captionMode: {safe_debug_repr(config.get('captionMode', 'NOT FOUND'))}"
+    )
 
     # Normalize config keys (snake_case -> camelCase)
     config = normalize_config(config)
 
     # Debug: Print config AFTER normalization
     print(f"[Captioner] NORMALIZED config keys: {list(config.keys())}")
-    print(f"[Captioner] NORMALIZED text: {repr(config.get('text', 'NOT FOUND'))}")
-    print(f"[Captioner] NORMALIZED captions: {repr(config.get('captions', 'NOT FOUND'))}")
-    print(f"[Captioner] NORMALIZED captionMode: {repr(config.get('captionMode', 'NOT FOUND'))}")
+    print(
+        f"[Captioner] NORMALIZED text: {safe_debug_repr(config.get('text', 'NOT FOUND'))}"
+    )
+    print(
+        f"[Captioner] NORMALIZED captions: {safe_debug_repr(config.get('captions', 'NOT FOUND'))}"
+    )
+    print(
+        f"[Captioner] NORMALIZED captionMode: {safe_debug_repr(config.get('captionMode', 'NOT FOUND'))}"
+    )
 
     def report_progress(progress: float, message: str = ""):
         if progress_callback:
@@ -760,23 +1033,29 @@ def process_captioner(
     # Detect file type
     ext = os.path.splitext(input_path)[1].lower()
     is_video = ext in VIDEO_EXTENSIONS
-    is_zip = ext == '.zip'
+    is_zip = ext == ".zip"
 
     # Get image index for batch mode (passed from workflow execution)
-    image_index = config.get('imageIndex', 0)
+    image_index = config.get("imageIndex", 0)
 
     # Debug logging for batch mode troubleshooting
-    caption_mode = config.get('captionMode', 'single')
-    captions = config.get('captions', [])
-    text = config.get('text', '')
-    print(f"[Captioner] Mode: {caption_mode}, imageIndex: {image_index}, captions count: {len(captions)}, text: {repr(text[:50] if text else '')}")
+    caption_mode = config.get("captionMode", "single")
+    captions = config.get("captions", [])
+    text = config.get("text", "")
+    print(
+        f"[Captioner] Mode: {caption_mode}, imageIndex: {image_index}, captions count: {len(captions)}, text: {safe_debug_repr(text[:50] if text else '')}"
+    )
 
     # Debug: Show actual caption that will be used
     actual_caption = get_caption_for_index(config, image_index)
-    print(f"[Captioner] ACTUAL caption to render: {repr(actual_caption[:100] if actual_caption else 'EMPTY')}")
+    print(
+        f"[Captioner] ACTUAL caption to render: {safe_debug_repr(actual_caption[:100] if actual_caption else 'EMPTY')}"
+    )
 
-    if caption_mode == 'batch' and captions:
-        print(f"[Captioner] Using caption {image_index % len(captions)}: {captions[image_index % len(captions)][:50]}...")
+    if caption_mode == "batch" and captions:
+        print(
+            f"[Captioner] Using caption {image_index % len(captions)}: {safe_debug_repr(captions[image_index % len(captions)][:50])}..."
+        )
 
     report_progress(0.05, "Analyzing file...")
 
@@ -784,12 +1063,16 @@ def process_captioner(
     if is_zip:
         report_progress(0.08, "Checking ZIP contents...")
         temp_dir = tempfile.mkdtemp(prefix="captioner_batch_")
+        video_paths: List[str] = []
 
         try:
             video_paths = extract_videos_from_zip(input_path, temp_dir)
 
             if video_paths:
-                report_progress(0.1, f"Found {len(video_paths)} videos, starting parallel processing...")
+                report_progress(
+                    0.1,
+                    f"Found {len(video_paths)} videos, starting parallel processing...",
+                )
 
                 output_dir = os.path.join(temp_dir, "output")
                 os.makedirs(output_dir, exist_ok=True)
@@ -798,39 +1081,47 @@ def process_captioner(
                     video_paths, output_dir, config, progress_callback=progress_callback
                 )
 
-                if result.get('error'):
+                if result.get("error"):
                     return result
 
                 report_progress(0.95, "Creating output ZIP...")
 
-                with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_STORED) as zf:
-                    for r in result.get('results', []):
-                        if r.get('status') == 'completed' and r.get('output_path'):
-                            if os.path.exists(r['output_path']):
-                                zf.write(r['output_path'], os.path.basename(r['output_path']))
+                with zipfile.ZipFile(output_path, "w", zipfile.ZIP_STORED) as zf:
+                    for r in result.get("results", []):
+                        if r.get("status") == "completed" and r.get("output_path"):
+                            if os.path.exists(r["output_path"]):
+                                zf.write(
+                                    r["output_path"], os.path.basename(r["output_path"])
+                                )
 
                 report_progress(1.0, "Complete")
 
                 return {
-                    'status': 'completed',
-                    'mode': 'parallel_video_batch',
-                    'videos_processed': result.get('completed', 0),
-                    'videos_failed': result.get('failed', 0),
-                    'parallel_sessions': result.get('parallel_sessions', 1),
-                    'output_size': os.path.getsize(output_path) if os.path.exists(output_path) else 0
+                    "status": "completed",
+                    "mode": "parallel_video_batch",
+                    "videos_processed": result.get("completed", 0),
+                    "videos_failed": result.get("failed", 0),
+                    "parallel_sessions": result.get("parallel_sessions", 1),
+                    "output_size": os.path.getsize(output_path)
+                    if os.path.exists(output_path)
+                    else 0,
                 }
 
         except Exception as e:
             shutil.rmtree(temp_dir, ignore_errors=True)
             raise
         finally:
-            if 'video_paths' in dir() and video_paths:
+            if video_paths:
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
     if is_video:
-        return process_video_caption(input_path, output_path, config, report_progress, image_index)
+        return process_video_caption(
+            input_path, output_path, config, report_progress, image_index
+        )
     else:
-        return process_image_caption(input_path, output_path, config, report_progress, image_index)
+        return process_image_caption(
+            input_path, output_path, config, report_progress, image_index
+        )
 
 
 def process_image_caption(
@@ -838,7 +1129,7 @@ def process_image_caption(
     output_path: str,
     config: Dict[str, Any],
     report_progress: Callable[[float, str], None],
-    image_index: int = 0
+    image_index: int = 0,
 ) -> Dict[str, Any]:
     """
     Add caption to a single image.
@@ -855,7 +1146,7 @@ def process_image_caption(
 
     report_progress(0.1, "Loading image...")
 
-    img = Image.open(input_path).convert('RGBA')
+    img = Image.open(input_path).convert("RGBA")
     width, height = img.size
 
     # Get the actual text that will be rendered (for logging)
@@ -864,7 +1155,7 @@ def process_image_caption(
 
     # Face detection (if enabled)
     faces = []
-    avoid_faces = config.get('avoidFaces', False)
+    avoid_faces = config.get("avoidFaces", False)
     if avoid_faces and MEDIAPIPE_AVAILABLE:
         report_progress(0.2, "Detecting faces...")
         faces = detect_faces(img)
@@ -883,33 +1174,33 @@ def process_image_caption(
 
     # Convert to RGB for JPEG output
     output_ext = os.path.splitext(output_path)[1].lower()
-    if output_ext in ['.jpg', '.jpeg']:
-        img = img.convert('RGB')
-        img.save(output_path, 'JPEG', quality=95)
-    elif output_ext == '.png':
-        img.save(output_path, 'PNG')
+    if output_ext in [".jpg", ".jpeg"]:
+        img = img.convert("RGB")
+        img.save(output_path, "JPEG", quality=95)
+    elif output_ext == ".png":
+        img.save(output_path, "PNG")
     else:
-        img = img.convert('RGB')
-        img.save(output_path, 'JPEG', quality=95)
+        img = img.convert("RGB")
+        img.save(output_path, "JPEG", quality=95)
 
     report_progress(1.0, "Complete")
 
     # Determine final position (may have been adjusted for faces)
-    final_position = config.get('position', 'bottom')
+    final_position = config.get("position", "bottom")
     position_adjusted = False
     if faces and avoid_faces:
         position_adjusted = True  # Actual adjustment happens in create_caption_overlay
 
     return {
-        'text': caption_text,
-        'title': parsed['title'],
-        'body': parsed['body'],
-        'position': final_position,
-        'resolution': f"{width}x{height}",
-        'captionMode': config.get('captionMode', 'single'),
-        'imageIndex': image_index,
-        'facesDetected': len(faces),
-        'positionAdjusted': position_adjusted
+        "text": caption_text,
+        "title": parsed["title"],
+        "body": parsed["body"],
+        "position": final_position,
+        "resolution": f"{width}x{height}",
+        "captionMode": config.get("captionMode", "single"),
+        "imageIndex": image_index,
+        "facesDetected": len(faces),
+        "positionAdjusted": position_adjusted,
     }
 
 
@@ -918,7 +1209,7 @@ def process_video_caption(
     output_path: str,
     config: Dict[str, Any],
     report_progress: Callable[[float, str], None],
-    image_index: int = 0
+    image_index: int = 0,
 ) -> Dict[str, Any]:
     """
     Add caption to video using FFmpeg drawtext filter.
@@ -929,127 +1220,106 @@ def process_video_caption(
 
     report_progress(0.1, "Analyzing video...")
 
-    # Get video info
     video_info = get_video_info(input_path)
-    width = video_info.get('width', 1920)
-    height = video_info.get('height', 1080)
-    duration = video_info.get('duration', 0)
+    width = int(video_info.get("width", 1920))
+    height = int(video_info.get("height", 1080))
+    duration = float(video_info.get("duration", 0))
 
-    report_progress(0.2, "Building caption filter...")
+    report_progress(0.2, "Rendering caption overlay...")
+    overlay_image = create_caption_overlay(width, height, config, image_index, [])
 
-    # Extract config - support both frontend keys (font, textColor) and legacy keys (fontFamily, color)
-    text = get_caption_for_index(config, image_index)  # Support batch mode
-    position = config.get('position', 'bottom')
-    font_size = config.get('fontSize', 48)
-    font_name = config.get('font', config.get('fontFamily', 'TikTokBold.otf'))  # frontend sends 'font'
-    font_weight = config.get('fontWeight', 'normal')
-    color = config.get('textColor', config.get('color', '#FFFFFF'))  # frontend sends 'textColor'
-    bg_color = config.get('backgroundColor')
-    bg_opacity = config.get('backgroundOpacity', 80) / 100
-    stroke_color = config.get('strokeColor', '#000000')
-    stroke_width = config.get('strokeWidth', 2)
-    shadow = config.get('shadow', True)
-    animation = config.get('animation', 'none')
-    start_time = config.get('startTime', 0)
-    end_time = config.get('endTime')
-    max_width = config.get('maxWidth')
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as overlay_file:
+        overlay_path = overlay_file.name
 
-    # GPU selection for multi-GPU systems (default to GPU 0)
-    gpu_id = config.get('gpuId', config.get('gpu_id', 0))
+    overlay_image.save(overlay_path, "PNG")
 
-    # Get font path - check FONT_MAP with font name directly (e.g., 'TikTokBold.otf')
-    font_path = FONT_MAP.get(font_name, FONT_MAP.get('default', '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'))
+    text = get_caption_for_index(config, image_index)
+    position = config.get("position", "bottom")
+    animation = str(config.get("animation", "none")).lower()
+    start_time = float(config.get("startTime", 0) or 0)
+    raw_end_time = config.get("endTime")
+    end_time = float(raw_end_time) if raw_end_time not in (None, "") else None
+    gpu_id = int(config.get("gpuId", config.get("gpu_id", 0)) or 0)
 
-    # Fallback: try with bold suffix if font_weight is bold
-    if font_weight == 'bold' and font_name not in FONT_MAP:
-        font_key = f"{font_name} Bold"
-        font_path = FONT_MAP.get(font_key, FONT_MAP.get('default-bold', font_path))
+    filter_parts = ["[1:v]format=rgba[caption_base]"]
+    overlay_stream = "[caption_base]"
 
-    # Escape text for FFmpeg
-    text_escaped = escape_ffmpeg_text(text)
+    if animation == "fade":
+        fade_duration = 0.35
+        filter_parts.append(
+            f"{overlay_stream}fade=t=in:st={start_time:.3f}:d={fade_duration:.3f}:alpha=1[caption_animated]"
+        )
+        overlay_stream = "[caption_animated]"
 
-    # Calculate position
-    x, y = calculate_position(position, width, height, font_size, config)
+    overlay_filter = f"[0:v]{overlay_stream}overlay=0:0:shortest=1"
+    if start_time > 0 or end_time is not None:
+        final_end = end_time if end_time is not None else duration
+        final_end = max(final_end, start_time + 0.01)
+        overlay_filter += f":enable='between(t,{start_time:.3f},{final_end:.3f})'"
+    overlay_filter += "[vout]"
+    filter_parts.append(overlay_filter)
 
-    # Build drawtext filter
-    drawtext_parts = [
-        f"text='{text_escaped}'",
-        f"fontfile='{font_path}'",
-        f"fontsize={font_size}",
-        f"fontcolor={color}",
-        f"x={x}",
-        f"y={y}"
-    ]
-
-    # Add stroke/border
-    if stroke_color and stroke_width > 0:
-        drawtext_parts.append(f"borderw={stroke_width}")
-        drawtext_parts.append(f"bordercolor={stroke_color}")
-
-    # Add shadow
-    if shadow:
-        drawtext_parts.append("shadowcolor=black@0.5")
-        drawtext_parts.append("shadowx=2")
-        drawtext_parts.append("shadowy=2")
-
-    # Add background box
-    if bg_color:
-        drawtext_parts.append(f"box=1")
-        alpha_hex = hex(int(bg_opacity * 255))[2:].zfill(2)
-        drawtext_parts.append(f"boxcolor={bg_color}@{bg_opacity:.2f}")
-        drawtext_parts.append(f"boxborderw=10")
-
-    # Add timing (enable/disable)
-    if start_time > 0 or end_time:
-        enable_expr = f"between(t,{start_time},{end_time or duration})"
-        drawtext_parts.append(f"enable='{enable_expr}'")
-
-    # Add animation
-    if animation == 'fade':
-        # Fade in over 0.5 seconds
-        drawtext_parts.append(f"alpha='if(lt(t,{start_time + 0.5}),(t-{start_time})/0.5,1)'")
-    elif animation == 'slide':
-        # Slide up from bottom
-        drawtext_parts.append(f"y='if(lt(t,{start_time + 0.3}),h-(h-{y})*(t-{start_time})/0.3,{y})'")
-
-    drawtext_filter = f"drawtext={':'.join(drawtext_parts)}"
+    filter_complex = ";".join(filter_parts)
 
     report_progress(0.3, f"Encoding with NVENC on GPU {gpu_id}...")
 
     def build_ffmpeg_cmd(use_nvenc: bool = True) -> list:
         """Build FFmpeg command with GPU or CPU encoding."""
-        cmd = ['ffmpeg', '-y']
+        cmd = ["ffmpeg", "-y"]
         if use_nvenc:
-            # Specify GPU for hardware acceleration
-            cmd.extend(['-hwaccel', 'cuda', '-hwaccel_device', str(gpu_id)])
-        cmd.extend([
-            '-i', input_path,
-            '-vf', drawtext_filter,
-        ])
+            cmd.extend(["-hwaccel", "cuda", "-hwaccel_device", str(gpu_id)])
+
+        cmd.extend(
+            [
+                "-i",
+                input_path,
+                "-loop",
+                "1",
+                "-i",
+                overlay_path,
+                "-filter_complex",
+                filter_complex,
+                "-map",
+                "[vout]",
+                "-map",
+                "0:a?",
+            ]
+        )
 
         if use_nvenc:
-            cmd.extend([
-                '-c:v', 'h264_nvenc',
-                '-gpu', str(gpu_id),  # Specify GPU for NVENC encoder
-                '-preset', 'p4',
-                '-b:v', '5000k',
-                '-maxrate', '7500k',
-                '-bufsize', '10000k',
-                '-profile:v', 'high',
-            ])
+            cmd.extend(
+                [
+                    "-c:v",
+                    "h264_nvenc",
+                    "-gpu",
+                    str(gpu_id),
+                    "-preset",
+                    "p4",
+                    "-b:v",
+                    "5000k",
+                    "-maxrate",
+                    "7500k",
+                    "-bufsize",
+                    "10000k",
+                    "-profile:v",
+                    "high",
+                ]
+            )
         else:
-            cmd.extend([
-                '-c:v', 'libx264',
-                '-preset', 'medium',
-                '-crf', '23',
-                '-profile:v', 'high',
-            ])
+            cmd.extend(
+                [
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "medium",
+                    "-crf",
+                    "23",
+                    "-profile:v",
+                    "high",
+                ]
+            )
 
-        cmd.extend([
-            '-c:a', 'aac',
-            '-b:a', '128k',
-            output_path
-        ])
+        cmd.extend(["-c:a", "aac", "-b:a", "128k", "-shortest", output_path])
         return cmd
 
     def run_ffmpeg_with_progress(cmd: list, mode_name: str) -> tuple:
@@ -1057,11 +1327,12 @@ def process_video_caption(
         stderr_lines = []
 
         process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True
         )
+
+        if process.stderr is None:
+            process.kill()
+            return False, "Failed to capture FFmpeg stderr output"
 
         # Read stderr line by line for progress
         try:
@@ -1077,14 +1348,17 @@ def process_video_caption(
                 if len(stderr_lines) > 50:
                     stderr_lines.pop(0)
 
-                if 'time=' in line:
+                if "time=" in line:
                     try:
-                        time_str = line.split('time=')[1].split()[0]
-                        h, m, s = time_str.split(':')
+                        time_str = line.split("time=")[1].split()[0]
+                        h, m, s = time_str.split(":")
                         current_time = int(h) * 3600 + int(m) * 60 + float(s)
                         if duration > 0:
                             progress = min(0.3 + (current_time / duration) * 0.65, 0.95)
-                            report_progress(progress, f"Encoding ({mode_name})... {int(current_time)}s / {int(duration)}s")
+                            report_progress(
+                                progress,
+                                f"Encoding ({mode_name})... {int(current_time)}s / {int(duration)}s",
+                            )
                     except:
                         pass
 
@@ -1099,33 +1373,39 @@ def process_video_caption(
             process.kill()
             return False, f"Error during encoding: {str(e)}"
 
-        stderr_output = ''.join(stderr_lines)
+        stderr_output = "".join(stderr_lines)
         return process.returncode == 0, stderr_output
 
-    # Try NVENC first
-    cmd = build_ffmpeg_cmd(use_nvenc=True)
-    success, stderr = run_ffmpeg_with_progress(cmd, "NVENC")
+    try:
+        cmd = build_ffmpeg_cmd(use_nvenc=True)
+        success, stderr = run_ffmpeg_with_progress(cmd, "NVENC")
 
-    # If NVENC failed, try CPU fallback
-    if not success:
-        print(f"[Captioner] NVENC failed, trying CPU fallback. Error: {stderr[-500:]}")
-        report_progress(0.3, "NVENC failed, trying CPU encoding...")
-        cmd = build_ffmpeg_cmd(use_nvenc=False)
-        success, stderr = run_ffmpeg_with_progress(cmd, "CPU")
+        if not success:
+            print(
+                f"[Captioner] NVENC failed, trying CPU fallback. Error: {stderr[-500:]}"
+            )
+            report_progress(0.3, "NVENC failed, trying CPU encoding...")
+            cmd = build_ffmpeg_cmd(use_nvenc=False)
+            success, stderr = run_ffmpeg_with_progress(cmd, "CPU")
 
-    if not success:
-        raise RuntimeError(f"FFmpeg failed with all encoders: {stderr[-1000:]}")
+        if not success:
+            raise RuntimeError(f"FFmpeg failed with all encoders: {stderr[-1000:]}")
 
-    report_progress(1.0, "Complete")
+        report_progress(1.0, "Complete")
 
-    return {
-        'text': text,
-        'position': position,
-        'animation': animation,
-        'resolution': f"{width}x{height}",
-        'duration': duration,
-        'gpuId': gpu_id
-    }
+        return {
+            "text": text,
+            "position": position,
+            "animation": animation,
+            "resolution": f"{width}x{height}",
+            "duration": duration,
+            "gpuId": gpu_id,
+        }
+    finally:
+        try:
+            os.remove(overlay_path)
+        except Exception:
+            pass
 
 
 def create_caption_overlay(
@@ -1133,7 +1413,7 @@ def create_caption_overlay(
     height: int,
     config: Dict[str, Any],
     image_index: int = 0,
-    faces: List[Dict[str, Any]] = None
+    faces: Optional[List[Dict[str, Any]]] = None,
 ) -> Image.Image:
     """
     Create a caption overlay for images.
@@ -1152,238 +1432,281 @@ def create_caption_overlay(
     if faces is None:
         faces = []
 
-    # Get text based on mode (single or batch)
     raw_text = get_caption_for_index(config, image_index)
-
-    # Parse ##Title## and &&& formatting
     parsed = parse_caption_format(raw_text)
-    title_text = parsed['title']
-    body_text = parsed['body']
+    title_text = parsed["title"]
+    body_text = parsed["body"]
 
-    # Scaling factor (base resolution 1080px)
-    BASE_WIDTH = 1080
-    scale_factor = width / BASE_WIDTH
+    base_width = 1080
+    scale_factor = width / base_width
 
-    # Check if this image should be force-centered (center every N feature)
-    center_every_enabled = config.get('centerEveryEnabled', False)
-    center_every_n = config.get('centerEveryN', 7)
+    center_every_enabled = config.get("centerEveryEnabled", False)
+    center_every_n = config.get("centerEveryN", 7)
     force_center = center_every_enabled and (image_index + 1) % center_every_n == 0
 
-    # Extract config with scaling (default position is now CENTER)
-    position = 'center' if force_center else config.get('position', 'center')
+    position = "center" if force_center else config.get("position", "center")
+    alignment = config.get("alignment", "center")
+    text_width_ratio = config.get("textWidthRatio", 0.85)
+    max_width = int(width * text_width_ratio)
 
-    # Scale font sizes
-    base_font_size = config.get('fontSize', 47)
-    base_title_size = config.get('titleFontSize', 75)
-    base_stroke_width = config.get('strokeWidth', 3.5)
+    show_background = config.get("showBackground", False)
+    emoji_style = str(config.get("emojiStyle", "ios")).lower()
+
+    base_font_size = config.get("fontSize", 47)
+    base_title_size = config.get("titleFontSize", 75)
+    base_stroke_width = config.get("strokeWidth", 0 if show_background else 3.5)
 
     font_size = max(12, int(base_font_size * scale_factor))
     title_font_size = max(14, int(base_title_size * scale_factor))
-    stroke_width = max(1, int(base_stroke_width * scale_factor))
+    stroke_width = max(0, int(base_stroke_width * scale_factor))
 
-    font_name = config.get('font', config.get('fontFamily', 'TikTokBold.otf'))
-    text_color = config.get('textColor', config.get('color', '#FFFFFF'))
-    bg_color = config.get('backgroundColor') if config.get('showBackground', False) else None
-    bg_opacity = config.get('backgroundOpacity', 80) / 100
-    stroke_color = config.get('strokeColor', '#000000')
-    shadow = config.get('shadow', False)
-    alignment = config.get('alignment', 'center')
-    text_width_ratio = config.get('textWidthRatio', 0.85)
-    block_spacing = max(5, int(config.get('blockSpacing', 40) * scale_factor))
-    line_spacing = max(2, int(config.get('lineSpacing', 20) * scale_factor))
+    if show_background:
+        text_color = "#000000"
+        bg_color = "#FFFFFF"
+        bg_opacity = 1.0
+        stroke_width = 0
+        shadow = False
+    else:
+        text_color = config.get("textColor", config.get("color", "#FFFFFF"))
+        bg_color = None
+        bg_opacity_raw = config.get("backgroundOpacity", 80)
+        if isinstance(bg_opacity_raw, (int, float)) and bg_opacity_raw <= 1:
+            bg_opacity = float(bg_opacity_raw)
+        else:
+            bg_opacity = float(bg_opacity_raw) / 100
+        shadow = config.get("shadow", False)
 
-    # Random tilt (default -5 to +5 degrees)
-    random_tilt = config.get('randomTilt', False)
+    stroke_color = config.get("strokeColor", "#000000")
+    block_spacing = max(4, int(config.get("blockSpacing", 40) * scale_factor))
+    if show_background:
+        line_spacing = max(0, int(font_size * 0.09))
+    else:
+        line_spacing = max(1, int(config.get("lineSpacing", 20) * scale_factor * 0.5))
+
+    random_tilt = config.get("randomTilt", False)
     tilt_angle = 0
     if random_tilt:
-        tilt_min = config.get('tiltRangeMin', -5)
-        tilt_max = config.get('tiltRangeMax', 5)
+        tilt_min = config.get("tiltRangeMin", -5)
+        tilt_max = config.get("tiltRangeMax", 5)
         tilt_angle = random.uniform(tilt_min, tilt_max)
 
-    max_width = int(width * text_width_ratio)
-
-    # Create transparent overlay
-    overlay = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    # Load fonts
-    font_path = FONT_MAP.get(font_name, FONT_MAP['default-bold'])
-    italic_font_name = font_name.replace('Bold', 'Italic').replace('bold', 'italic')
-    if 'TikTok' in font_name or 'tiktok' in font_name:
-        italic_font_path = FONT_MAP.get('LightItalic.otf', FONT_MAP.get('tiktok-italic', FONT_MAP['default-italic']))
+    font_name = config.get("font", config.get("fontFamily", "TikTokBold.otf"))
+    font_path = FONT_MAP.get(font_name, FONT_MAP["default-bold"])
+    italic_font_name = font_name.replace("Bold", "Italic").replace("bold", "italic")
+    if "TikTok" in font_name or "tiktok" in font_name:
+        italic_font_path = FONT_MAP.get(
+            "LightItalic.otf", FONT_MAP.get("tiktok-italic", FONT_MAP["default-italic"])
+        )
     else:
-        italic_font_path = FONT_MAP.get(italic_font_name, FONT_MAP['default-italic'])
+        italic_font_path = FONT_MAP.get(italic_font_name, FONT_MAP["default-italic"])
 
     try:
         body_font = ImageFont.truetype(font_path, font_size)
-    except:
+    except Exception:
         body_font = ImageFont.load_default()
 
     try:
         title_font = ImageFont.truetype(italic_font_path, title_font_size)
-    except:
+    except Exception:
         title_font = body_font
 
-    # Calculate total content height and widths
+    content_blocks: List[Dict[str, Any]] = []
     total_height = 0
-    content_blocks = []
 
     if title_text:
-        wrapped_title = wrap_text(title_text, title_font, max_width)
-        title_bbox = draw.multiline_textbbox((0, 0), wrapped_title, font=title_font, spacing=line_spacing)
-        title_w = title_bbox[2] - title_bbox[0]
-        title_h = title_bbox[3] - title_bbox[1]
-        content_blocks.append({
-            'type': 'title',
-            'text': wrapped_title,
-            'font': title_font,
-            'width': title_w,
-            'height': title_h
-        })
-        total_height += title_h + block_spacing
+        wrapped_title = wrap_text_mixed(title_text, title_font, max_width)
+        title_lines = wrapped_title.split("\n") if wrapped_title else [""]
+        title_line_height = max(
+            get_font_line_height(title_font), estimate_emoji_size(title_font)
+        )
+        title_width = max(
+            measure_text_width(line if line else " ", title_font)
+            for line in title_lines
+        )
+        title_height = (
+            len(title_lines) * title_line_height
+            + max(0, len(title_lines) - 1) * line_spacing
+        )
+        content_blocks.append(
+            {
+                "type": "title",
+                "lines": title_lines,
+                "font": title_font,
+                "width": int(title_width),
+                "height": int(title_height),
+                "lineHeight": int(title_line_height),
+            }
+        )
+        total_height += int(title_height)
 
     if body_text:
-        wrapped_body = wrap_text(body_text, body_font, max_width)
-        body_bbox = draw.multiline_textbbox((0, 0), wrapped_body, font=body_font, spacing=line_spacing)
-        body_w = body_bbox[2] - body_bbox[0]
-        body_h = body_bbox[3] - body_bbox[1]
-        content_blocks.append({
-            'type': 'body',
-            'text': wrapped_body,
-            'font': body_font,
-            'width': body_w,
-            'height': body_h
-        })
-        total_height += body_h
+        wrapped_body = wrap_text_mixed(body_text, body_font, max_width)
+        body_lines = wrapped_body.split("\n") if wrapped_body else [""]
+        body_line_height = max(
+            get_font_line_height(body_font), estimate_emoji_size(body_font)
+        )
+        body_width = max(
+            measure_text_width(line if line else " ", body_font) for line in body_lines
+        )
+        body_height = (
+            len(body_lines) * body_line_height
+            + max(0, len(body_lines) - 1) * line_spacing
+        )
+        content_blocks.append(
+            {
+                "type": "body",
+                "lines": body_lines,
+                "font": body_font,
+                "width": int(body_width),
+                "height": int(body_height),
+                "lineHeight": int(body_line_height),
+            }
+        )
+        total_height += int(body_height)
 
     if not content_blocks:
         return overlay
 
-    # Calculate max content width
-    max_content_width = max(block['width'] for block in content_blocks)
+    if len(content_blocks) > 1:
+        total_height += block_spacing
 
-    # Face avoidance: adjust position AND alignment if faces are detected
-    avoid_faces = config.get('avoidFaces', False)
-    position_x = config.get('positionX', config.get('customX', 0.5))
-    position_y = config.get('positionY', config.get('customY', 0.85))
+    max_content_width = max(block["width"] for block in content_blocks)
+
+    avoid_faces = config.get("avoidFaces", False)
+    position_x = float(config.get("positionX", config.get("customX", 0.5)))
+    position_y = float(config.get("positionY", config.get("customY", 0.82)))
 
     if avoid_faces and faces:
-        # Calculate safe position and alignment that avoids faces
         adjusted_position, adjusted_y, adjusted_alignment = get_face_safe_position(
             faces=faces,
-            caption_height=total_height,
-            caption_width=max_content_width,
+            caption_height=int(total_height),
+            caption_width=int(max_content_width),
             image_width=width,
             image_height=height,
             preferred_position=position,
             preferred_alignment=alignment,
-            config=config
+            config=config,
         )
-        # Update position and alignment if adjusted
         position = adjusted_position
         position_y = adjusted_y
         alignment = adjusted_alignment
 
-    # Calculate Y position based on (possibly adjusted) position
-    # Using safe margins: 15% from top, 18% from bottom
-    if position == 'top':
+    if position == "top":
         base_y = int(height * 0.15) - total_height // 2
-    elif position == 'center':
+    elif position == "center":
         base_y = (height - total_height) // 2
-    elif position == 'bottom':
+    elif position == "bottom":
         base_y = int(height * 0.82) - total_height // 2
-    elif position == 'custom':
+    elif position == "custom":
         base_y = int(position_y * height) - total_height // 2
     else:
-        # Default to center
         base_y = (height - total_height) // 2
 
-    # Calculate X based on alignment
-    if alignment == 'left':
-        base_x = 20
-    elif alignment == 'right':
-        base_x = width - max_content_width - 20
-    else:  # center
-        if position == 'custom':
-            base_x = int(position_x * width) - max_content_width // 2
+    if position == "custom":
+        anchor_x = int(position_x * width)
+        if alignment == "left":
+            base_x = anchor_x
+        elif alignment == "right":
+            base_x = anchor_x - max_content_width
+        else:
+            base_x = anchor_x - max_content_width // 2
+    else:
+        if alignment == "left":
+            base_x = 20
+        elif alignment == "right":
+            base_x = width - max_content_width - 20
         else:
             base_x = (width - max_content_width) // 2
 
-    # Clamp positions to be within safe margins (5% of image dimensions)
-    # This prevents captions from hiding in the edges
+    if bg_color:
+        bg_pad_x = max(8, int(font_size * 0.32))
+        bg_pad_y = max(4, int(font_size * 0.14))
+        bubble_height = max(1, get_font_line_height(body_font) + (bg_pad_y * 2))
+        bg_radius = max(8, int(bubble_height * 0.34))
+        bg_join = max(1, int(font_size * 0.05))
+    else:
+        bg_pad_x = 0
+        bg_pad_y = 0
+        bg_radius = 0
+        bg_join = 0
+    effective_width = max_content_width + (bg_pad_x * 2)
+
     margin_x = max(20, int(width * 0.05))
     margin_y = max(30, int(height * 0.05))
-    base_x = max(margin_x, min(base_x, width - max_content_width - margin_x))
+    base_x = max(margin_x, min(base_x, width - effective_width - margin_x))
     base_y = max(margin_y, min(base_y, height - total_height - margin_y))
 
-    # Draw background if enabled
-    if bg_color:
-        padding = 15
-        bg_r, bg_g, bg_b = hex_to_rgb(bg_color)
-        bg_alpha = int(bg_opacity * 255)
-        draw.rounded_rectangle(
-            [base_x - padding, base_y - padding,
-             base_x + max_content_width + padding, base_y + total_height + padding],
-            radius=8,
-            fill=(bg_r, bg_g, bg_b, bg_alpha)
-        )
-
-    # Draw each content block
-    current_y = base_y
     text_r, text_g, text_b = hex_to_rgb(text_color)
+    stroke_rgba: Optional[Tuple[int, int, int, int]] = None
+    if stroke_color and stroke_width > 0:
+        stroke_r, stroke_g, stroke_b = hex_to_rgb(stroke_color)
+        stroke_rgba = (stroke_r, stroke_g, stroke_b, 255)
 
-    for block in content_blocks:
-        text = block['text']
-        font = block['font']
-        block_width = block['width']
-        block_height = block['height']
+    if bg_color:
+        bg_r, bg_g, bg_b = hex_to_rgb(bg_color)
+        bg_alpha = int(max(0.0, min(1.0, bg_opacity)) * 255)
+    else:
+        bg_r = bg_g = bg_b = bg_alpha = 0
 
-        # Calculate X for this block based on alignment
-        if alignment == 'left':
-            x = base_x
-        elif alignment == 'right':
-            x = base_x + max_content_width - block_width
-        else:  # center
-            x = base_x + (max_content_width - block_width) // 2
+    current_y = base_y
 
-        # Draw shadow
-        if shadow:
-            draw.multiline_text(
-                (x + 2, current_y + 2),
-                text,
-                font=font,
-                fill=(0, 0, 0, 128),
-                spacing=line_spacing,
-                align=alignment
+    for block_index, block in enumerate(content_blocks):
+        block_font = block["font"]
+        line_height = int(block["lineHeight"])
+
+        for line_index, line in enumerate(block["lines"]):
+            line_text = line if line else " "
+            line_width = measure_text_width(line_text, block_font)
+
+            if alignment == "left":
+                line_x = base_x
+            elif alignment == "right":
+                line_x = base_x + max_content_width - int(line_width)
+            else:
+                line_x = base_x + (max_content_width - int(line_width)) // 2
+
+            if bg_color:
+                bg_top = current_y - bg_pad_y
+                bg_bottom = current_y + line_height + bg_pad_y
+                if bg_join > 0:
+                    if line_index > 0:
+                        bg_top -= bg_join
+                    if line_index < len(block["lines"]) - 1:
+                        bg_bottom += bg_join
+
+                draw.rounded_rectangle(
+                    [
+                        line_x - bg_pad_x,
+                        bg_top,
+                        line_x + int(line_width) + bg_pad_x,
+                        bg_bottom,
+                    ],
+                    radius=bg_radius,
+                    fill=(bg_r, bg_g, bg_b, bg_alpha),
+                )
+
+            draw_mixed_text_line(
+                base_image=overlay,
+                draw=draw,
+                text=line_text,
+                x=line_x,
+                y=current_y,
+                font=block_font,
+                text_color=(text_r, text_g, text_b, 255),
+                emoji_style=emoji_style,
+                stroke_color=stroke_rgba,
+                stroke_width=stroke_width,
+                shadow=shadow,
             )
 
-        # Draw stroke
-        if stroke_color and stroke_width > 0:
-            stroke_r, stroke_g, stroke_b = hex_to_rgb(stroke_color)
-            for dx in range(-stroke_width, stroke_width + 1):
-                for dy in range(-stroke_width, stroke_width + 1):
-                    if dx != 0 or dy != 0:
-                        draw.multiline_text(
-                            (x + dx, current_y + dy),
-                            text,
-                            font=font,
-                            fill=(stroke_r, stroke_g, stroke_b, 255),
-                            spacing=line_spacing,
-                            align=alignment
-                        )
+            current_y += line_height
+            if line_index < len(block["lines"]) - 1:
+                current_y += line_spacing
 
-        # Draw text
-        draw.multiline_text(
-            (x, current_y),
-            text,
-            font=font,
-            fill=(text_r, text_g, text_b, 255),
-            spacing=line_spacing,
-            align=alignment
-        )
-
-        current_y += block_height
-        if block['type'] == 'title':
+        if block_index < len(content_blocks) - 1:
             current_y += block_spacing
 
     # Apply random tilt if enabled
@@ -1394,8 +1717,8 @@ def create_caption_overlay(
         caption_center_y = base_y + total_height // 2
 
         # Create a larger canvas to accommodate rotation
-        diagonal = int((width ** 2 + height ** 2) ** 0.5)
-        rotated = Image.new('RGBA', (diagonal, diagonal), (0, 0, 0, 0))
+        diagonal = int((width**2 + height**2) ** 0.5)
+        rotated = Image.new("RGBA", (diagonal, diagonal), (0, 0, 0, 0))
 
         # Calculate offset to center the overlay in the rotated canvas
         offset_x = (diagonal - width) // 2
@@ -1404,7 +1727,12 @@ def create_caption_overlay(
         rotated.paste(overlay, (offset_x, offset_y))
 
         # Rotate around center
-        rotated = rotated.rotate(tilt_angle, center=(diagonal // 2, diagonal // 2), expand=False, fillcolor=(0, 0, 0, 0))
+        rotated = rotated.rotate(
+            tilt_angle,
+            center=(diagonal // 2, diagonal // 2),
+            expand=False,
+            fillcolor=(0, 0, 0, 0),
+        )
 
         # Crop back to original size
         crop_x = (diagonal - width) // 2
@@ -1417,57 +1745,68 @@ def create_caption_overlay(
 def wrap_text(text: str, font: ImageFont.ImageFont, max_width: int) -> str:
     """Wrap text to fit within max width."""
     lines = []
-    for line in text.split('\n'):
+    for line in text.split("\n"):
         if font.getlength(line) <= max_width:
             lines.append(line)
         else:
             words = line.split()
             current_line = []
             for word in words:
-                test_line = ' '.join(current_line + [word])
+                test_line = " ".join(current_line + [word])
                 if font.getlength(test_line) <= max_width:
                     current_line.append(word)
                 else:
                     if current_line:
-                        lines.append(' '.join(current_line))
+                        lines.append(" ".join(current_line))
                     current_line = [word]
             if current_line:
-                lines.append(' '.join(current_line))
+                lines.append(" ".join(current_line))
 
-    return '\n'.join(lines)
+    return "\n".join(lines)
 
 
-def calculate_position(position: str, width: int, height: int, font_size: int, config: Dict[str, Any]) -> tuple:
+def calculate_position(
+    position: str, width: int, height: int, font_size: int, config: Dict[str, Any]
+) -> tuple:
     """Calculate FFmpeg position expressions."""
-    padding = 20
-
-    if position == 'top':
-        return f'(w-text_w)/2', str(padding)
-    elif position == 'center':
-        return f'(w-text_w)/2', f'(h-text_h)/2'
-    elif position == 'bottom':
-        return f'(w-text_w)/2', f'h-text_h-{padding}'
-    elif position == 'custom':
-        x = config.get('customX', width // 2)
-        y = config.get('customY', height - 100)
-        return str(x), str(y)
+    if position == "top":
+        return "(w-text_w)/2", f"{int(height * 0.15)}-text_h/2"
+    elif position == "center":
+        return "(w-text_w)/2", "(h-text_h)/2"
+    elif position == "bottom":
+        return "(w-text_w)/2", f"{int(height * 0.82)}-text_h/2"
+    elif position == "custom":
+        pos_x = float(config.get("positionX", config.get("customX", 0.5)) or 0.5)
+        pos_y = float(config.get("positionY", config.get("customY", 0.5)) or 0.5)
+        x = int(pos_x * width)
+        y = int(pos_y * height)
+        return f"{x}-text_w/2", f"{y}-text_h/2"
     else:
-        return f'(w-text_w)/2', f'h-text_h-{padding}'
+        return "(w-text_w)/2", f"{int(height * 0.82)}-text_h/2"
 
 
-def calculate_position_pixels(position: str, width: int, height: int, text_width: int, text_height: int, config: Dict[str, Any]) -> tuple:
+def calculate_position_pixels(
+    position: str,
+    width: int,
+    height: int,
+    text_width: int,
+    text_height: int,
+    config: Dict[str, Any],
+) -> tuple:
     """Calculate pixel position for image captions."""
     padding = 20
 
-    if position == 'top':
+    if position == "top":
         return (width - text_width) // 2, padding
-    elif position == 'center':
+    elif position == "center":
         return (width - text_width) // 2, (height - text_height) // 2
-    elif position == 'bottom':
+    elif position == "bottom":
         return (width - text_width) // 2, height - text_height - padding
-    elif position == 'custom':
-        x = config.get('customX', (width - text_width) // 2)
-        y = config.get('customY', height - text_height - padding)
+    elif position == "custom":
+        pos_x = float(config.get("positionX", config.get("customX", 0.5)) or 0.5)
+        pos_y = float(config.get("positionY", config.get("customY", 0.5)) or 0.5)
+        x = int(pos_x * width) - text_width // 2
+        y = int(pos_y * height) - text_height // 2
         return x, y
     else:
         return (width - text_width) // 2, height - text_height - padding
@@ -1476,18 +1815,24 @@ def calculate_position_pixels(position: str, width: int, height: int, text_width
 def escape_ffmpeg_text(text: str) -> str:
     """Escape special characters for FFmpeg drawtext filter."""
     # Escape single quotes, colons, and backslashes
-    text = text.replace('\\', '\\\\')
+    text = text.replace("\\", "\\\\")
     text = text.replace("'", "\\'")
-    text = text.replace(':', '\\:')
-    text = text.replace('%', '%%')
+    text = text.replace(":", "\\:")
+    text = text.replace("%", "%%")
     return text
 
 
 def get_video_info(path: str) -> Dict[str, Any]:
     """Get video metadata using ffprobe."""
     cmd = [
-        'ffprobe', '-v', 'quiet', '-print_format', 'json',
-        '-show_streams', '-show_format', path
+        "ffprobe",
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_streams",
+        "-show_format",
+        path,
     ]
 
     try:
@@ -1495,27 +1840,26 @@ def get_video_info(path: str) -> Dict[str, Any]:
         info = json.loads(result.stdout)
 
         video_stream = next(
-            (s for s in info.get('streams', []) if s.get('codec_type') == 'video'),
-            {}
+            (s for s in info.get("streams", []) if s.get("codec_type") == "video"), {}
         )
 
         return {
-            'width': int(video_stream.get('width', 1920)),
-            'height': int(video_stream.get('height', 1080)),
-            'duration': float(info.get('format', {}).get('duration', 0))
+            "width": int(video_stream.get("width", 1920)),
+            "height": int(video_stream.get("height", 1080)),
+            "duration": float(info.get("format", {}).get("duration", 0)),
         }
     except:
-        return {'width': 1920, 'height': 1080, 'duration': 0}
+        return {"width": 1920, "height": 1080, "duration": 0}
 
 
 def hex_to_rgb(hex_color: str) -> tuple:
     """Convert hex color to RGB tuple."""
-    hex_color = hex_color.lstrip('#')
+    hex_color = hex_color.lstrip("#")
     if len(hex_color) == 3:
-        hex_color = ''.join([c * 2 for c in hex_color])
+        hex_color = "".join([c * 2 for c in hex_color])
 
     try:
-        return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+        return tuple(int(hex_color[i : i + 2], 16) for i in (0, 2, 4))
     except:
         return (255, 255, 255)
 
@@ -1528,18 +1872,18 @@ if __name__ == "__main__":
         sys.exit(1)
 
     test_config = {
-        'text': 'Sample Caption Text',
-        'position': 'center',  # Default position is now center
-        'fontSize': 48,
-        'fontFamily': 'Arial',
-        'color': '#FFFFFF',
-        'strokeColor': '#000000',
-        'strokeWidth': 2,
-        'shadow': True
+        "text": "Sample Caption Text",
+        "position": "center",  # Default position is now center
+        "fontSize": 48,
+        "fontFamily": "Arial",
+        "color": "#FFFFFF",
+        "strokeColor": "#000000",
+        "strokeWidth": 2,
+        "shadow": True,
     }
 
     def progress(p, msg):
-        print(f"[{int(p*100)}%] {msg}")
+        print(f"[{int(p * 100)}%] {msg}")
 
     result = process_captioner(sys.argv[1], sys.argv[2], test_config, progress)
     print(f"Result: {result}")

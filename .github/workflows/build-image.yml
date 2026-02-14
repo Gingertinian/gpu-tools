@@ -74,6 +74,7 @@ jobs:
           no-cache: true
 
       - name: Restart RunPod workers
+        continue-on-error: true
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           PROD_ENDPOINT_ID: "v5n08urt0qn7hn"
@@ -108,7 +109,10 @@ jobs:
               -d "$(graphql_payload "$query")"
           }
 
-          ENDPOINTS_RESPONSE="$(graphql_call 'query Endpoints { myself { endpoints { id name templateId gpuIds idleTimeout workersMax workersMin } } }')"
+          if ! ENDPOINTS_RESPONSE="$(graphql_call 'query Endpoints { myself { endpoints { id name templateId gpuIds idleTimeout workersMax workersMin } } }')"; then
+            echo "::warning::RunPod restart skipped: unauthorized RUNPOD_API_KEY. Image was pushed to GHCR, but workers were not restarted."
+            exit 0
+          fi
           echo "Fetched endpoint metadata"
 
           ENDPOINT_FIELDS="$(python - "$ENDPOINT_ID" <<'PY' <<< "$ENDPOINTS_RESPONSE"

@@ -79,51 +79,105 @@ jobs:
           PROD_ENDPOINT_ID: "v5n08urt0qn7hn"
           DEV_ENDPOINT_ID: "b32yhnf147dgbo"
         run: |
+          set -euo pipefail
+
           # Determine which endpoint to update based on branch
           if [[ "${{ github.ref }}" == "refs/heads/main" || "${{ github.ref }}" == "refs/heads/master" ]]; then
             ENDPOINT_ID=$PROD_ENDPOINT_ID
-            MAX_WORKERS=5
+            TARGET_MAX_WORKERS=5
             echo "Restarting PRODUCTION workers..."
           else
             ENDPOINT_ID=$DEV_ENDPOINT_ID
-            MAX_WORKERS=1
+            TARGET_MAX_WORKERS=1
             echo "Restarting DEVELOPMENT workers..."
           fi
 
-          if [[ -z "${RUNPOD_API_KEY}" ]]; then
+          if [[ -z "${RUNPOD_API_KEY:-}" ]]; then
             echo "ERROR: RUNPOD_API_KEY secret is not configured"
             exit 1
           fi
 
-          echo "Testing API key (first 10 chars): ${RUNPOD_API_KEY:0:10}..."
+          graphql_payload() {
+            python -c "import json,sys; print(json.dumps({'query': sys.argv[1]}))" "$1"
+          }
 
-          # GraphQL mutation to restart workers (scale down then up)
-          echo "Scaling down workers to 0..."
-          SCALE_DOWN=$(curl -s -X POST "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d '{"query":"mutation{saveEndpoint(input:{id:\"'"${ENDPOINT_ID}"'\",name:\"farmium-gpu-tools -fb\",templateId:\"hjmrqomin1\",workersMax:0,workersMin:0,idleTimeout:10,gpuIds:\"AMPERE_24,AMPERE_48,AMPERE_16\"}){id workersMax}}"}')
+          graphql_call() {
+            local query="$1"
+            curl -sS --fail-with-body -X POST "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d "$(graphql_payload "$query")"
+          }
 
-          echo "Scale down response: ${SCALE_DOWN}"
+          ENDPOINTS_RESPONSE="$(graphql_call 'query Endpoints { myself { endpoints { id name templateId gpuIds idleTimeout workersMax workersMin } } }')"
+          echo "Fetched endpoint metadata"
 
-          if echo "${SCALE_DOWN}" | grep -q '"error"'; then
-            echo "ERROR: Scale down failed"
-            echo "${SCALE_DOWN}"
+          ENDPOINT_FIELDS="$(python - "$ENDPOINT_ID" <<'PY' <<< "$ENDPOINTS_RESPONSE"
+          import json
+          import sys
+
+          endpoint_id = sys.argv[1]
+          payload = json.loads(sys.stdin.read())
+          errors = payload.get("errors") or payload.get("error")
+          if errors:
+              print(json.dumps(payload, indent=2))
+              raise SystemExit("RunPod GraphQL returned errors while reading endpoint config")
+
+          endpoints = ((payload.get("data") or {}).get("myself") or {}).get("endpoints") or []
+          target = next((e for e in endpoints if e.get("id") == endpoint_id), None)
+          if target is None:
+              raise SystemExit(f"Endpoint {endpoint_id} not found in API response")
+
+          print("\t".join([
+              target.get("name") or "",
+              target.get("templateId") or "",
+              target.get("gpuIds") or "",
+              str(target.get("idleTimeout") if target.get("idleTimeout") is not None else 10),
+              str(target.get("workersMax") if target.get("workersMax") is not None else 0),
+          ]))
+          PY
+          )"
+
+          IFS=$'\t' read -r ENDPOINT_NAME TEMPLATE_ID GPU_IDS IDLE_TIMEOUT CURRENT_MAX_WORKERS <<< "$ENDPOINT_FIELDS"
+
+          if [[ -z "${ENDPOINT_NAME}" || -z "${TEMPLATE_ID}" || -z "${GPU_IDS}" ]]; then
+            echo "ERROR: Missing required endpoint fields (name/templateId/gpuIds)"
             exit 1
           fi
 
-          sleep 5
+          echo "Endpoint ${ENDPOINT_ID} config: name='${ENDPOINT_NAME}', template='${TEMPLATE_ID}', gpuIds='${GPU_IDS}', idleTimeout='${IDLE_TIMEOUT}', currentMax='${CURRENT_MAX_WORKERS}'"
 
-          echo "Scaling workers back up to ${MAX_WORKERS}..."
-          SCALE_UP=$(curl -s -X POST "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d '{"query":"mutation{saveEndpoint(input:{id:\"'"${ENDPOINT_ID}"'\",name:\"farmium-gpu-tools -fb\",templateId:\"hjmrqomin1\",workersMax:'"${MAX_WORKERS}"',workersMin:0,idleTimeout:10,gpuIds:\"AMPERE_24,AMPERE_48,AMPERE_16\"}){id workersMax}}"}')
+          build_save_endpoint_query() {
+            python -c "import json,sys; endpoint_id,name,template_id,gpu_ids,idle_timeout,workers_max=sys.argv[1:]; idle=int(float(idle_timeout)) if idle_timeout else 10; max_workers=int(workers_max); print('mutation RestartEndpoint { saveEndpoint(input: { id: %s, name: %s, templateId: %s, gpuIds: %s, idleTimeout: %d, workersMin: 0, workersMax: %d }) { id workersMin workersMax } }' % (json.dumps(endpoint_id), json.dumps(name), json.dumps(template_id), json.dumps(gpu_ids), idle, max_workers))" "$ENDPOINT_ID" "$ENDPOINT_NAME" "$TEMPLATE_ID" "$GPU_IDS" "$IDLE_TIMEOUT" "$1"
+          }
 
-          echo "Scale up response: ${SCALE_UP}"
+          validate_save_response() {
+            python - "$1" <<'PY'
+          import json
+          import sys
 
-          if echo "${SCALE_UP}" | grep -q '"error"'; then
-            echo "ERROR: Scale up failed"
-            echo "${SCALE_UP}"
-            exit 1
-          fi
+          payload = json.loads(sys.argv[1])
+          errors = payload.get("errors") or payload.get("error")
+          if errors:
+              print(json.dumps(payload, indent=2))
+              raise SystemExit("RunPod saveEndpoint returned errors")
+
+          result = (payload.get("data") or {}).get("saveEndpoint")
+          if not result:
+              print(json.dumps(payload, indent=2))
+              raise SystemExit("RunPod saveEndpoint returned empty payload")
+
+          print(json.dumps(result, indent=2))
+          PY
+          }
+
+          echo "Scaling workers down to 0..."
+          SCALE_DOWN_RESPONSE="$(graphql_call "$(build_save_endpoint_query 0)")"
+          validate_save_response "${SCALE_DOWN_RESPONSE}"
+
+          sleep 10
+
+          echo "Scaling workers back up to ${TARGET_MAX_WORKERS}..."
+          SCALE_UP_RESPONSE="$(graphql_call "$(build_save_endpoint_query "${TARGET_MAX_WORKERS}")")"
+          validate_save_response "${SCALE_UP_RESPONSE}"
 
           echo "Workers restarted successfully!"

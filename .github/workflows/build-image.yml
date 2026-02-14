@@ -79,13 +79,6 @@ jobs:
           PROD_ENDPOINT_ID: "v5n08urt0qn7hn"
           DEV_ENDPOINT_ID: "b32yhnf147dgbo"
         run: |
-          set -euo pipefail
-
-          if [[ -z "${RUNPOD_API_KEY:-}" ]]; then
-            echo "RUNPOD_API_KEY is not configured"
-            exit 1
-          fi
-
           # Determine which endpoint to update based on branch
           if [[ "${{ github.ref }}" == "refs/heads/main" || "${{ github.ref }}" == "refs/heads/master" ]]; then
             ENDPOINT_ID=$PROD_ENDPOINT_ID
@@ -97,45 +90,40 @@ jobs:
             echo "Restarting DEVELOPMENT workers..."
           fi
 
-          API_BASE="https://rest.runpod.io/v1"
-          AUTH_HEADER="Authorization: Bearer ${RUNPOD_API_KEY}"
+          if [[ -z "${RUNPOD_API_KEY}" ]]; then
+            echo "ERROR: RUNPOD_API_KEY secret is not configured"
+            exit 1
+          fi
 
-          get_endpoint() {
-            curl -sS --fail \
-              -H "${AUTH_HEADER}" \
-              "${API_BASE}/endpoints/${ENDPOINT_ID}?includeTemplate=true&includeWorkers=true"
-          }
+          echo "Testing API key (first 10 chars): ${RUNPOD_API_KEY:0:10}..."
 
-          patch_endpoint() {
-            local payload="$1"
-            curl -sS --fail -X PATCH \
-              -H "${AUTH_HEADER}" \
-              -H "Content-Type: application/json" \
-              "${API_BASE}/endpoints/${ENDPOINT_ID}" \
-              -d "${payload}"
-          }
-
-          echo "Current endpoint configuration:"
-          current_state="$(get_endpoint)"
-          python -c "import json, sys; d=json.loads(sys.stdin.read()); print(json.dumps({'id': d.get('id'), 'name': d.get('name'), 'workersMin': d.get('workersMin'), 'workersMax': d.get('workersMax'), 'templateId': d.get('templateId'), 'templateImage': (d.get('template') or {}).get('imageName'), 'workerCount': len(d.get('workers') or [])}, indent=2)); assert d.get('id'), 'Failed to read endpoint'" <<< "${current_state}"
-
-          echo "Requested image tags from build: ${DOCKER_METADATA_OUTPUT_TAGS}"
-
-          # Scale down to 0 workers (force restart)
+          # GraphQL mutation to restart workers (scale down then up)
           echo "Scaling down workers to 0..."
-          down_response="$(patch_endpoint '{"workersMin":0,"workersMax":0}')"
-          python -c "import json, sys; d=json.loads(sys.stdin.read()); print(json.dumps({'id': d.get('id'), 'workersMin': d.get('workersMin'), 'workersMax': d.get('workersMax'), 'version': d.get('version')}, indent=2)); assert d.get('workersMax') == 0, 'Scale-down did not apply'" <<< "${down_response}"
+          SCALE_DOWN=$(curl -s -X POST "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"query":"mutation{saveEndpoint(input:{id:\"'"${ENDPOINT_ID}"'\",name:\"farmium-gpu-tools -fb\",templateId:\"hjmrqomin1\",workersMax:0,workersMin:0,idleTimeout:10,gpuIds:\"AMPERE_24,AMPERE_48,AMPERE_16\"}){id workersMax}}"}')
 
-          sleep 10
+          echo "Scale down response: ${SCALE_DOWN}"
 
-          # Scale back up to original worker count
+          if echo "${SCALE_DOWN}" | grep -q '"error"'; then
+            echo "ERROR: Scale down failed"
+            echo "${SCALE_DOWN}"
+            exit 1
+          fi
+
+          sleep 5
+
           echo "Scaling workers back up to ${MAX_WORKERS}..."
-          up_payload="$(printf '{"workersMin":0,"workersMax":%s}' "${MAX_WORKERS}")"
-          up_response="$(patch_endpoint "${up_payload}")"
-          python -c "import json, sys; d=json.loads(sys.stdin.read()); print(json.dumps({'id': d.get('id'), 'workersMin': d.get('workersMin'), 'workersMax': d.get('workersMax'), 'version': d.get('version')}, indent=2)); assert d.get('workersMax') == int(sys.argv[1]), 'Scale-up did not apply'" "${MAX_WORKERS}" <<< "${up_response}"
+          SCALE_UP=$(curl -s -X POST "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{"query":"mutation{saveEndpoint(input:{id:\"'"${ENDPOINT_ID}"'\",name:\"farmium-gpu-tools -fb\",templateId:\"hjmrqomin1\",workersMax:'"${MAX_WORKERS}"',workersMin:0,idleTimeout:10,gpuIds:\"AMPERE_24,AMPERE_48,AMPERE_16\"}){id workersMax}}"}')
 
-          echo "Endpoint state after restart request:"
-          final_state="$(get_endpoint)"
-          python -c "import json, sys; d=json.loads(sys.stdin.read()); print(json.dumps({'id': d.get('id'), 'workersMin': d.get('workersMin'), 'workersMax': d.get('workersMax'), 'templateImage': (d.get('template') or {}).get('imageName'), 'workerCount': len(d.get('workers') or [])}, indent=2))" <<< "${final_state}"
+          echo "Scale up response: ${SCALE_UP}"
+
+          if echo "${SCALE_UP}" | grep -q '"error"'; then
+            echo "ERROR: Scale up failed"
+            echo "${SCALE_UP}"
+            exit 1
+          fi
 
           echo "Workers restarted successfully!"

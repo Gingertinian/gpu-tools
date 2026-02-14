@@ -79,6 +79,13 @@ jobs:
           PROD_ENDPOINT_ID: "v5n08urt0qn7hn"
           DEV_ENDPOINT_ID: "b32yhnf147dgbo"
         run: |
+          set -euo pipefail
+
+          if [[ -z "${RUNPOD_API_KEY:-}" ]]; then
+            echo "RUNPOD_API_KEY is not configured"
+            exit 1
+          fi
+
           # Determine which endpoint to update based on branch
           if [[ "${{ github.ref }}" == "refs/heads/main" || "${{ github.ref }}" == "refs/heads/master" ]]; then
             ENDPOINT_ID=$PROD_ENDPOINT_ID
@@ -90,24 +97,45 @@ jobs:
             echo "Restarting DEVELOPMENT workers..."
           fi
 
-          # GPU IDs: AMPERE_24 (A5000/3090/4090), AMPERE_48 (A6000), AMPERE_16 (A4000)
-          GPU_IDS="AMPERE_24,AMPERE_48,AMPERE_16"
+          API_BASE="https://rest.runpod.io/v1"
+          AUTH_HEADER="Authorization: Bearer ${RUNPOD_API_KEY}"
 
-          # Template ID that points to ghcr.io/gingertinian/gpu-tools:latest
-          TEMPLATE_ID="hjmrqomin1"
+          get_endpoint() {
+            curl -sS --fail \
+              -H "${AUTH_HEADER}" \
+              "${API_BASE}/endpoints/${ENDPOINT_ID}?includeTemplate=true&includeWorkers=true"
+          }
+
+          patch_endpoint() {
+            local payload="$1"
+            curl -sS --fail -X PATCH \
+              -H "${AUTH_HEADER}" \
+              -H "Content-Type: application/json" \
+              "${API_BASE}/endpoints/${ENDPOINT_ID}" \
+              -d "${payload}"
+          }
+
+          echo "Current endpoint configuration:"
+          current_state="$(get_endpoint)"
+          python -c "import json, sys; d=json.loads(sys.stdin.read()); print(json.dumps({'id': d.get('id'), 'name': d.get('name'), 'workersMin': d.get('workersMin'), 'workersMax': d.get('workersMax'), 'templateId': d.get('templateId'), 'templateImage': (d.get('template') or {}).get('imageName'), 'workerCount': len(d.get('workers') or [])}, indent=2)); assert d.get('id'), 'Failed to read endpoint'" <<< "${current_state}"
+
+          echo "Requested image tags from build: ${DOCKER_METADATA_OUTPUT_TAGS}"
 
           # Scale down to 0 workers (force restart)
           echo "Scaling down workers to 0..."
-          curl -s -X POST "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d "{\"query\": \"mutation { saveEndpoint(input: { id: \\\"${ENDPOINT_ID}\\\", name: \\\"farmium-gpu-tools -fb\\\", templateId: \\\"${TEMPLATE_ID}\\\", workersMax: 0, workersMin: 0, idleTimeout: 10, gpuIds: \\\"${GPU_IDS}\\\" }) { id workersMax } }\"}"
+          down_response="$(patch_endpoint '{"workersMin":0,"workersMax":0}')"
+          python -c "import json, sys; d=json.loads(sys.stdin.read()); print(json.dumps({'id': d.get('id'), 'workersMin': d.get('workersMin'), 'workersMax': d.get('workersMax'), 'version': d.get('version')}, indent=2)); assert d.get('workersMax') == 0, 'Scale-down did not apply'" <<< "${down_response}"
 
-          sleep 5
+          sleep 10
 
           # Scale back up to original worker count
           echo "Scaling workers back up to ${MAX_WORKERS}..."
-          curl -s -X POST "https://api.runpod.io/graphql?api_key=${RUNPOD_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d "{\"query\": \"mutation { saveEndpoint(input: { id: \\\"${ENDPOINT_ID}\\\", name: \\\"farmium-gpu-tools -fb\\\", templateId: \\\"${TEMPLATE_ID}\\\", workersMax: ${MAX_WORKERS}, workersMin: 0, idleTimeout: 10, gpuIds: \\\"${GPU_IDS}\\\" }) { id workersMax } }\"}"
+          up_payload="$(printf '{"workersMin":0,"workersMax":%s}' "${MAX_WORKERS}")"
+          up_response="$(patch_endpoint "${up_payload}")"
+          python -c "import json, sys; d=json.loads(sys.stdin.read()); print(json.dumps({'id': d.get('id'), 'workersMin': d.get('workersMin'), 'workersMax': d.get('workersMax'), 'version': d.get('version')}, indent=2)); assert d.get('workersMax') == int(sys.argv[1]), 'Scale-up did not apply'" "${MAX_WORKERS}" <<< "${up_response}"
+
+          echo "Endpoint state after restart request:"
+          final_state="$(get_endpoint)"
+          python -c "import json, sys; d=json.loads(sys.stdin.read()); print(json.dumps({'id': d.get('id'), 'workersMin': d.get('workersMin'), 'workersMax': d.get('workersMax'), 'templateImage': (d.get('template') or {}).get('imageName'), 'workerCount': len(d.get('workers') or [])}, indent=2))" <<< "${final_state}"
 
           echo "Workers restarted successfully!"

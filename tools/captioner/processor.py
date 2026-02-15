@@ -36,7 +36,7 @@ import zipfile
 from typing import Callable, Optional, Dict, Any, List, Tuple
 from io import BytesIO
 from urllib.parse import quote as url_quote
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 import json
 import textwrap
 import numpy as np
@@ -794,10 +794,10 @@ def get_y_ratio_for_position(position: str, config: Dict[str, Any]) -> float:
 # ==================== CAPTION FORMAT PARSING ====================
 
 
-def parse_caption_format(text: str) -> Dict[str, Any]:
+def parse_caption_format(text: str, allow_title: bool = True) -> Dict[str, Any]:
     """
     Parse special caption format:
-    - ##Title## at the start becomes italic title with larger font
+    - ##Title## at the start becomes italic title with larger font (if enabled)
     - &&& becomes newline
     - Straight quotes converted to curly quotes
 
@@ -812,11 +812,12 @@ def parse_caption_format(text: str) -> Dict[str, Any]:
     # Replace straight quotes with curly quotes
     text = replace_quotes(text)
 
-    # Extract ##Title## if present at start
-    title_match = re.match(r"^##(.+?)##\s*", text)
-    if title_match:
-        result["title"] = title_match.group(1)
-        text = text[title_match.end() :]
+    # Extract ##Title## if present at start (only when explicitly enabled)
+    if allow_title:
+        title_match = re.match(r"^##(.+?)##\s*", text)
+        if title_match:
+            result["title"] = title_match.group(1)
+            text = text[title_match.end() :]
 
     # Replace &&& with newlines
     result["body"] = text.replace("&&&", "\n")
@@ -1151,7 +1152,9 @@ def process_image_caption(
 
     # Get the actual text that will be rendered (for logging)
     caption_text = get_caption_for_index(config, image_index)
-    parsed = parse_caption_format(caption_text)
+    parsed = parse_caption_format(
+        caption_text, allow_title=bool(config.get("enableTitleSyntax", False))
+    )
 
     # Face detection (if enabled)
     faces = []
@@ -1432,8 +1435,11 @@ def create_caption_overlay(
     if faces is None:
         faces = []
 
+    show_background = config.get("showBackground", False)
+    enable_title_syntax = bool(config.get("enableTitleSyntax", False))
+
     raw_text = get_caption_for_index(config, image_index)
-    parsed = parse_caption_format(raw_text)
+    parsed = parse_caption_format(raw_text, allow_title=enable_title_syntax)
     title_text = parsed["title"]
     body_text = parsed["body"]
 
@@ -1446,10 +1452,11 @@ def create_caption_overlay(
 
     position = "center" if force_center else config.get("position", "center")
     alignment = config.get("alignment", "center")
-    text_width_ratio = config.get("textWidthRatio", 0.85)
+    text_width_ratio = float(config.get("textWidthRatio", 0.85) or 0.85)
+    if show_background:
+        text_width_ratio = max(0.75, min(0.95, text_width_ratio))
     max_width = int(width * text_width_ratio)
 
-    show_background = config.get("showBackground", False)
     emoji_style = str(config.get("emojiStyle", "ios")).lower()
 
     base_font_size = config.get("fontSize", 47)
@@ -1479,7 +1486,7 @@ def create_caption_overlay(
     stroke_color = config.get("strokeColor", "#000000")
     block_spacing = max(4, int(config.get("blockSpacing", 40) * scale_factor))
     if show_background:
-        line_spacing = max(0, int(font_size * 0.09))
+        line_spacing = max(0, int(font_size * 0.08))
     else:
         line_spacing = max(1, int(config.get("lineSpacing", 20) * scale_factor * 0.5))
 
@@ -1623,10 +1630,10 @@ def create_caption_overlay(
 
     if bg_color:
         bg_pad_x = max(8, int(font_size * 0.32))
-        bg_pad_y = max(4, int(font_size * 0.14))
+        bg_pad_y = max(3, int(font_size * 0.09))
         bubble_height = max(1, get_font_line_height(body_font) + (bg_pad_y * 2))
-        bg_radius = max(8, int(bubble_height * 0.34))
-        bg_join = max(1, int(font_size * 0.05))
+        bg_radius = max(4, int(bubble_height * 0.14))
+        bg_join = 0
     else:
         bg_pad_x = 0
         bg_pad_y = 0
@@ -1651,63 +1658,106 @@ def create_caption_overlay(
     else:
         bg_r = bg_g = bg_b = bg_alpha = 0
 
+    line_layouts: List[Dict[str, Any]] = []
     current_y = base_y
 
     for block_index, block in enumerate(content_blocks):
         block_font = block["font"]
         line_height = int(block["lineHeight"])
+        line_count = len(block["lines"])
 
         for line_index, line in enumerate(block["lines"]):
             line_text = line if line else " "
-            line_width = measure_text_width(line_text, block_font)
+            line_width = int(measure_text_width(line_text, block_font))
 
             if alignment == "left":
                 line_x = base_x
             elif alignment == "right":
-                line_x = base_x + max_content_width - int(line_width)
+                line_x = base_x + max_content_width - line_width
             else:
-                line_x = base_x + (max_content_width - int(line_width)) // 2
+                line_x = base_x + (max_content_width - line_width) // 2
 
-            if bg_color:
-                bg_top = current_y - bg_pad_y
-                bg_bottom = current_y + line_height + bg_pad_y
-                if bg_join > 0:
-                    if line_index > 0:
-                        bg_top -= bg_join
-                    if line_index < len(block["lines"]) - 1:
-                        bg_bottom += bg_join
-
-                draw.rounded_rectangle(
-                    [
-                        line_x - bg_pad_x,
-                        bg_top,
-                        line_x + int(line_width) + bg_pad_x,
-                        bg_bottom,
-                    ],
-                    radius=bg_radius,
-                    fill=(bg_r, bg_g, bg_b, bg_alpha),
-                )
-
-            draw_mixed_text_line(
-                base_image=overlay,
-                draw=draw,
-                text=line_text,
-                x=line_x,
-                y=current_y,
-                font=block_font,
-                text_color=(text_r, text_g, text_b, 255),
-                emoji_style=emoji_style,
-                stroke_color=stroke_rgba,
-                stroke_width=stroke_width,
-                shadow=shadow,
+            line_layouts.append(
+                {
+                    "text": line_text,
+                    "x": line_x,
+                    "y": current_y,
+                    "font": block_font,
+                    "lineWidth": line_width,
+                    "lineHeight": line_height,
+                    "blockIndex": block_index,
+                    "lineIndex": line_index,
+                    "lineCount": line_count,
+                }
             )
 
             current_y += line_height
-            if line_index < len(block["lines"]) - 1:
+            if line_index < line_count - 1:
                 current_y += line_spacing
 
         if block_index < len(content_blocks) - 1:
             current_y += block_spacing
+
+    # Draw all background bubbles first so multi-line joins never cover previous text.
+    if bg_color:
+        aa_factor = 2 if font_size >= 28 else 1
+        bg_mask = Image.new("L", (width * aa_factor, height * aa_factor), 0)
+        bg_draw = ImageDraw.Draw(bg_mask)
+
+        def aa(value: int) -> int:
+            return int(round(value * aa_factor))
+
+        for line in line_layouts:
+            bg_top = line["y"] - bg_pad_y
+            bg_bottom = line["y"] + line["lineHeight"] + bg_pad_y
+
+            if bg_join > 0:
+                if line["lineIndex"] > 0:
+                    bg_top -= bg_join
+                if line["lineIndex"] < line["lineCount"] - 1:
+                    bg_bottom += bg_join
+
+            bubble_left = line["x"] - bg_pad_x
+            bubble_right = line["x"] + line["lineWidth"] + bg_pad_x
+
+            bg_draw.rounded_rectangle(
+                [
+                    aa(bubble_left),
+                    aa(bg_top),
+                    aa(bubble_right),
+                    aa(bg_bottom),
+                ],
+                radius=max(1, aa(bg_radius)),
+                fill=255,
+            )
+
+        # Vector-like contour smoothing on high-res mask to avoid jagged notches.
+        if aa_factor > 1:
+            contour_blur = max(0.6, aa_factor * 0.55)
+            bg_mask = bg_mask.filter(ImageFilter.GaussianBlur(contour_blur))
+            threshold_table = [0] * 140 + [255] * (256 - 140)
+            bg_mask = bg_mask.point(threshold_table)
+
+        if aa_factor > 1:
+            bg_mask = bg_mask.resize((width, height), LANCZOS_RESAMPLE)
+
+        overlay.paste((bg_r, bg_g, bg_b, bg_alpha), (0, 0), bg_mask)
+
+    # Draw text after backgrounds to prevent clipping between joined lines.
+    for line in line_layouts:
+        draw_mixed_text_line(
+            base_image=overlay,
+            draw=draw,
+            text=line["text"],
+            x=line["x"],
+            y=line["y"],
+            font=line["font"],
+            text_color=(text_r, text_g, text_b, 255),
+            emoji_style=emoji_style,
+            stroke_color=stroke_rgba,
+            stroke_width=stroke_width,
+            shadow=shadow,
+        )
 
     # Apply random tilt if enabled
     if tilt_angle != 0:

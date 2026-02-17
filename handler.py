@@ -11,6 +11,8 @@ This handler processes GPU jobs for:
 - Upscale: AI upscaling with Real-ESRGAN
 - Face Swap: Swap faces using InsightFace
 - Video Gen: AI video generation from images
+- Video Reframe: Smart reframing for image/video assets
+- Editor: Timeline-ready media editing/rendering to MP4 (color FX, fades, audio filters)
 
 Usage:
     Deploy to RunPod Serverless with network volume containing tools/ directory
@@ -32,16 +34,32 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue, Empty
 from dataclasses import dataclass
-from typing import Optional, List, Callable, Any, Tuple
+from typing import Optional, List, Callable, Any, Tuple, Dict
 
 # ==================== Constants ====================
 
 # Already-compressed file formats (ZIP_STORED = no compression, saves CPU)
 COMPRESSED_EXTENSIONS = {
-    '.jpg', '.jpeg', '.png', '.webp', '.gif',  # Images (already compressed)
-    '.mp4', '.mov', '.webm', '.mkv', '.avi', '.m4v',  # Videos (already compressed)
-    '.mp3', '.aac', '.ogg', '.flac',  # Audio (already compressed)
-    '.zip', '.gz', '.bz2', '.xz', '.7z',  # Archives
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".gif",  # Images (already compressed)
+    ".mp4",
+    ".mov",
+    ".webm",
+    ".mkv",
+    ".avi",
+    ".m4v",  # Videos (already compressed)
+    ".mp3",
+    ".aac",
+    ".ogg",
+    ".flac",  # Audio (already compressed)
+    ".zip",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".7z",  # Archives
 }
 
 # Larger chunk size for faster downloads (1MB instead of 8KB)
@@ -61,9 +79,9 @@ DOWNLOAD_CHUNK_SIZE = 1024 * 1024  # 1MB
 #   9 GPUs: max(50, 9×10) = 90 workers
 #   20 GPUs: max(50, 20×10) = 200 workers
 
-BASE_DOWNLOAD_WORKERS = 50    # Minimum download connections
-BASE_UPLOAD_WORKERS = 50      # Minimum upload connections
-IO_WORKERS_PER_GPU = 10       # Additional I/O workers per GPU
+BASE_DOWNLOAD_WORKERS = 50  # Minimum download connections
+BASE_UPLOAD_WORKERS = 50  # Minimum upload connections
+IO_WORKERS_PER_GPU = 10  # Additional I/O workers per GPU
 
 # Processing configuration
 PROCESSING_OVERPROVISION = 1.2  # Reduced from 1.5, semaphores handle blocking
@@ -84,9 +102,39 @@ def get_optimal_io_workers(gpu_count: int) -> tuple:
 
     return download_workers, upload_workers
 
+
 # Add tools directory to path
-WORKSPACE = os.environ.get('WORKSPACE', '/workspace')
-sys.path.insert(0, os.path.join(WORKSPACE, 'tools'))
+WORKSPACE = os.environ.get("WORKSPACE", "/workspace")
+sys.path.insert(0, os.path.join(WORKSPACE, "tools"))
+
+# ==================== Phase 0: GTP Support ====================
+# Import GTP utilities for reliable file transfers with 7 invariants:
+# 1. Content-Addressable Verification (SHA-256)
+# 2. Atomic Upload-Then-Confirm (manifest sidecar)
+# 3. Idempotent Retry (exponential backoff)
+# 4. Bounded Lifetime (expiration tracking)
+# 5. Size Verification
+# 6. Content-Type Consistency
+# 7. Structured Error Propagation
+
+# Enable GTP mode by default (set to False to disable)
+USE_GTP = os.environ.get("USE_GTP", "true").lower() in ("true", "1", "yes")
+
+if USE_GTP:
+    try:
+        from gtp_utils import download_file_gtp, upload_file_gtp, TransferError
+
+        # Replace default functions with GTP-enabled versions
+        download_file_original = None  # Will be defined below
+        upload_file_original = None  # Will be defined below
+        print("[GTP] Global Transfer Protocol enabled (7 invariants active)")
+    except ImportError as e:
+        print(
+            f"[GTP] WARNING: GTP utilities not available ({e}), falling back to standard transfers"
+        )
+        USE_GTP = False
+else:
+    print("[GTP] Global Transfer Protocol disabled (standard transfers)")
 
 # ==================== Import Tool Processors ====================
 
@@ -154,16 +202,25 @@ except ImportError:
 # Video Reframe - Use GPU-optimized processor
 try:
     from video_reframe.processor_gpu import process_video_reframe
+
     print("[Handler] Using GPU-optimized video_reframe processor")
 except ImportError:
     try:
         from video_reframe.processor import process_video_reframe
+
         print("[Handler] Using standard video_reframe processor")
     except ImportError:
         process_video_reframe = None
 
+# Editor
+try:
+    from editor.processor import process_editor
+except ImportError:
+    process_editor = None
+
 
 # ==================== Helper Functions ====================
+
 
 def get_zip_compression(filepath: str) -> int:
     """
@@ -178,11 +235,28 @@ def get_zip_compression(filepath: str) -> int:
 
 
 def download_file(url: str, path: str) -> None:
-    """Download file from presigned URL with optimized chunk size"""
+    """
+    Download file from presigned URL with optimized chunk size.
+
+    Phase 0: Uses GTP (Global Transfer Protocol) when enabled for:
+    - SHA-256 hash verification
+    - Manifest validation
+    - Size verification
+    - Automatic retry with exponential backoff
+    """
+    if USE_GTP:
+        try:
+            download_file_gtp(url, path)
+            return
+        except Exception as e:
+            print(f"[GTP] Download failed with GTP, falling back to standard: {e}")
+            # Fall through to standard download
+
+    # Standard download (no verification)
     response = requests.get(url, stream=True, timeout=300)
     response.raise_for_status()
 
-    with open(path, 'wb') as f:
+    with open(path, "wb") as f:
         for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
             f.write(chunk)
 
@@ -192,24 +266,39 @@ def upload_file(path: str, url: str, max_retries: int = 3) -> dict:
     Upload file to presigned URL with retry logic and verification.
     Returns dict with upload status and details.
     Raises exception on failure after all retries.
+
+    Phase 0: Uses GTP (Global Transfer Protocol) when enabled for:
+    - SHA-256 hash computation
+    - Manifest sidecar upload
+    - Size verification
+    - Automatic retry with exponential backoff + jitter
     """
+    if USE_GTP:
+        try:
+            result = upload_file_gtp(path, url, max_retries)
+            return result
+        except Exception as e:
+            print(f"[GTP] Upload failed with GTP, falling back to standard: {e}")
+            # Fall through to standard upload
+
+    # Standard upload (no manifest)
     ext = os.path.splitext(path)[1].lower()
     content_types = {
-        '.zip': 'application/zip',
-        '.jpg': 'image/jpeg',
-        '.jpeg': 'image/jpeg',
-        '.png': 'image/png',
-        '.webp': 'image/webp',
-        '.gif': 'image/gif',
-        '.bmp': 'image/bmp',
-        '.mp4': 'video/mp4',
-        '.mov': 'video/quicktime',
-        '.webm': 'video/webm',
-        '.mkv': 'video/x-matroska',
-        '.avi': 'video/x-msvideo',
-        '.m4v': 'video/x-m4v',
+        ".zip": "application/zip",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".bmp": "image/bmp",
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".webm": "video/webm",
+        ".mkv": "video/x-matroska",
+        ".avi": "video/x-msvideo",
+        ".m4v": "video/x-m4v",
     }
-    content_type = content_types.get(ext, 'application/octet-stream')
+    content_type = content_types.get(ext, "application/octet-stream")
 
     # Verify file exists and has content
     if not os.path.exists(path):
@@ -222,43 +311,46 @@ def upload_file(path: str, url: str, max_retries: int = 3) -> dict:
         raise ValueError(f"Output file is empty: {path}")
 
     # Extract destination key from URL for logging (hide signature)
-    url_path = url.split('?')[0].split('/')[-2:] if '?' in url else ['unknown']
-    dest_key = '/'.join(url_path)
-    print(f"[Upload] Starting: {os.path.basename(path)} ({file_size/1024/1024:.2f}MB) -> {dest_key}")
+    url_path = url.split("?")[0].split("/")[-2:] if "?" in url else ["unknown"]
+    dest_key = "/".join(url_path)
+    print(
+        f"[Upload] Starting: {os.path.basename(path)} ({file_size / 1024 / 1024:.2f}MB) -> {dest_key}"
+    )
 
     last_error = None
     for attempt in range(max_retries):
         try:
             start_time = time.time()
-            with open(path, 'rb') as f:
+            with open(path, "rb") as f:
                 response = requests.put(
-                    url,
-                    data=f,
-                    headers={'Content-Type': content_type},
-                    timeout=600
+                    url, data=f, headers={"Content-Type": content_type}, timeout=600
                 )
                 response.raise_for_status()
 
             elapsed = time.time() - start_time
             speed_mbps = (file_size / 1024 / 1024) / elapsed if elapsed > 0 else 0
-            print(f"[Upload] SUCCESS: {os.path.basename(path)} uploaded in {elapsed:.1f}s ({speed_mbps:.1f} MB/s) - Status: {response.status_code}")
+            print(
+                f"[Upload] SUCCESS: {os.path.basename(path)} uploaded in {elapsed:.1f}s ({speed_mbps:.1f} MB/s) - Status: {response.status_code}"
+            )
 
             # Upload succeeded
             return {
                 "uploaded": True,
                 "size": file_size,
                 "contentType": content_type,
-                "attempts": attempt + 1
+                "attempts": attempt + 1,
             }
         except requests.exceptions.RequestException as e:
             last_error = e
             error_detail = str(e)
-            if hasattr(e, 'response') and e.response is not None:
+            if hasattr(e, "response") and e.response is not None:
                 error_detail = f"HTTP {e.response.status_code}: {e.response.text[:200]}"
-            print(f"[Upload] FAILED attempt {attempt+1}/{max_retries}: {error_detail}")
+            print(
+                f"[Upload] FAILED attempt {attempt + 1}/{max_retries}: {error_detail}"
+            )
             if attempt < max_retries - 1:
                 # Exponential backoff: 1s, 2s, 4s
-                wait_time = (2 ** attempt)
+                wait_time = 2**attempt
                 print(f"[Upload] Retrying in {wait_time}s...")
                 time.sleep(wait_time)
 
@@ -269,12 +361,14 @@ def upload_file(path: str, url: str, max_retries: int = 3) -> dict:
 
 def create_progress_callback(job):
     """Create a progress callback that sends updates to RunPod"""
+
     def callback(progress: float, message: str = None):
         scaled_progress = int(10 + progress * 80)
         update = {"progress": scaled_progress}
         if message:
             update["status"] = message
         runpod.serverless.progress_update(job, update)
+
     return callback
 
 
@@ -282,26 +376,28 @@ def get_file_extension(url: str, config: dict) -> str:
     """Extract file extension from URL or config"""
     ext = config.get("inputExtension")
     if not ext:
-        url_path = url.split('?')[0]
+        url_path = url.split("?")[0]
         ext = os.path.splitext(url_path)[1].lower() or ".jpg"
     return ext
 
 
 def is_image(ext: str) -> bool:
     """Check if extension is an image format"""
-    return ext.lower() in ['.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif']
+    return ext.lower() in [".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"]
 
 
 def is_video(ext: str) -> bool:
     """Check if extension is a video format"""
-    return ext.lower() in ['.mp4', '.mov', '.avi', '.webm', '.mkv', '.m4v']
+    return ext.lower() in [".mp4", ".mov", ".avi", ".webm", ".mkv", ".m4v"]
 
 
 # ==================== Async Pipeline Data Classes ====================
 
+
 @dataclass
 class WorkItem:
     """Represents a single item in the processing pipeline"""
+
     index: int
     input_url: str
     output_url: str
@@ -356,12 +452,21 @@ def get_gpu_info(force_refresh: bool = False) -> dict:
     try:
         # Query comprehensive GPU info: name, memory total, memory free
         result = subprocess.run(
-            ['nvidia-smi', '--query-gpu=name,memory.total,memory.free,utilization.gpu',
-             '--format=csv,noheader,nounits'],
-            capture_output=True, text=True, timeout=10
+            [
+                "nvidia-smi",
+                "--query-gpu=name,memory.total,memory.free,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
         if result.returncode == 0:
-            gpu_lines = [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
+            gpu_lines = [
+                line.strip()
+                for line in result.stdout.strip().split("\n")
+                if line.strip()
+            ]
             gpu_count = len(gpu_lines)
 
             gpu_names = []
@@ -370,39 +475,66 @@ def get_gpu_info(force_refresh: bool = False) -> dict:
             gpu_utilization = []
 
             for line in gpu_lines:
-                parts = [p.strip() for p in line.split(',')]
-                gpu_names.append(parts[0] if len(parts) > 0 else 'Unknown')
-                gpu_memory_mb.append(int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0)
-                gpu_memory_free_mb.append(int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0)
-                gpu_utilization.append(int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0)
+                parts = [p.strip() for p in line.split(",")]
+                gpu_names.append(parts[0] if len(parts) > 0 else "Unknown")
+                gpu_memory_mb.append(
+                    int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+                )
+                gpu_memory_free_mb.append(
+                    int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+                )
+                gpu_utilization.append(
+                    int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+                )
 
-            gpu_name = gpu_names[0] if gpu_names else 'Unknown'
+            gpu_name = gpu_names[0] if gpu_names else "Unknown"
 
             # Datacenter GPUs have unlimited NVENC sessions
-            datacenter_keywords = ['A100', 'A6000', 'A5000', 'A4000', 'A4500', 'A40', 'A30', 'A10',
-                                   'V100', 'T4', 'Quadro', 'Tesla', 'H100', 'L40', 'L4', 'RTX 6000', 'RTX 4090']
+            datacenter_keywords = [
+                "A100",
+                "A6000",
+                "A5000",
+                "A4000",
+                "A4500",
+                "A40",
+                "A30",
+                "A10",
+                "V100",
+                "T4",
+                "Quadro",
+                "Tesla",
+                "H100",
+                "L40",
+                "L4",
+                "RTX 6000",
+                "RTX 4090",
+            ]
             is_datacenter = any(kw in gpu_name for kw in datacenter_keywords)
-            gpu_type = 'datacenter' if is_datacenter else 'consumer'
+            gpu_type = "datacenter" if is_datacenter else "consumer"
 
             # NVENC session limits: datacenter = unlimited (use 12), consumer = 3
             base_sessions = 12 if is_datacenter else 3
             nvenc_sessions = base_sessions * gpu_count
 
             print(f"[GPU Detection] Found {gpu_count} GPU(s): {gpu_name}")
-            print(f"[GPU Detection] Type: {gpu_type}, Sessions/GPU: {base_sessions}, Total: {nvenc_sessions}")
-            print(f"[GPU Detection] Memory: {gpu_memory_mb} MB, Free: {gpu_memory_free_mb} MB")
+            print(
+                f"[GPU Detection] Type: {gpu_type}, Sessions/GPU: {base_sessions}, Total: {nvenc_sessions}"
+            )
+            print(
+                f"[GPU Detection] Memory: {gpu_memory_mb} MB, Free: {gpu_memory_free_mb} MB"
+            )
             print(f"[GPU Detection] Utilization: {gpu_utilization}%")
 
             _GPU_INFO_CACHE = {
-                'gpu_name': gpu_name,
-                'gpu_names': gpu_names,
-                'gpu_type': gpu_type,
-                'gpu_count': gpu_count,
-                'gpu_memory_mb': gpu_memory_mb,
-                'gpu_memory_free_mb': gpu_memory_free_mb,
-                'gpu_utilization': gpu_utilization,
-                'nvenc_sessions': nvenc_sessions,
-                'nvenc_sessions_per_gpu': base_sessions
+                "gpu_name": gpu_name,
+                "gpu_names": gpu_names,
+                "gpu_type": gpu_type,
+                "gpu_count": gpu_count,
+                "gpu_memory_mb": gpu_memory_mb,
+                "gpu_memory_free_mb": gpu_memory_free_mb,
+                "gpu_utilization": gpu_utilization,
+                "nvenc_sessions": nvenc_sessions,
+                "nvenc_sessions_per_gpu": base_sessions,
             }
             return _GPU_INFO_CACHE
 
@@ -411,15 +543,15 @@ def get_gpu_info(force_refresh: bool = False) -> dict:
 
     # Fallback for no GPU or error
     _GPU_INFO_CACHE = {
-        'gpu_name': 'Unknown',
-        'gpu_names': ['Unknown'],
-        'gpu_type': 'default',
-        'gpu_count': 1,
-        'gpu_memory_mb': [0],
-        'gpu_memory_free_mb': [0],
-        'gpu_utilization': [0],
-        'nvenc_sessions': 2,
-        'nvenc_sessions_per_gpu': 2
+        "gpu_name": "Unknown",
+        "gpu_names": ["Unknown"],
+        "gpu_type": "default",
+        "gpu_count": 1,
+        "gpu_memory_mb": [0],
+        "gpu_memory_free_mb": [0],
+        "gpu_utilization": [0],
+        "nvenc_sessions": 2,
+        "nvenc_sessions_per_gpu": 2,
     }
     return _GPU_INFO_CACHE
 
@@ -432,16 +564,19 @@ class GPULoadTracker:
     IMPROVED: Uses semaphores to enforce REAL limits per GPU.
     Critical for scaling to 9+ GPUs without over-subscription.
     """
+
     def __init__(self, gpu_count: int, max_sessions_per_gpu: int):
         self.gpu_count = gpu_count
         self.max_sessions_per_gpu = max_sessions_per_gpu
         self.active_jobs = [0] * gpu_count  # Current active jobs per GPU
-        self.total_jobs = [0] * gpu_count   # Total jobs assigned per GPU
+        self.total_jobs = [0] * gpu_count  # Total jobs assigned per GPU
         self.lock = threading.Lock()
 
         # CRITICAL: Semaphores enforce REAL limits per GPU
         # Prevents over-subscription when scaling to many GPUs
-        self._gpu_semaphores = {i: threading.Semaphore(max_sessions_per_gpu) for i in range(gpu_count)}
+        self._gpu_semaphores = {
+            i: threading.Semaphore(max_sessions_per_gpu) for i in range(gpu_count)
+        }
 
     def get_best_gpu(self, blocking: bool = True, timeout: float = None) -> int:
         """
@@ -474,7 +609,9 @@ class GPULoadTracker:
         start_gpu = gpu_order[0]
         for i in range(self.gpu_count):
             gpu_id = (start_gpu + i) % self.gpu_count
-            acquired = self._gpu_semaphores[gpu_id].acquire(blocking=True, timeout=timeout)
+            acquired = self._gpu_semaphores[gpu_id].acquire(
+                blocking=True, timeout=timeout
+            )
             if acquired:
                 with self.lock:
                     self.active_jobs[gpu_id] += 1
@@ -503,14 +640,15 @@ class GPULoadTracker:
         """Get current load statistics."""
         with self.lock:
             return {
-                'active_jobs': list(self.active_jobs),
-                'total_jobs': list(self.total_jobs),
-                'capacity_per_gpu': self.max_sessions_per_gpu,
-                'total_capacity': self.max_sessions_per_gpu * self.gpu_count
+                "active_jobs": list(self.active_jobs),
+                "total_jobs": list(self.total_jobs),
+                "capacity_per_gpu": self.max_sessions_per_gpu,
+                "total_capacity": self.max_sessions_per_gpu * self.gpu_count,
             }
 
 
 # ==================== Async Pipeline Implementation ====================
+
 
 class AsyncPipelineProcessor:
     """
@@ -535,31 +673,37 @@ class AsyncPipelineProcessor:
         job,
         temp_dir: str,
         download_workers: int = None,
-        upload_workers: int = None
+        upload_workers: int = None,
     ):
         self.gpu_info = gpu_info
         self.job = job
         self.temp_dir = temp_dir
 
         # MEGA-GPU: Scale I/O workers based on GPU count
-        gpu_count = gpu_info.get('gpu_count', 1)
+        gpu_count = gpu_info.get("gpu_count", 1)
         optimal_download, optimal_upload = get_optimal_io_workers(gpu_count)
 
         self.download_workers = download_workers or optimal_download
         self.upload_workers = upload_workers or optimal_upload
 
         # Calculate processing workers: smaller buffer, semaphores handle blocking
-        nvenc_sessions = gpu_info.get('nvenc_sessions', 6)
+        nvenc_sessions = gpu_info.get("nvenc_sessions", 6)
         self.processing_workers = int(nvenc_sessions * PROCESSING_OVERPROVISION)
 
         # GPU load tracking
-        gpu_count = gpu_info.get('gpu_count', 1)
-        self.gpu_tracker = GPULoadTracker(gpu_count, gpu_info.get('nvenc_sessions_per_gpu', 3))
+        gpu_count = gpu_info.get("gpu_count", 1)
+        self.gpu_tracker = GPULoadTracker(
+            gpu_count, gpu_info.get("nvenc_sessions_per_gpu", 3)
+        )
 
         # Thread-safe queues for pipeline stages
         self.download_queue: Queue[WorkItem] = Queue()  # Items ready to download
-        self.process_queue: Queue[WorkItem] = Queue()   # Items ready to process (downloaded)
-        self.upload_queue: Queue[WorkItem] = Queue()    # Items ready to upload (processed)
+        self.process_queue: Queue[WorkItem] = (
+            Queue()
+        )  # Items ready to process (downloaded)
+        self.upload_queue: Queue[WorkItem] = (
+            Queue()
+        )  # Items ready to upload (processed)
 
         # Results tracking
         self.results: List[Optional[dict]] = []
@@ -590,10 +734,10 @@ class AsyncPipelineProcessor:
         # Timing metrics
         self.start_time = 0
         self.pipeline_metrics = {
-            'download_wait_time': 0,
-            'process_wait_time': 0,
-            'upload_wait_time': 0,
-            'gpu_idle_time': 0
+            "download_wait_time": 0,
+            "process_wait_time": 0,
+            "upload_wait_time": 0,
+            "gpu_idle_time": 0,
         }
 
     def _download_worker(self, item: WorkItem) -> None:
@@ -622,17 +766,29 @@ class AsyncPipelineProcessor:
             if should_download:
                 # We're responsible for downloading this file
                 download_file(item.input_url, item.input_path)
-                item.input_size = os.path.getsize(item.input_path) if os.path.exists(item.input_path) else 0
+                item.input_size = (
+                    os.path.getsize(item.input_path)
+                    if os.path.exists(item.input_path)
+                    else 0
+                )
                 item.download_time = time.time() - start_time
 
-                speed_mbps = (item.input_size / 1024 / 1024) / item.download_time if item.download_time > 0 else 0
-                print(f"[Download {item.index}] {item.input_size/1024/1024:.2f}MB in {item.download_time:.2f}s ({speed_mbps:.2f} MB/s)")
+                speed_mbps = (
+                    (item.input_size / 1024 / 1024) / item.download_time
+                    if item.download_time > 0
+                    else 0
+                )
+                print(
+                    f"[Download {item.index}] {item.input_size / 1024 / 1024:.2f}MB in {item.download_time:.2f}s ({speed_mbps:.2f} MB/s)"
+                )
 
                 # Signal that download is complete
                 download_event.set()
             else:
                 # Wait for another worker to finish downloading
-                print(f"[Download {item.index}] Waiting for cached download of {os.path.basename(input_path)}...")
+                print(
+                    f"[Download {item.index}] Waiting for cached download of {os.path.basename(input_path)}..."
+                )
                 download_event.wait(timeout=300)  # 5 min timeout
 
                 # Check if download failed
@@ -640,9 +796,15 @@ class AsyncPipelineProcessor:
                     if input_path in self._download_cache_errors:
                         raise Exception(self._download_cache_errors[input_path])
 
-                item.input_size = os.path.getsize(item.input_path) if os.path.exists(item.input_path) else 0
+                item.input_size = (
+                    os.path.getsize(item.input_path)
+                    if os.path.exists(item.input_path)
+                    else 0
+                )
                 item.download_time = time.time() - start_time
-                print(f"[Download {item.index}] Using cached file (waited {item.download_time:.2f}s)")
+                print(
+                    f"[Download {item.index}] Using cached file (waited {item.download_time:.2f}s)"
+                )
 
             item.download_complete = True
 
@@ -674,7 +836,7 @@ class AsyncPipelineProcessor:
                 self.results[item.index] = {
                     "index": item.index,
                     "status": "failed",
-                    "error": item.error
+                    "error": item.error,
                 }
 
     def _process_worker(self) -> None:
@@ -693,7 +855,7 @@ class AsyncPipelineProcessor:
 
                 wait_time = time.time() - wait_start
                 with self.stats_lock:
-                    self.pipeline_metrics['process_wait_time'] += wait_time
+                    self.pipeline_metrics["process_wait_time"] += wait_time
 
                 if item is None:  # Poison pill
                     break
@@ -718,13 +880,17 @@ class AsyncPipelineProcessor:
                         item.output_size = result.get("output_size", 0)
                         item.result = result
 
-                        print(f"[Process {item.index}] GPU {gpu_id} completed in {item.process_time:.2f}s")
+                        print(
+                            f"[Process {item.index}] GPU {gpu_id} completed in {item.process_time:.2f}s"
+                        )
 
                         # Add to upload queue immediately
                         self.upload_queue.put(item)
                     else:
                         item.error = result.get("error", "Unknown processing error")
-                        print(f"[Process {item.index}] GPU {gpu_id} FAILED: {item.error[:100]}")
+                        print(
+                            f"[Process {item.index}] GPU {gpu_id} FAILED: {item.error[:100]}"
+                        )
 
                         with self.stats_lock:
                             self.failed_count += 1
@@ -734,14 +900,16 @@ class AsyncPipelineProcessor:
                                 "index": item.index,
                                 "status": "failed",
                                 "error": item.error,
-                                "gpu_id": gpu_id
+                                "gpu_id": gpu_id,
                             }
 
                 except Exception as e:
                     item.error = str(e)
                     item.process_time = time.time() - start_time
 
-                    print(f"[Process {item.index}] GPU {gpu_id} EXCEPTION: {str(e)[:100]}")
+                    print(
+                        f"[Process {item.index}] GPU {gpu_id} EXCEPTION: {str(e)[:100]}"
+                    )
 
                     with self.stats_lock:
                         self.failed_count += 1
@@ -751,7 +919,7 @@ class AsyncPipelineProcessor:
                             "index": item.index,
                             "status": "failed",
                             "error": item.error,
-                            "gpu_id": gpu_id
+                            "gpu_id": gpu_id,
                         }
                 finally:
                     self.gpu_tracker.complete_job(gpu_id)
@@ -772,7 +940,7 @@ class AsyncPipelineProcessor:
             **item.config,
             "_gpu_id": item.gpu_id,
             "_cuda_device": item.gpu_id,
-            "_ffmpeg_loglevel": "info"
+            "_ffmpeg_loglevel": "info",
         }
 
         tool = item.tool
@@ -835,12 +1003,20 @@ class AsyncPipelineProcessor:
 
         elif tool == "video_reframe":
             if process_video_reframe is not None:
-                result = process_video_reframe(item.input_path, item.output_path, gpu_config)
+                result = process_video_reframe(
+                    item.input_path, item.output_path, gpu_config
+                )
                 # video_reframe may change output path for images
-                if result and result.get('outputPath'):
-                    item.output_path = result['outputPath']
+                if result and result.get("outputPath"):
+                    item.output_path = result["outputPath"]
             else:
                 return {"status": "failed", "error": "Video Reframe not available"}
+
+        elif tool == "editor":
+            if process_editor is not None:
+                process_editor(item.input_path, item.output_path, gpu_config)
+            else:
+                return {"status": "failed", "error": "Editor not available"}
 
         else:
             return {"status": "failed", "error": f"Unknown tool: {tool}"}
@@ -852,7 +1028,7 @@ class AsyncPipelineProcessor:
                 "status": "completed",
                 "output_path": item.output_path,
                 "output_size": output_size,
-                "gpu_id": item.gpu_id
+                "gpu_id": item.gpu_id,
             }
         else:
             return {"status": "failed", "error": "Output file not created"}
@@ -873,7 +1049,7 @@ class AsyncPipelineProcessor:
 
                 wait_time = time.time() - wait_start
                 with self.stats_lock:
-                    self.pipeline_metrics['upload_wait_time'] += wait_time
+                    self.pipeline_metrics["upload_wait_time"] += wait_time
 
                 if item is None:  # Poison pill
                     break
@@ -889,8 +1065,14 @@ class AsyncPipelineProcessor:
                     item.upload_time = time.time() - start_time
                     item.upload_complete = True
 
-                    speed_mbps = (item.output_size / 1024 / 1024) / item.upload_time if item.upload_time > 0 else 0
-                    print(f"[Upload {item.index}] {item.output_size/1024/1024:.2f}MB in {item.upload_time:.2f}s ({speed_mbps:.2f} MB/s)")
+                    speed_mbps = (
+                        (item.output_size / 1024 / 1024) / item.upload_time
+                        if item.upload_time > 0
+                        else 0
+                    )
+                    print(
+                        f"[Upload {item.index}] {item.output_size / 1024 / 1024:.2f}MB in {item.upload_time:.2f}s ({speed_mbps:.2f} MB/s)"
+                    )
 
                     # Record success
                     with self.results_lock:
@@ -903,7 +1085,7 @@ class AsyncPipelineProcessor:
                             "input_size": item.input_size,
                             "output_size": item.output_size,
                             "download_time": item.download_time,
-                            "upload_time": item.upload_time
+                            "upload_time": item.upload_time,
                         }
 
                 except Exception as e:
@@ -920,7 +1102,7 @@ class AsyncPipelineProcessor:
                             "index": item.index,
                             "status": "upload_failed",
                             "error": item.error,
-                            "gpu_id": item.gpu_id
+                            "gpu_id": item.gpu_id,
                         }
                 finally:
                     with self.stats_lock:
@@ -930,11 +1112,7 @@ class AsyncPipelineProcessor:
                 print(f"[Upload Worker] Unexpected error: {e}")
 
     def process_batch(
-        self,
-        input_urls: List[str],
-        output_urls: List[str],
-        tool: str,
-        config: dict
+        self, input_urls: List[str], output_urls: List[str], tool: str, config: dict
     ) -> dict:
         """
         Process a batch of files using the async pipeline.
@@ -949,36 +1127,57 @@ class AsyncPipelineProcessor:
         self.total_items = len(input_urls)
         self.results = [None] * self.total_items
 
-        gpu_count = self.gpu_info.get('gpu_count', 1)
-        nvenc_sessions = self.gpu_info.get('nvenc_sessions', 6)
-        gpu_name = self.gpu_info.get('gpu_name', 'Unknown')
-        sessions_per_gpu = self.gpu_info.get('nvenc_sessions_per_gpu', 16)
+        gpu_count = self.gpu_info.get("gpu_count", 1)
+        nvenc_sessions = self.gpu_info.get("nvenc_sessions", 6)
+        gpu_name = self.gpu_info.get("gpu_name", "Unknown")
+        sessions_per_gpu = self.gpu_info.get("nvenc_sessions_per_gpu", 16)
 
         # Calculate theoretical throughput (assuming ~2s per video encode)
         theoretical_throughput = nvenc_sessions / 2.0  # videos/second
-        estimated_time = self.total_items / theoretical_throughput if theoretical_throughput > 0 else 0
+        estimated_time = (
+            self.total_items / theoretical_throughput
+            if theoretical_throughput > 0
+            else 0
+        )
 
         print(f"[AsyncPipeline] =============== MEGA-GPU BATCH START ===============")
         print(f"[AsyncPipeline] GPU Model: {gpu_name}")
-        print(f"[AsyncPipeline] GPU Count: {gpu_count} | Sessions/GPU: {sessions_per_gpu}")
-        print(f"[AsyncPipeline] Total NVENC Capacity: {nvenc_sessions} parallel encodes")
+        print(
+            f"[AsyncPipeline] GPU Count: {gpu_count} | Sessions/GPU: {sessions_per_gpu}"
+        )
+        print(
+            f"[AsyncPipeline] Total NVENC Capacity: {nvenc_sessions} parallel encodes"
+        )
         print(f"[AsyncPipeline] ---")
         print(f"[AsyncPipeline] Items to Process: {self.total_items} | Tool: {tool}")
         print(f"[AsyncPipeline] Download Workers: {self.download_workers}")
         print(f"[AsyncPipeline] Process Workers: {self.processing_workers}")
         print(f"[AsyncPipeline] Upload Workers: {self.upload_workers}")
         print(f"[AsyncPipeline] ---")
-        print(f"[AsyncPipeline] Theoretical Throughput: ~{theoretical_throughput:.1f} videos/sec")
-        print(f"[AsyncPipeline] Estimated Time: ~{estimated_time:.1f}s ({estimated_time/60:.1f} min)")
-        print(f"[AsyncPipeline] =======================================================")
+        print(
+            f"[AsyncPipeline] Theoretical Throughput: ~{theoretical_throughput:.1f} videos/sec"
+        )
+        print(
+            f"[AsyncPipeline] Estimated Time: ~{estimated_time:.1f}s ({estimated_time / 60:.1f} min)"
+        )
+        print(
+            f"[AsyncPipeline] ======================================================="
+        )
 
         # Check for spoofer variations - need to expand work items
         # Supports both 'variations' and legacy 'copies' for backward compatibility
-        variations = config.get("variations") or config.get("copies") or config.get("options", {}).get("variations") or config.get("options", {}).get("copies", 1)
+        variations = (
+            config.get("variations")
+            or config.get("copies")
+            or config.get("options", {}).get("variations")
+            or config.get("options", {}).get("copies", 1)
+        )
         is_spoofer_batch = tool == "spoofer" and variations > 1
 
         if is_spoofer_batch:
-            print(f"[AsyncPipeline] SPOOFER BATCH MODE: {len(input_urls)} inputs × {variations} variations = {len(input_urls) * variations} outputs")
+            print(
+                f"[AsyncPipeline] SPOOFER BATCH MODE: {len(input_urls)} inputs × {variations} variations = {len(input_urls) * variations} outputs"
+            )
 
         # Prepare work items
         work_items = []
@@ -990,10 +1189,16 @@ class AsyncPipelineProcessor:
             # Determine output extension
             if tool == "bg_remove":
                 output_ext = ".png"
-            elif tool in ["pic_to_video", "video_gen"]:
+            elif tool in ["pic_to_video", "video_gen", "editor"]:
                 output_ext = ".mp4"
-            elif tool in ["spoofer", "captioner", "vignettes", "resize", "video_reframe"]:
-                output_ext = ext if is_video(ext) else '.jpg'
+            elif tool in [
+                "spoofer",
+                "captioner",
+                "vignettes",
+                "resize",
+                "video_reframe",
+            ]:
+                output_ext = ext if is_video(ext) else ".jpg"
             else:
                 output_ext = ext
 
@@ -1006,20 +1211,31 @@ class AsyncPipelineProcessor:
                         "variations": 1,  # Process single variation per work item
                         "copies": 1,  # Legacy support
                         "_variation_index": var_idx,
-                        "_seed": int(time.time() * 1000) + work_index * 12345,  # Unique seed per variation
+                        "_seed": int(time.time() * 1000)
+                        + work_index * 12345,  # Unique seed per variation
                     }
                     # Remove options.copies/variations if present (set to 1)
                     if "options" in var_config:
-                        var_config["options"] = {**var_config["options"], "variations": 1, "copies": 1}
+                        var_config["options"] = {
+                            **var_config["options"],
+                            "variations": 1,
+                            "copies": 1,
+                        }
 
                     item = WorkItem(
                         index=work_index,
                         input_url=input_url,  # Same input URL for all variations
-                        output_url=f"{output_url.rsplit('.', 1)[0]}_v{var_idx:04d}.{output_url.rsplit('.', 1)[1]}" if '.' in output_url else f"{output_url}_v{var_idx:04d}",
-                        input_path=os.path.join(self.temp_dir, f"input_{i}{ext}"),  # Share input file
-                        output_path=os.path.join(self.temp_dir, f"output_{i}_v{var_idx:04d}{output_ext}"),
+                        output_url=f"{output_url.rsplit('.', 1)[0]}_v{var_idx:04d}.{output_url.rsplit('.', 1)[1]}"
+                        if "." in output_url
+                        else f"{output_url}_v{var_idx:04d}",
+                        input_path=os.path.join(
+                            self.temp_dir, f"input_{i}{ext}"
+                        ),  # Share input file
+                        output_path=os.path.join(
+                            self.temp_dir, f"output_{i}_v{var_idx:04d}{output_ext}"
+                        ),
                         tool=tool,
-                        config=var_config
+                        config=var_config,
                     )
                     work_items.append(item)
                     work_index += 1
@@ -1032,7 +1248,7 @@ class AsyncPipelineProcessor:
                     input_path=os.path.join(self.temp_dir, f"input_{i}{ext}"),
                     output_path=os.path.join(self.temp_dir, f"output_{i}{output_ext}"),
                     tool=tool,
-                    config=config
+                    config=config,
                 )
                 work_items.append(item)
                 work_index += 1
@@ -1042,7 +1258,9 @@ class AsyncPipelineProcessor:
         self.results = [None] * self.total_items
 
         if is_spoofer_batch:
-            print(f"[AsyncPipeline] Created {self.total_items} work items for spoofer batch")
+            print(
+                f"[AsyncPipeline] Created {self.total_items} work items for spoofer batch"
+            )
 
         # Start thread pools
         self.download_executor = ThreadPoolExecutor(max_workers=self.download_workers)
@@ -1082,12 +1300,17 @@ class AsyncPipelineProcessor:
                 download_progress = (downloads / self.total_items) * 10
                 process_progress = (processing / self.total_items) * 70
                 upload_progress = (uploads / self.total_items) * 20
-                overall_progress = int(download_progress + process_progress + upload_progress)
+                overall_progress = int(
+                    download_progress + process_progress + upload_progress
+                )
 
-                runpod.serverless.progress_update(self.job, {
-                    "progress": min(overall_progress, 99),
-                    "status": f"D:{downloads}/{self.total_items} P:{processing}/{self.total_items} U:{uploads}/{self.total_items}"
-                })
+                runpod.serverless.progress_update(
+                    self.job,
+                    {
+                        "progress": min(overall_progress, 99),
+                        "status": f"D:{downloads}/{self.total_items} P:{processing}/{self.total_items} U:{uploads}/{self.total_items}",
+                    },
+                )
 
                 if total_done >= self.total_items:
                     break
@@ -1142,7 +1365,9 @@ class AsyncPipelineProcessor:
         # Calculate final stats
         elapsed = time.time() - self.start_time
 
-        completed_count = sum(1 for r in self.results if r and r.get("status") == "completed")
+        completed_count = sum(
+            1 for r in self.results if r and r.get("status") == "completed"
+        )
         failed_count = self.total_items - completed_count
 
         # GPU distribution
@@ -1160,27 +1385,34 @@ class AsyncPipelineProcessor:
                 total_input_size += r.get("input_size", 0)
                 total_output_size += r.get("output_size", 0)
 
-        throughput_mbps = (total_input_size / 1024 / 1024) / elapsed if elapsed > 0 else 0
-        parallelism_efficiency = (total_processing_time / elapsed / nvenc_sessions * 100) if elapsed > 0 else 0
+        throughput_mbps = (
+            (total_input_size / 1024 / 1024) / elapsed if elapsed > 0 else 0
+        )
+        parallelism_efficiency = (
+            (total_processing_time / elapsed / nvenc_sessions * 100)
+            if elapsed > 0
+            else 0
+        )
 
         print(f"[AsyncPipeline] ===== BATCH COMPLETE =====")
         print(f"[AsyncPipeline] Total time: {elapsed:.2f}s")
-        print(f"[AsyncPipeline] Completed: {completed_count}/{self.total_items}, Failed: {failed_count}")
+        print(
+            f"[AsyncPipeline] Completed: {completed_count}/{self.total_items}, Failed: {failed_count}"
+        )
         print(f"[AsyncPipeline] Throughput: {throughput_mbps:.2f} MB/s")
         print(f"[AsyncPipeline] GPU distribution: {gpu_distribution}")
         print(f"[AsyncPipeline] Parallelism efficiency: {parallelism_efficiency:.1f}%")
         print(f"[AsyncPipeline] Pipeline metrics: {self.pipeline_metrics}")
 
-        runpod.serverless.progress_update(self.job, {
-            "progress": 100,
-            "status": "Completed"
-        })
+        runpod.serverless.progress_update(
+            self.job, {"progress": 100, "status": "Completed"}
+        )
 
         return {
             "status": "completed",
             "mode": "async_pipeline",
-            "gpu": self.gpu_info['gpu_name'],
-            "gpu_type": self.gpu_info['gpu_type'],
+            "gpu": self.gpu_info["gpu_name"],
+            "gpu_type": self.gpu_info["gpu_type"],
             "gpu_count": gpu_count,
             "parallel_sessions": nvenc_sessions,
             "total": self.total_items,
@@ -1192,11 +1424,12 @@ class AsyncPipelineProcessor:
             "throughput_mbps": throughput_mbps,
             "parallelism_efficiency": parallelism_efficiency,
             "pipeline_metrics": self.pipeline_metrics,
-            "results": self.results
+            "results": self.results,
         }
 
 
 # ==================== Legacy Functions (for backwards compatibility) ====================
+
 
 def download_files_parallel(urls: list, paths: list, max_workers: int = 50) -> list:
     """
@@ -1217,20 +1450,33 @@ def download_files_parallel(urls: list, paths: list, max_workers: int = 50) -> l
             file_size = os.path.getsize(path) if os.path.exists(path) else 0
             elapsed = time.time() - file_start
             speed_mbps = (file_size / 1024 / 1024) / elapsed if elapsed > 0 else 0
-            print(f"[Download {idx}] {file_size/1024/1024:.2f}MB in {elapsed:.2f}s ({speed_mbps:.2f} MB/s)")
-            return {"index": idx, "success": True, "path": path, "size": file_size, "time": elapsed}
+            print(
+                f"[Download {idx}] {file_size / 1024 / 1024:.2f}MB in {elapsed:.2f}s ({speed_mbps:.2f} MB/s)"
+            )
+            return {
+                "index": idx,
+                "success": True,
+                "path": path,
+                "size": file_size,
+                "time": elapsed,
+            }
         except Exception as e:
             return {"index": idx, "success": False, "error": str(e)}
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(download_one, i, u, p) for i, (u, p) in enumerate(zip(urls, paths))]
+        futures = [
+            executor.submit(download_one, i, u, p)
+            for i, (u, p) in enumerate(zip(urls, paths))
+        ]
         for future in as_completed(futures):
             result = future.result()
             results[result["index"]] = result
 
     total_time = time.time() - download_start
     total_size = sum(r.get("size", 0) for r in results if r and r.get("success"))
-    print(f"[Download Complete] {len(urls)} files, {total_size/1024/1024:.2f}MB total in {total_time:.2f}s")
+    print(
+        f"[Download Complete] {len(urls)} files, {total_size / 1024 / 1024:.2f}MB total in {total_time:.2f}s"
+    )
 
     return results
 
@@ -1255,7 +1501,9 @@ def upload_files_parallel(files: list, urls: list, max_workers: int = 50) -> lis
             elapsed = time.time() - file_start
             file_size = result.get("size", 0)
             speed_mbps = (file_size / 1024 / 1024) / elapsed if elapsed > 0 else 0
-            print(f"[Upload {idx}] {file_size/1024/1024:.2f}MB in {elapsed:.2f}s ({speed_mbps:.2f} MB/s)")
+            print(
+                f"[Upload {idx}] {file_size / 1024 / 1024:.2f}MB in {elapsed:.2f}s ({speed_mbps:.2f} MB/s)"
+            )
             return {"index": idx, "success": True, "size": file_size, "time": elapsed}
         except Exception as e:
             return {"index": idx, "success": False, "error": str(e)}
@@ -1271,12 +1519,16 @@ def upload_files_parallel(files: list, urls: list, max_workers: int = 50) -> lis
 
     total_time = time.time() - upload_start
     total_size = sum(r.get("size", 0) for r in results if r and r.get("success"))
-    print(f"[Upload Complete] {len(files)} files, {total_size/1024/1024:.2f}MB total in {total_time:.2f}s")
+    print(
+        f"[Upload Complete] {len(files)} files, {total_size / 1024 / 1024:.2f}MB total in {total_time:.2f}s"
+    )
 
     return results
 
 
-def pre_distribute_work(items: list, gpu_count: int, gpu_memory_free_mb: list = None) -> list:
+def pre_distribute_work(
+    items: list, gpu_count: int, gpu_memory_free_mb: list = None
+) -> list:
     """
     Pre-distribute work items across GPUs before processing starts.
     Uses memory-aware distribution if memory info is available.
@@ -1314,13 +1566,22 @@ def pre_distribute_work(items: list, gpu_count: int, gpu_memory_free_mb: list = 
         # Find GPU with minimum load
         if gpu_memory_free_mb:
             # Weight by available memory
-            scores = [gpu_loads[i] / max(gpu_memory_free_mb[i], 1) for i in range(gpu_count)]
+            scores = [
+                gpu_loads[i] / max(gpu_memory_free_mb[i], 1) for i in range(gpu_count)
+            ]
             best_gpu = scores.index(min(scores))
         else:
             best_gpu = gpu_loads.index(min(gpu_loads))
 
         gpu_loads[best_gpu] += file_sizes[original_idx]
-        assignments[original_idx] = (item[0], item[1], item[2], item[3], item[4], best_gpu)
+        assignments[original_idx] = (
+            item[0],
+            item[1],
+            item[2],
+            item[3],
+            item[4],
+            best_gpu,
+        )
 
     print(f"[Pre-distribute] Assigned {len(items)} items across {gpu_count} GPUs")
     print(f"[Pre-distribute] Load per GPU (bytes): {gpu_loads}")
@@ -1328,7 +1589,9 @@ def pre_distribute_work(items: list, gpu_count: int, gpu_memory_free_mb: list = 
     return assignments
 
 
-def process_single_file_for_batch(args: tuple, gpu_tracker: GPULoadTracker = None) -> dict:
+def process_single_file_for_batch(
+    args: tuple, gpu_tracker: GPULoadTracker = None
+) -> dict:
     """
     Worker function for batch processing.
     Processes a single file with the specified tool.
@@ -1368,10 +1631,12 @@ def process_single_file_for_batch(args: tuple, gpu_tracker: GPULoadTracker = Non
             **config,
             "_gpu_id": gpu_id,
             "_cuda_device": gpu_id,
-            "_ffmpeg_loglevel": "info"  # Enable to see encoder initialization
+            "_ffmpeg_loglevel": "info",  # Enable to see encoder initialization
         }
 
-        print(f"[Batch Worker {file_index}] GPU {gpu_id} START: {os.path.basename(input_path)} ({input_size/1024/1024:.2f}MB)")
+        print(
+            f"[Batch Worker {file_index}] GPU {gpu_id} START: {os.path.basename(input_path)} ({input_size / 1024 / 1024:.2f}MB)"
+        )
 
         # Process based on tool type
         if tool == "spoofer":
@@ -1381,7 +1646,12 @@ def process_single_file_for_batch(args: tuple, gpu_tracker: GPULoadTracker = Non
             elif process_spoofer is not None:
                 result = process_spoofer(input_path, output_path, gpu_config)
             else:
-                return {"index": file_index, "status": "failed", "error": "Spoofer not available", "gpu_id": gpu_id}
+                return {
+                    "index": file_index,
+                    "status": "failed",
+                    "error": "Spoofer not available",
+                    "gpu_id": gpu_id,
+                }
 
         elif tool == "captioner":
             if process_captioner is not None:
@@ -1389,31 +1659,56 @@ def process_single_file_for_batch(args: tuple, gpu_tracker: GPULoadTracker = Non
                 captioner_config = {**gpu_config, "imageIndex": file_index}
                 result = process_captioner(input_path, output_path, captioner_config)
             else:
-                return {"index": file_index, "status": "failed", "error": "Captioner not available", "gpu_id": gpu_id}
+                return {
+                    "index": file_index,
+                    "status": "failed",
+                    "error": "Captioner not available",
+                    "gpu_id": gpu_id,
+                }
 
         elif tool == "vignettes":
             if process_vignettes is not None:
                 result = process_vignettes(input_path, output_path, gpu_config)
             else:
-                return {"index": file_index, "status": "failed", "error": "Vignettes not available", "gpu_id": gpu_id}
+                return {
+                    "index": file_index,
+                    "status": "failed",
+                    "error": "Vignettes not available",
+                    "gpu_id": gpu_id,
+                }
 
         elif tool == "resize":
             if process_resize is not None:
                 result = process_resize(input_path, output_path, gpu_config)
             else:
-                return {"index": file_index, "status": "failed", "error": "Resize not available", "gpu_id": gpu_id}
+                return {
+                    "index": file_index,
+                    "status": "failed",
+                    "error": "Resize not available",
+                    "gpu_id": gpu_id,
+                }
 
         elif tool == "pic_to_video":
             if process_pic_to_video is not None:
                 result = process_pic_to_video(input_path, output_path, gpu_config)
             else:
-                return {"index": file_index, "status": "failed", "error": "Pic to Video not available", "gpu_id": gpu_id}
+                return {
+                    "index": file_index,
+                    "status": "failed",
+                    "error": "Pic to Video not available",
+                    "gpu_id": gpu_id,
+                }
 
         elif tool == "bg_remove":
             if process_bg_remove is not None:
                 result = process_bg_remove(input_path, output_path, gpu_config)
             else:
-                return {"index": file_index, "status": "failed", "error": "BG Remove not available", "gpu_id": gpu_id}
+                return {
+                    "index": file_index,
+                    "status": "failed",
+                    "error": "BG Remove not available",
+                    "gpu_id": gpu_id,
+                }
 
         elif tool == "upscale":
             if is_video_file and process_upscale_video is not None:
@@ -1421,7 +1716,12 @@ def process_single_file_for_batch(args: tuple, gpu_tracker: GPULoadTracker = Non
             elif process_upscale is not None:
                 result = process_upscale(input_path, output_path, gpu_config)
             else:
-                return {"index": file_index, "status": "failed", "error": "Upscale not available", "gpu_id": gpu_id}
+                return {
+                    "index": file_index,
+                    "status": "failed",
+                    "error": "Upscale not available",
+                    "gpu_id": gpu_id,
+                }
 
         elif tool == "face_swap":
             if is_video_file and process_face_swap_video is not None:
@@ -1429,25 +1729,53 @@ def process_single_file_for_batch(args: tuple, gpu_tracker: GPULoadTracker = Non
             elif process_face_swap is not None:
                 result = process_face_swap(input_path, output_path, gpu_config)
             else:
-                return {"index": file_index, "status": "failed", "error": "Face Swap not available", "gpu_id": gpu_id}
+                return {
+                    "index": file_index,
+                    "status": "failed",
+                    "error": "Face Swap not available",
+                    "gpu_id": gpu_id,
+                }
 
         elif tool == "video_reframe":
             if process_video_reframe is not None:
                 result = process_video_reframe(input_path, output_path, gpu_config)
                 # video_reframe may change output path for images
-                if result and result.get('outputPath'):
-                    output_path = result['outputPath']
+                if result and result.get("outputPath"):
+                    output_path = result["outputPath"]
             else:
-                return {"index": file_index, "status": "failed", "error": "Video Reframe not available", "gpu_id": gpu_id}
+                return {
+                    "index": file_index,
+                    "status": "failed",
+                    "error": "Video Reframe not available",
+                    "gpu_id": gpu_id,
+                }
+
+        elif tool == "editor":
+            if process_editor is not None:
+                result = process_editor(input_path, output_path, gpu_config)
+            else:
+                return {
+                    "index": file_index,
+                    "status": "failed",
+                    "error": "Editor not available",
+                    "gpu_id": gpu_id,
+                }
 
         else:
-            return {"index": file_index, "status": "failed", "error": f"Unknown tool: {tool}", "gpu_id": gpu_id}
+            return {
+                "index": file_index,
+                "status": "failed",
+                "error": f"Unknown tool: {tool}",
+                "gpu_id": gpu_id,
+            }
 
         processing_time = time.time() - start_time
 
         if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
             output_size = os.path.getsize(output_path)
-            print(f"[Batch Worker {file_index}] GPU {gpu_id} DONE: {processing_time:.2f}s, output {output_size/1024/1024:.2f}MB")
+            print(
+                f"[Batch Worker {file_index}] GPU {gpu_id} DONE: {processing_time:.2f}s, output {output_size / 1024 / 1024:.2f}MB"
+            )
             return {
                 "index": file_index,
                 "status": "completed",
@@ -1456,23 +1784,34 @@ def process_single_file_for_batch(args: tuple, gpu_tracker: GPULoadTracker = Non
                 "gpu_id": gpu_id,
                 "processing_time": processing_time,
                 "input_size": input_size,
-                "output_size": output_size
+                "output_size": output_size,
             }
         else:
-            print(f"[Batch Worker {file_index}] GPU {gpu_id} FAILED: No output after {processing_time:.2f}s")
-            return {"index": file_index, "status": "failed", "error": "Output file not created", "gpu_id": gpu_id, "processing_time": processing_time}
+            print(
+                f"[Batch Worker {file_index}] GPU {gpu_id} FAILED: No output after {processing_time:.2f}s"
+            )
+            return {
+                "index": file_index,
+                "status": "failed",
+                "error": "Output file not created",
+                "gpu_id": gpu_id,
+                "processing_time": processing_time,
+            }
 
     except Exception as e:
         import traceback
+
         processing_time = time.time() - start_time
-        print(f"[Batch Worker {file_index}] GPU {gpu_id} ERROR after {processing_time:.2f}s: {str(e)[:100]}")
+        print(
+            f"[Batch Worker {file_index}] GPU {gpu_id} ERROR after {processing_time:.2f}s: {str(e)[:100]}"
+        )
         return {
             "index": file_index,
             "status": "failed",
             "error": str(e),
             "traceback": traceback.format_exc(),
             "gpu_id": gpu_id,
-            "processing_time": processing_time
+            "processing_time": processing_time,
         }
 
 
@@ -1482,7 +1821,7 @@ def process_batch_videos(
     job,
     results: list,
     progress_base: int = 30,
-    progress_range: int = 50
+    progress_range: int = 50,
 ) -> tuple:
     """
     Process video batch using ThreadPoolExecutor with proper GPU affinity
@@ -1506,9 +1845,9 @@ def process_batch_videos(
 
     batch_start_time = time.time()
 
-    gpu_count = gpu_info.get('gpu_count', 1)
-    nvenc_sessions_per_gpu = gpu_info.get('nvenc_sessions_per_gpu', 3)
-    max_parallel = gpu_info.get('nvenc_sessions', nvenc_sessions_per_gpu * gpu_count)
+    gpu_count = gpu_info.get("gpu_count", 1)
+    nvenc_sessions_per_gpu = gpu_info.get("nvenc_sessions_per_gpu", 3)
+    max_parallel = gpu_info.get("nvenc_sessions", nvenc_sessions_per_gpu * gpu_count)
 
     # Create GPU load tracker for dynamic assignment
     gpu_tracker = GPULoadTracker(gpu_count, nvenc_sessions_per_gpu)
@@ -1518,11 +1857,17 @@ def process_batch_videos(
     total_items = len(work_items)
 
     # Calculate total input size for throughput metrics
-    total_input_size = sum(os.path.getsize(item[0]) for item in work_items if os.path.exists(item[0]))
+    total_input_size = sum(
+        os.path.getsize(item[0]) for item in work_items if os.path.exists(item[0])
+    )
 
     print(f"[Batch Videos] ===== VIDEO PROCESSING START =====")
-    print(f"[Batch Videos] Processing {total_items} videos ({total_input_size/1024/1024:.2f}MB total)")
-    print(f"[Batch Videos] GPU count: {gpu_count}, NVENC sessions/GPU: {nvenc_sessions_per_gpu}, Max parallel: {max_parallel}")
+    print(
+        f"[Batch Videos] Processing {total_items} videos ({total_input_size / 1024 / 1024:.2f}MB total)"
+    )
+    print(
+        f"[Batch Videos] GPU count: {gpu_count}, NVENC sessions/GPU: {nvenc_sessions_per_gpu}, Max parallel: {max_parallel}"
+    )
 
     def process_with_tracking(item):
         """Wrapper that handles GPU tracking."""
@@ -1558,7 +1903,12 @@ def process_batch_videos(
                 result = future.result(timeout=900)  # 15 min timeout for videos
             except Exception as e:
                 idx = future_to_idx[future]
-                result = {"index": idx, "status": "failed", "error": str(e), "gpu_id": -1}
+                result = {
+                    "index": idx,
+                    "status": "failed",
+                    "error": str(e),
+                    "gpu_id": -1,
+                }
 
             idx = result["index"]
             results[idx] = result
@@ -1569,11 +1919,16 @@ def process_batch_videos(
                 failed += 1
 
             # Update progress
-            progress = progress_base + int(((completed + failed) / total_items) * progress_range)
-            runpod.serverless.progress_update(job, {
-                "progress": progress,
-                "status": f"Videos: {completed + failed}/{total_items} ({failed} failed)"
-            })
+            progress = progress_base + int(
+                ((completed + failed) / total_items) * progress_range
+            )
+            runpod.serverless.progress_update(
+                job,
+                {
+                    "progress": progress,
+                    "status": f"Videos: {completed + failed}/{total_items} ({failed} failed)",
+                },
+            )
 
     # Log final GPU distribution stats and performance metrics
     batch_elapsed = time.time() - batch_start_time
@@ -1586,14 +1941,26 @@ def process_batch_videos(
         if results[i] and results[i].get("status") == "completed"
     )
     avg_time_per_video = total_processing_time / completed if completed > 0 else 0
-    throughput_mbps = (total_input_size / 1024 / 1024) / batch_elapsed if batch_elapsed > 0 else 0
-    parallelism_efficiency = (total_processing_time / batch_elapsed / max_parallel * 100) if batch_elapsed > 0 else 0
+    throughput_mbps = (
+        (total_input_size / 1024 / 1024) / batch_elapsed if batch_elapsed > 0 else 0
+    )
+    parallelism_efficiency = (
+        (total_processing_time / batch_elapsed / max_parallel * 100)
+        if batch_elapsed > 0
+        else 0
+    )
 
     print(f"[Batch Videos] ===== VIDEO PROCESSING COMPLETE =====")
-    print(f"[Batch Videos] Total time: {batch_elapsed:.2f}s, Videos: {completed}/{total_items}")
-    print(f"[Batch Videos] Throughput: {throughput_mbps:.2f} MB/s, Avg time/video: {avg_time_per_video:.2f}s")
+    print(
+        f"[Batch Videos] Total time: {batch_elapsed:.2f}s, Videos: {completed}/{total_items}"
+    )
+    print(
+        f"[Batch Videos] Throughput: {throughput_mbps:.2f} MB/s, Avg time/video: {avg_time_per_video:.2f}s"
+    )
     print(f"[Batch Videos] GPU distribution: {stats['total_jobs']}")
-    print(f"[Batch Videos] Parallelism efficiency: {parallelism_efficiency:.1f}% (of {max_parallel} max sessions)")
+    print(
+        f"[Batch Videos] Parallelism efficiency: {parallelism_efficiency:.1f}% (of {max_parallel} max sessions)"
+    )
 
     return completed, failed
 
@@ -1604,7 +1971,7 @@ def process_batch_images(
     job,
     results: list,
     progress_base: int = 30,
-    progress_range: int = 50
+    progress_range: int = 50,
 ) -> tuple:
     """
     Process image batch using ThreadPoolExecutor.
@@ -1627,10 +1994,11 @@ def process_batch_images(
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    gpu_count = gpu_info.get('gpu_count', 1)
+    gpu_count = gpu_info.get("gpu_count", 1)
     # For images, we can have more parallelism (no NVENC limit)
     # But limit based on CPU cores
     import multiprocessing
+
     cpu_cores = multiprocessing.cpu_count()
     max_parallel = min(cpu_cores * 2, len(work_items), 32)  # Cap at 32
 
@@ -1638,17 +2006,27 @@ def process_batch_images(
     failed = 0
     total_items = len(work_items)
 
-    print(f"[Batch Images] Processing {total_items} images with max {max_parallel} parallel workers")
+    print(
+        f"[Batch Images] Processing {total_items} images with max {max_parallel} parallel workers"
+    )
 
     with ThreadPoolExecutor(max_workers=max_parallel) as executor:
-        future_to_idx = {executor.submit(process_single_file_for_batch, item): item[4] for item in work_items}
+        future_to_idx = {
+            executor.submit(process_single_file_for_batch, item): item[4]
+            for item in work_items
+        }
 
         for future in as_completed(future_to_idx):
             try:
                 result = future.result(timeout=300)  # 5 min timeout for images
             except Exception as e:
                 idx = future_to_idx[future]
-                result = {"index": idx, "status": "failed", "error": str(e), "gpu_id": 0}
+                result = {
+                    "index": idx,
+                    "status": "failed",
+                    "error": str(e),
+                    "gpu_id": 0,
+                }
 
             idx = result["index"]
             results[idx] = result
@@ -1659,11 +2037,16 @@ def process_batch_images(
                 failed += 1
 
             # Update progress
-            progress = progress_base + int(((completed + failed) / total_items) * progress_range)
-            runpod.serverless.progress_update(job, {
-                "progress": progress,
-                "status": f"Images: {completed + failed}/{total_items} ({failed} failed)"
-            })
+            progress = progress_base + int(
+                ((completed + failed) / total_items) * progress_range
+            )
+            runpod.serverless.progress_update(
+                job,
+                {
+                    "progress": progress,
+                    "status": f"Images: {completed + failed}/{total_items} ({failed} failed)",
+                },
+            )
 
     return completed, failed
 
@@ -1713,25 +2096,32 @@ def process_batch_mode(job, job_input: dict) -> dict:
 
     # Detect GPU capabilities (cached)
     gpu_info = get_gpu_info()
-    gpu_count = gpu_info.get('gpu_count', 1)
-    max_parallel = gpu_info['nvenc_sessions']
+    gpu_count = gpu_info.get("gpu_count", 1)
+    max_parallel = gpu_info["nvenc_sessions"]
 
     print(f"[Batch Mode] ===== JOB START: {job_id} =====")
     print(f"[Batch Mode] GPU: {gpu_info['gpu_name']}, Type: {gpu_info['gpu_type']}")
     print(f"[Batch Mode] GPUs: {gpu_count}, Max parallel: {max_parallel}")
     print(f"[Batch Mode] Processing {total_files} files with processor: {processor}")
-    print(f"[Batch Mode] Config received: {json.dumps({k: v for k, v in config.items() if not str(k).startswith('_')}, default=str)}")
+    print(
+        f"[Batch Mode] Config received: {json.dumps({k: v for k, v in config.items() if not str(k).startswith('_')}, default=str)}"
+    )
 
-    runpod.serverless.progress_update(job, {
-        "progress": 5,
-        "status": f"Batch mode: {total_files} files, {gpu_count} GPU(s), {max_parallel} sessions"
-    })
+    runpod.serverless.progress_update(
+        job,
+        {
+            "progress": 5,
+            "status": f"Batch mode: {total_files} files, {gpu_count} GPU(s), {max_parallel} sessions",
+        },
+    )
 
     temp_dir = tempfile.mkdtemp(prefix=f"farmium_batch_{job_id}_")
 
     # Get optimal I/O workers based on GPU count
     download_workers, upload_workers = get_optimal_io_workers(gpu_count)
-    print(f"[Batch Mode] I/O workers: {download_workers} download, {upload_workers} upload")
+    print(
+        f"[Batch Mode] I/O workers: {download_workers} download, {upload_workers} upload"
+    )
 
     try:
         # Use the new async pipeline processor
@@ -1740,27 +2130,28 @@ def process_batch_mode(job, job_input: dict) -> dict:
             job=job,
             temp_dir=temp_dir,
             download_workers=download_workers,
-            upload_workers=upload_workers
+            upload_workers=upload_workers,
         )
 
         result = pipeline.process_batch(
             input_urls=input_urls,
             output_urls=output_urls,
             tool=processor,
-            config=config
+            config=config,
         )
 
         # Add job timing
-        result['job_time_seconds'] = time.time() - job_start_time
+        result["job_time_seconds"] = time.time() - job_start_time
 
         return result
 
     except Exception as e:
         import traceback
+
         return {
             "error": str(e),
             "traceback": traceback.format_exc(),
-            "mode": "async_pipeline"
+            "mode": "async_pipeline",
         }
 
     finally:
@@ -1772,7 +2163,16 @@ def process_batch_mode(job, job_input: dict) -> dict:
 
 # ==================== Pipeline Processor ====================
 
-def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipeline: list, progress_callback, output_urls: list = None) -> dict:
+
+def process_pipeline(
+    job,
+    temp_dir: str,
+    input_path: str,
+    output_url: str,
+    pipeline: list,
+    progress_callback,
+    output_urls: list = None,
+) -> dict:
     """
     Process a pipeline of tools sequentially without intermediate uploads.
 
@@ -1811,10 +2211,13 @@ def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipel
 
         step_progress_base = int((step_idx / total_steps) * 80) + 10
 
-        runpod.serverless.progress_update(job, {
-            "progress": step_progress_base,
-            "status": f"Step {step_idx + 1}/{total_steps}: {tool}"
-        })
+        runpod.serverless.progress_update(
+            job,
+            {
+                "progress": step_progress_base,
+                "status": f"Step {step_idx + 1}/{total_steps}: {tool}",
+            },
+        )
 
         # Create output directory for this step
         step_output_dir = os.path.join(temp_dir, f"step_{step_idx}_{tool}")
@@ -1829,13 +2232,18 @@ def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipel
             # Determine output extension based on tool
             if tool == "bg_remove":
                 output_ext = ".png"
-            elif tool in ["pic_to_video", "video_gen"]:
+            elif tool in ["pic_to_video", "video_gen", "editor"]:
                 output_ext = ".mp4"
             else:
                 output_ext = input_ext if input_ext else ".jpg"
 
             # For spoofer with variations > 1, output is a directory of files
-            variations = config.get("variations") or config.get("copies") or config.get("options", {}).get("variations") or config.get("options", {}).get("copies", 1)
+            variations = (
+                config.get("variations")
+                or config.get("copies")
+                or config.get("options", {}).get("variations")
+                or config.get("options", {}).get("copies", 1)
+            )
             is_batch_spoofer = tool == "spoofer" and variations > 1
 
             if is_batch_spoofer:
@@ -1845,9 +2253,15 @@ def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipel
                 output_path = spoofer_output_dir  # Pass directory, not file
 
                 # Modify config to output individual files, not ZIP
-                batch_config = {**config, "outputMode": "directory", "outputDir": spoofer_output_dir}
+                batch_config = {
+                    **config,
+                    "outputMode": "directory",
+                    "outputDir": spoofer_output_dir,
+                }
             else:
-                output_path = os.path.join(step_output_dir, f"output_{file_idx}{output_ext}")
+                output_path = os.path.join(
+                    step_output_dir, f"output_{file_idx}{output_ext}"
+                )
                 batch_config = config
 
             # Create step-specific progress callback
@@ -1864,17 +2278,38 @@ def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipel
                 if tool == "spoofer":
                     input_is_image = is_image(input_ext)
                     if input_is_image and process_spoofer_fast is not None:
-                        result = process_spoofer_fast(current_file, output_path, batch_config, progress_callback=step_callback)
+                        result = process_spoofer_fast(
+                            current_file,
+                            output_path,
+                            batch_config,
+                            progress_callback=step_callback,
+                        )
                     elif process_spoofer is not None:
-                        result = process_spoofer(current_file, output_path, batch_config, progress_callback=step_callback)
+                        result = process_spoofer(
+                            current_file,
+                            output_path,
+                            batch_config,
+                            progress_callback=step_callback,
+                        )
                     else:
                         return {"error": "Spoofer processor not available"}
 
                     # Collect output files
                     if is_batch_spoofer:
                         # Collect all files from the batch output directory (images and videos)
-                        for ext in ['*.jpg', '*.jpeg', '*.png', '*.webp', '*.mp4', '*.mov', '*.avi', '*.webm']:
-                            next_files.extend(glob(os.path.join(spoofer_output_dir, ext)))
+                        for ext in [
+                            "*.jpg",
+                            "*.jpeg",
+                            "*.png",
+                            "*.webp",
+                            "*.mp4",
+                            "*.mov",
+                            "*.avi",
+                            "*.webm",
+                        ]:
+                            next_files.extend(
+                                glob(os.path.join(spoofer_output_dir, ext))
+                            )
                     else:
                         if os.path.exists(output_path):
                             next_files.append(output_path)
@@ -1885,28 +2320,48 @@ def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipel
 
                     # For captioner, pass the image index for batch caption matching
                     captioner_config = {**batch_config, "imageIndex": file_idx}
-                    result = process_captioner(current_file, output_path, captioner_config, progress_callback=step_callback)
+                    result = process_captioner(
+                        current_file,
+                        output_path,
+                        captioner_config,
+                        progress_callback=step_callback,
+                    )
                     if os.path.exists(output_path):
                         next_files.append(output_path)
 
                 elif tool == "resize":
                     if process_resize is None:
                         return {"error": "Resize processor not available"}
-                    result = process_resize(current_file, output_path, batch_config, progress_callback=step_callback)
+                    result = process_resize(
+                        current_file,
+                        output_path,
+                        batch_config,
+                        progress_callback=step_callback,
+                    )
                     if os.path.exists(output_path):
                         next_files.append(output_path)
 
                 elif tool == "vignettes":
                     if process_vignettes is None:
                         return {"error": "Vignettes processor not available"}
-                    result = process_vignettes(current_file, output_path, batch_config, progress_callback=step_callback)
+                    result = process_vignettes(
+                        current_file,
+                        output_path,
+                        batch_config,
+                        progress_callback=step_callback,
+                    )
                     if os.path.exists(output_path):
                         next_files.append(output_path)
 
                 elif tool == "bg_remove":
                     if process_bg_remove is None:
                         return {"error": "BG Remove processor not available"}
-                    result = process_bg_remove(current_file, output_path, batch_config, progress_callback=step_callback)
+                    result = process_bg_remove(
+                        current_file,
+                        output_path,
+                        batch_config,
+                        progress_callback=step_callback,
+                    )
                     if os.path.exists(output_path):
                         next_files.append(output_path)
 
@@ -1914,9 +2369,19 @@ def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipel
                     if process_upscale is None:
                         return {"error": "Upscale processor not available"}
                     if is_video(input_ext) and process_upscale_video:
-                        result = process_upscale_video(current_file, output_path, batch_config, progress_callback=step_callback)
+                        result = process_upscale_video(
+                            current_file,
+                            output_path,
+                            batch_config,
+                            progress_callback=step_callback,
+                        )
                     else:
-                        result = process_upscale(current_file, output_path, batch_config, progress_callback=step_callback)
+                        result = process_upscale(
+                            current_file,
+                            output_path,
+                            batch_config,
+                            progress_callback=step_callback,
+                        )
                     if os.path.exists(output_path):
                         next_files.append(output_path)
 
@@ -1924,66 +2389,107 @@ def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipel
                     if process_face_swap is None:
                         return {"error": "Face Swap processor not available"}
                     if is_video(input_ext) and process_face_swap_video:
-                        result = process_face_swap_video(current_file, output_path, batch_config, progress_callback=step_callback)
+                        result = process_face_swap_video(
+                            current_file,
+                            output_path,
+                            batch_config,
+                            progress_callback=step_callback,
+                        )
                     else:
-                        result = process_face_swap(current_file, output_path, batch_config, progress_callback=step_callback)
+                        result = process_face_swap(
+                            current_file,
+                            output_path,
+                            batch_config,
+                            progress_callback=step_callback,
+                        )
                     if os.path.exists(output_path):
                         next_files.append(output_path)
 
                 elif tool == "pic_to_video":
                     if process_pic_to_video is None:
                         return {"error": "Pic to Video processor not available"}
-                    result = process_pic_to_video(current_file, output_path, batch_config, progress_callback=step_callback)
+                    result = process_pic_to_video(
+                        current_file,
+                        output_path,
+                        batch_config,
+                        progress_callback=step_callback,
+                    )
                     if os.path.exists(output_path):
                         next_files.append(output_path)
 
                 elif tool == "video_gen":
                     if process_video_gen is None:
                         return {"error": "Video Gen processor not available"}
-                    result = process_video_gen(current_file, output_path, batch_config, progress_callback=step_callback)
+                    result = process_video_gen(
+                        current_file,
+                        output_path,
+                        batch_config,
+                        progress_callback=step_callback,
+                    )
                     if os.path.exists(output_path):
                         next_files.append(output_path)
 
                 elif tool == "video_reframe":
                     if process_video_reframe is None:
                         return {"error": "Video Reframe processor not available"}
-                    result = process_video_reframe(current_file, output_path, batch_config, progress_callback=step_callback)
+                    result = process_video_reframe(
+                        current_file,
+                        output_path,
+                        batch_config,
+                        progress_callback=step_callback,
+                    )
                     # video_reframe may change extension for images (mp4 -> jpg)
-                    actual_path = result.get('outputPath', output_path) if result else output_path
+                    actual_path = (
+                        result.get("outputPath", output_path) if result else output_path
+                    )
                     if os.path.exists(actual_path):
                         next_files.append(actual_path)
+
+                elif tool == "editor":
+                    if process_editor is None:
+                        return {"error": "Editor processor not available"}
+                    result = process_editor(
+                        current_file,
+                        output_path,
+                        batch_config,
+                        progress_callback=step_callback,
+                    )
+                    if os.path.exists(output_path):
+                        next_files.append(output_path)
 
                 else:
                     return {"error": f"Unknown tool in pipeline: {tool}"}
 
             except Exception as e:
                 import traceback
+
                 return {
                     "error": f"Pipeline step {step_idx + 1} ({tool}) failed: {str(e)}",
                     "traceback": traceback.format_exc(),
                     "step": step_idx,
-                    "tool": tool
+                    "tool": tool,
                 }
 
         # Update current files for next step
         if not next_files:
-            return {"error": f"Pipeline step {step_idx + 1} ({tool}) produced no output files"}
+            return {
+                "error": f"Pipeline step {step_idx + 1} ({tool}) produced no output files"
+            }
 
         current_files = next_files
 
     # ==================== DIRECT UPLOAD MODE ====================
     # If output_urls array is provided, upload each file directly (FAST)
     if output_urls and len(output_urls) >= len(current_files):
-        runpod.serverless.progress_update(job, {
-            "progress": 92,
-            "status": "Uploading files directly"
-        })
+        runpod.serverless.progress_update(
+            job, {"progress": 92, "status": "Uploading files directly"}
+        )
 
         # Upload files in parallel (50 concurrent uploads for maximum throughput)
         upload_results = upload_files_parallel(
-            current_files[:len(output_urls)],
-            output_urls[:len(current_files)],
-            max_workers=50
+            current_files[: len(output_urls)],
+            output_urls[: len(current_files)],
+            max_workers=50,
         )
 
         # Check for failures
@@ -1995,15 +2501,12 @@ def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipel
                 "steps": len(pipeline),
                 "outputFiles": len(current_files),
                 "uploadedFiles": len(current_files) - len(failed),
-                "failedUploads": len(failed)
+                "failedUploads": len(failed),
             }
 
         total_size = sum(r.get("size", 0) for r in upload_results)
 
-        runpod.serverless.progress_update(job, {
-            "progress": 100,
-            "status": "Completed"
-        })
+        runpod.serverless.progress_update(job, {"progress": 100, "status": "Completed"})
 
         return {
             "status": "completed",
@@ -2011,18 +2514,15 @@ def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipel
             "steps": len(pipeline),
             "outputFiles": len(current_files),
             "uploadedFiles": len(current_files),
-            "totalSize": total_size
+            "totalSize": total_size,
         }
 
     # ==================== LEGACY ZIP MODE ====================
     # Fallback: Create ZIP and upload (for backwards compatibility)
-    runpod.serverless.progress_update(job, {
-        "progress": 92,
-        "status": "Creating ZIP"
-    })
+    runpod.serverless.progress_update(job, {"progress": 92, "status": "Creating ZIP"})
 
     final_zip_path = os.path.join(temp_dir, "pipeline_output.zip")
-    with zipfile.ZipFile(final_zip_path, 'w') as zf:
+    with zipfile.ZipFile(final_zip_path, "w") as zf:
         for idx, file_path in enumerate(current_files):
             ext = os.path.splitext(file_path)[1]
             arcname = f"output_{idx + 1:04d}{ext}"
@@ -2031,10 +2531,7 @@ def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipel
             zf.write(file_path, arcname, compress_type=compression)
 
     # Upload final ZIP with error handling
-    runpod.serverless.progress_update(job, {
-        "progress": 95,
-        "status": "Uploading"
-    })
+    runpod.serverless.progress_update(job, {"progress": 95, "status": "Uploading"})
 
     try:
         upload_result = upload_file(final_zip_path, output_url)
@@ -2043,7 +2540,7 @@ def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipel
             "error": f"Failed to upload pipeline output: {str(e)}",
             "mode": "pipeline",
             "steps": len(pipeline),
-            "outputFiles": len(current_files)
+            "outputFiles": len(current_files),
         }
 
     return {
@@ -2052,11 +2549,12 @@ def process_pipeline(job, temp_dir: str, input_path: str, output_url: str, pipel
         "steps": len(pipeline),
         "outputFiles": len(current_files),
         "outputSize": os.path.getsize(final_zip_path),
-        "uploadAttempts": upload_result.get("attempts", 1)
+        "uploadAttempts": upload_result.get("attempts", 1),
     }
 
 
 # ==================== Batch Pipeline Processor ====================
+
 
 def process_single_pipeline_for_batch(args: tuple) -> dict:
     """
@@ -2076,14 +2574,20 @@ def process_single_pipeline_for_batch(args: tuple) -> dict:
     # NOTE: Do NOT set os.environ['CUDA_VISIBLE_DEVICES'] - see comment in process_single_file_for_batch
 
     try:
-        print(f"[Pipeline Worker {file_index}] Processing on GPU {gpu_id}: {os.path.basename(input_path)}")
+        print(
+            f"[Pipeline Worker {file_index}] Processing on GPU {gpu_id}: {os.path.basename(input_path)}"
+        )
 
         # Track current files through pipeline
         current_files = [input_path]
 
         for step_idx, step in enumerate(pipeline):
             tool = step.get("tool", "").lower()
-            step_config = {**step.get("config", {}), "_gpu_id": gpu_id, "_cuda_device": gpu_id}
+            step_config = {
+                **step.get("config", {}),
+                "_gpu_id": gpu_id,
+                "_cuda_device": gpu_id,
+            }
 
             # Create step output directory
             step_output_dir = os.path.join(output_dir, f"step_{step_idx}_{tool}")
@@ -2097,12 +2601,14 @@ def process_single_pipeline_for_batch(args: tuple) -> dict:
                 # Determine output extension
                 if tool == "bg_remove":
                     output_ext = ".png"
-                elif tool in ["pic_to_video", "video_gen"]:
+                elif tool in ["pic_to_video", "video_gen", "editor"]:
                     output_ext = ".mp4"
                 else:
                     output_ext = input_ext if input_ext else ".jpg"
 
-                output_path = os.path.join(step_output_dir, f"output_{sub_idx}{output_ext}")
+                output_path = os.path.join(
+                    step_output_dir, f"output_{sub_idx}{output_ext}"
+                )
 
                 # Process based on tool type
                 if tool == "spoofer":
@@ -2111,7 +2617,11 @@ def process_single_pipeline_for_batch(args: tuple) -> dict:
                     elif process_spoofer is not None:
                         process_spoofer(current_file, output_path, step_config)
                 elif tool == "captioner" and process_captioner is not None:
-                    process_captioner(current_file, output_path, {**step_config, "imageIndex": file_index})
+                    process_captioner(
+                        current_file,
+                        output_path,
+                        {**step_config, "imageIndex": file_index},
+                    )
                 elif tool == "vignettes" and process_vignettes is not None:
                     process_vignettes(current_file, output_path, step_config)
                 elif tool == "resize" and process_resize is not None:
@@ -2133,10 +2643,14 @@ def process_single_pipeline_for_batch(args: tuple) -> dict:
                 elif tool == "video_gen" and process_video_gen is not None:
                     process_video_gen(current_file, output_path, step_config)
                 elif tool == "video_reframe" and process_video_reframe is not None:
-                    reframe_result = process_video_reframe(current_file, output_path, step_config)
+                    reframe_result = process_video_reframe(
+                        current_file, output_path, step_config
+                    )
                     # video_reframe may change extension for images (mp4 -> jpg)
-                    if reframe_result and reframe_result.get('outputPath'):
-                        output_path = reframe_result['outputPath']
+                    if reframe_result and reframe_result.get("outputPath"):
+                        output_path = reframe_result["outputPath"]
+                elif tool == "editor" and process_editor is not None:
+                    process_editor(current_file, output_path, step_config)
 
                 if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                     next_files.append(output_path)
@@ -2146,7 +2660,7 @@ def process_single_pipeline_for_batch(args: tuple) -> dict:
                     "index": file_index,
                     "status": "failed",
                     "error": f"Pipeline step {step_idx + 1} ({tool}) produced no output",
-                    "gpu_id": gpu_id
+                    "gpu_id": gpu_id,
                 }
 
             current_files = next_files
@@ -2155,17 +2669,18 @@ def process_single_pipeline_for_batch(args: tuple) -> dict:
             "index": file_index,
             "status": "completed",
             "output_files": current_files,
-            "gpu_id": gpu_id
+            "gpu_id": gpu_id,
         }
 
     except Exception as e:
         import traceback
+
         return {
             "index": file_index,
             "status": "failed",
             "error": str(e),
             "traceback": traceback.format_exc(),
-            "gpu_id": gpu_id
+            "gpu_id": gpu_id,
         }
 
 
@@ -2214,26 +2729,30 @@ def process_batch_pipeline(job, job_input: dict) -> dict:
 
     # Detect GPU capabilities (cached)
     gpu_info = get_gpu_info()
-    gpu_count = gpu_info.get('gpu_count', 1)
-    max_parallel = gpu_info.get('nvenc_sessions', gpu_count * 3)
-    gpu_memory_free = gpu_info.get('gpu_memory_free_mb', [])
+    gpu_count = gpu_info.get("gpu_count", 1)
+    max_parallel = gpu_info.get("nvenc_sessions", gpu_count * 3)
+    gpu_memory_free = gpu_info.get("gpu_memory_free_mb", [])
 
     print(f"[Batch Pipeline] GPU: {gpu_info['gpu_name']}, GPUs: {gpu_count}")
-    print(f"[Batch Pipeline] Processing {total_files} files through {len(pipeline)} pipeline steps")
+    print(
+        f"[Batch Pipeline] Processing {total_files} files through {len(pipeline)} pipeline steps"
+    )
 
-    runpod.serverless.progress_update(job, {
-        "progress": 5,
-        "status": f"Batch pipeline: {total_files} files, {len(pipeline)} steps, {gpu_count} GPU(s)"
-    })
+    runpod.serverless.progress_update(
+        job,
+        {
+            "progress": 5,
+            "status": f"Batch pipeline: {total_files} files, {len(pipeline)} steps, {gpu_count} GPU(s)",
+        },
+    )
 
     temp_dir = tempfile.mkdtemp(prefix=f"farmium_batch_pipeline_{job_id}_")
 
     try:
         # 1. Download all input files in parallel
-        runpod.serverless.progress_update(job, {
-            "progress": 10,
-            "status": f"Downloading {total_files} files..."
-        })
+        runpod.serverless.progress_update(
+            job, {"progress": 10, "status": f"Downloading {total_files} files..."}
+        )
 
         input_paths = []
         for i, url in enumerate(input_urls):
@@ -2241,7 +2760,9 @@ def process_batch_pipeline(job, job_input: dict) -> dict:
             input_paths.append(os.path.join(temp_dir, f"input_{i}{ext}"))
 
         # Download with high parallelism (50 concurrent) to minimize GPU idle time
-        download_results = download_files_parallel(input_urls, input_paths, max_workers=50)
+        download_results = download_files_parallel(
+            input_urls, input_paths, max_workers=50
+        )
 
         # 2. Prepare work items
         results = [None] * total_files
@@ -2253,24 +2774,29 @@ def process_batch_pipeline(job, job_input: dict) -> dict:
                 results[i] = {
                     "index": i,
                     "status": "failed",
-                    "error": f"Download failed: {download_results[i].get('error')}"
+                    "error": f"Download failed: {download_results[i].get('error')}",
                 }
                 failed += 1
             else:
                 # Each file gets its own output directory
                 file_output_dir = os.path.join(temp_dir, f"file_{i}")
                 os.makedirs(file_output_dir, exist_ok=True)
-                work_items.append((input_paths[i], file_output_dir, pipeline, config, i))
+                work_items.append(
+                    (input_paths[i], file_output_dir, pipeline, config, i)
+                )
 
         # 3. Pre-distribute work across GPUs
         if work_items:
             work_items = pre_distribute_work(work_items, gpu_count, gpu_memory_free)
 
         # 4. Process pipelines in parallel
-        runpod.serverless.progress_update(job, {
-            "progress": 25,
-            "status": f"Processing {len(work_items)} pipelines in parallel..."
-        })
+        runpod.serverless.progress_update(
+            job,
+            {
+                "progress": 25,
+                "status": f"Processing {len(work_items)} pipelines in parallel...",
+            },
+        )
 
         completed = 0
         # Create GPU tracker for dynamic assignment
@@ -2304,7 +2830,12 @@ def process_batch_pipeline(job, job_input: dict) -> dict:
                     result = future.result(timeout=1800)  # 30 min timeout per pipeline
                 except Exception as e:
                     idx = future_to_idx[future]
-                    result = {"index": idx, "status": "failed", "error": str(e), "gpu_id": -1}
+                    result = {
+                        "index": idx,
+                        "status": "failed",
+                        "error": str(e),
+                        "gpu_id": -1,
+                    }
 
                 idx = result["index"]
                 results[idx] = result
@@ -2316,23 +2847,29 @@ def process_batch_pipeline(job, job_input: dict) -> dict:
 
                 # Update progress
                 progress = 25 + int(((completed + failed) / total_files) * 55)
-                runpod.serverless.progress_update(job, {
-                    "progress": progress,
-                    "status": f"Pipelines: {completed + failed}/{total_files} ({failed} failed)"
-                })
+                runpod.serverless.progress_update(
+                    job,
+                    {
+                        "progress": progress,
+                        "status": f"Pipelines: {completed + failed}/{total_files} ({failed} failed)",
+                    },
+                )
 
         # 5. Upload output files
-        runpod.serverless.progress_update(job, {
-            "progress": 85,
-            "status": f"Uploading {completed} processed files..."
-        })
+        runpod.serverless.progress_update(
+            job, {"progress": 85, "status": f"Uploading {completed} processed files..."}
+        )
 
         files_to_upload = []
         urls_to_upload = []
         upload_indices = []
 
         for i, result in enumerate(results):
-            if result and result.get("status") == "completed" and result.get("output_files"):
+            if (
+                result
+                and result.get("status") == "completed"
+                and result.get("output_files")
+            ):
                 # Upload the first/primary output file from the pipeline
                 output_files = result["output_files"]
                 if output_files and os.path.exists(output_files[0]):
@@ -2342,7 +2879,9 @@ def process_batch_pipeline(job, job_input: dict) -> dict:
 
         if files_to_upload:
             # Upload with high parallelism (50 concurrent) to minimize total job time
-            upload_results = upload_files_parallel(files_to_upload, urls_to_upload, max_workers=50)
+            upload_results = upload_files_parallel(
+                files_to_upload, urls_to_upload, max_workers=50
+            )
             for upload_result in upload_results:
                 if not upload_result.get("success"):
                     idx = upload_indices[upload_result["index"]]
@@ -2359,30 +2898,28 @@ def process_batch_pipeline(job, job_input: dict) -> dict:
                 if 0 <= gpu_id < gpu_count:
                     gpu_distribution[gpu_id] += 1
 
-        runpod.serverless.progress_update(job, {
-            "progress": 100,
-            "status": "Completed"
-        })
+        runpod.serverless.progress_update(job, {"progress": 100, "status": "Completed"})
 
         return {
             "status": "completed",
             "mode": "batch_pipeline",
-            "gpu": gpu_info['gpu_name'],
+            "gpu": gpu_info["gpu_name"],
             "gpu_count": gpu_count,
             "pipeline_steps": len(pipeline),
             "total": total_files,
             "completed": completed,
             "failed": failed,
             "gpu_distribution": gpu_distribution,
-            "results": results
+            "results": results,
         }
 
     except Exception as e:
         import traceback
+
         return {
             "error": str(e),
             "traceback": traceback.format_exc(),
-            "mode": "batch_pipeline"
+            "mode": "batch_pipeline",
         }
 
     finally:
@@ -2394,6 +2931,7 @@ def process_batch_pipeline(job, job_input: dict) -> dict:
 
 # ==================== Main Handler ====================
 
+
 def handler(job):
     """
     Main handler for GPU processing jobs
@@ -2401,11 +2939,21 @@ def handler(job):
     Input format:
     {
         "tool": "vignettes" | "spoofer" | "captioner" | "resize" | "pic_to_video" |
-                "bg_remove" | "upscale" | "face_swap" | "video_gen" | "batch" | "batch_pipeline",
+                "bg_remove" | "upscale" | "face_swap" | "video_gen" | "video_reframe" |
+                "editor" | "pipeline" | "batch" | "batch_pipeline",
         "inputUrl": "presigned download URL",
         "outputUrl": "presigned upload URL",
         "config": { tool-specific configuration }
     }
+
+    Editor config highlights:
+      mode, width, height, fps, durationSec, trimStartSec, trimEndSec, playbackRate, fit,
+      brightness, contrast, saturation, gamma, hueDeg, grayscale, blurSigma, denoiseStrength,
+      rotateDeg, flipHorizontal, flipVertical, sharpenAmount,
+      fadeInSec, fadeOutSec,
+      mute, volume, audioNormalize, audioFadeInSec, audioFadeOutSec,
+      audioHighpassHz, audioLowpassHz,
+      backgroundColor, videoCodec, qualityCrf, preset, timelineJson
 
     For batch mode:
     {
@@ -2432,7 +2980,6 @@ def handler(job):
     input_url = job_input.get("inputUrl")
     output_url = job_input.get("outputUrl")
     config = job_input.get("config", {})
-
 
     # Validate inputs
     if not tool:
@@ -2468,10 +3015,9 @@ def handler(job):
         temp_dir = tempfile.mkdtemp(prefix=f"farmium_{job_id}_")
         try:
             # Download input
-            runpod.serverless.progress_update(job, {
-                "progress": 5,
-                "status": "downloading"
-            })
+            runpod.serverless.progress_update(
+                job, {"progress": 5, "status": "downloading"}
+            )
             input_ext = get_file_extension(input_url, config)
             input_path = os.path.join(temp_dir, f"input{input_ext}")
             download_file(input_url, input_path)
@@ -2479,18 +3025,24 @@ def handler(job):
             # Process pipeline
             progress_callback = create_progress_callback(job)
             result = process_pipeline(
-                job, temp_dir, input_path, output_url, pipeline, progress_callback,
-                output_urls=output_urls if output_urls else None
+                job,
+                temp_dir,
+                input_path,
+                output_url,
+                pipeline,
+                progress_callback,
+                output_urls=output_urls if output_urls else None,
             )
 
             return result
 
         except Exception as e:
             import traceback
+
             return {
                 "error": str(e),
                 "traceback": traceback.format_exc(),
-                "tool": "pipeline"
+                "tool": "pipeline",
             }
         finally:
             try:
@@ -2508,7 +3060,12 @@ def handler(job):
 
         # Tool-specific output extension handling
         if tool == "spoofer":
-            variations = config.get("variations") or config.get("copies") or config.get("options", {}).get("variations") or config.get("options", {}).get("copies", 1)
+            variations = (
+                config.get("variations")
+                or config.get("copies")
+                or config.get("options", {}).get("variations")
+                or config.get("options", {}).get("copies", 1)
+            )
             if variations > 1:
                 output_ext = ".zip"
         elif tool == "bg_remove":
@@ -2517,22 +3074,18 @@ def handler(job):
             output_ext = ".mp4"
         elif tool == "video_gen":
             output_ext = ".mp4"
+        elif tool == "editor":
+            output_ext = ".mp4"
 
         input_path = os.path.join(temp_dir, f"input{input_ext}")
         output_path = os.path.join(temp_dir, f"output{output_ext}")
 
         # Download input file
-        runpod.serverless.progress_update(job, {
-            "progress": 5,
-            "status": "downloading"
-        })
+        runpod.serverless.progress_update(job, {"progress": 5, "status": "downloading"})
         download_file(input_url, input_path)
 
         # Process based on tool type
-        runpod.serverless.progress_update(job, {
-            "progress": 10,
-            "status": "processing"
-        })
+        runpod.serverless.progress_update(job, {"progress": 10, "status": "processing"})
 
         progress_callback = create_progress_callback(job)
         result = {}
@@ -2542,8 +3095,7 @@ def handler(job):
             if process_vignettes is None:
                 return {"error": "Vignettes processor not available"}
             result = process_vignettes(
-                input_path, output_path, config,
-                progress_callback=progress_callback
+                input_path, output_path, config, progress_callback=progress_callback
             )
 
         # ==================== SPOOFER ====================
@@ -2552,32 +3104,35 @@ def handler(job):
 
             try:
                 if input_is_image and process_spoofer_fast is not None:
-                    runpod.serverless.progress_update(job, {
-                        "progress": 12,
-                        "status": "processing (CPU fast mode)"
-                    })
+                    runpod.serverless.progress_update(
+                        job, {"progress": 12, "status": "processing (CPU fast mode)"}
+                    )
                     result = process_spoofer_fast(
-                        input_path, output_path, config,
-                        progress_callback=progress_callback
+                        input_path,
+                        output_path,
+                        config,
+                        progress_callback=progress_callback,
                     )
                 elif process_spoofer is not None:
-                    runpod.serverless.progress_update(job, {
-                        "progress": 12,
-                        "status": "processing (GPU mode)"
-                    })
+                    runpod.serverless.progress_update(
+                        job, {"progress": 12, "status": "processing (GPU mode)"}
+                    )
                     result = process_spoofer(
-                        input_path, output_path, config,
-                        progress_callback=progress_callback
+                        input_path,
+                        output_path,
+                        config,
+                        progress_callback=progress_callback,
                     )
                 else:
                     return {"error": "Spoofer processor not available"}
             except Exception as e:
                 import traceback
+
                 return {
                     "error": f"Spoofer processing error: {str(e)}",
                     "traceback": traceback.format_exc(),
                     "tool": tool,
-                    "mode": "cpu_fast" if input_is_image else "gpu"
+                    "mode": "cpu_fast" if input_is_image else "gpu",
                 }
 
         # ==================== CAPTIONER ====================
@@ -2585,8 +3140,7 @@ def handler(job):
             if process_captioner is None:
                 return {"error": "Captioner processor not available"}
             result = process_captioner(
-                input_path, output_path, config,
-                progress_callback=progress_callback
+                input_path, output_path, config, progress_callback=progress_callback
             )
 
         # ==================== RESIZE ====================
@@ -2594,8 +3148,7 @@ def handler(job):
             if process_resize is None:
                 return {"error": "Resize processor not available"}
             result = process_resize(
-                input_path, output_path, config,
-                progress_callback=progress_callback
+                input_path, output_path, config, progress_callback=progress_callback
             )
 
         # ==================== PIC TO VIDEO ====================
@@ -2604,86 +3157,101 @@ def handler(job):
                 return {"error": "Pic to Video processor not available"}
             output_path = os.path.join(temp_dir, "output.mp4")
             result = process_pic_to_video(
-                input_path, output_path, config,
-                progress_callback=progress_callback
+                input_path, output_path, config, progress_callback=progress_callback
             )
 
         # ==================== BG REMOVE ====================
         elif tool == "bg_remove":
             if process_bg_remove is None:
-                return {"error": "BG Remove processor not available. Install: pip install rembg"}
+                return {
+                    "error": "BG Remove processor not available. Install: pip install rembg"
+                }
             output_path = os.path.join(temp_dir, "output.png")
             result = process_bg_remove(
-                input_path, output_path, config,
-                progress_callback=progress_callback
+                input_path, output_path, config, progress_callback=progress_callback
             )
 
         # ==================== UPSCALE ====================
         elif tool == "upscale":
             if process_upscale is None:
-                return {"error": "Upscale processor not available. Install: pip install realesrgan basicsr"}
+                return {
+                    "error": "Upscale processor not available. Install: pip install realesrgan basicsr"
+                }
 
             if is_video(input_ext):
                 if process_upscale_video is None:
                     return {"error": "Video upscale not available"}
                 result = process_upscale_video(
-                    input_path, output_path, config,
-                    progress_callback=progress_callback
+                    input_path, output_path, config, progress_callback=progress_callback
                 )
             else:
                 result = process_upscale(
-                    input_path, output_path, config,
-                    progress_callback=progress_callback
+                    input_path, output_path, config, progress_callback=progress_callback
                 )
 
         # ==================== FACE SWAP ====================
         elif tool == "face_swap":
             if process_face_swap is None:
-                return {"error": "Face Swap processor not available. Install: pip install insightface onnxruntime-gpu"}
+                return {
+                    "error": "Face Swap processor not available. Install: pip install insightface onnxruntime-gpu"
+                }
 
             if is_video(input_ext):
                 if process_face_swap_video is None:
                     return {"error": "Video face swap not available"}
                 result = process_face_swap_video(
-                    input_path, output_path, config,
-                    progress_callback=progress_callback
+                    input_path, output_path, config, progress_callback=progress_callback
                 )
             else:
                 result = process_face_swap(
-                    input_path, output_path, config,
-                    progress_callback=progress_callback
+                    input_path, output_path, config, progress_callback=progress_callback
                 )
 
         # ==================== VIDEO GEN ====================
         elif tool == "video_gen":
             if process_video_gen is None:
-                return {"error": "Video Gen processor not available. Install: pip install replicate diffusers"}
+                return {
+                    "error": "Video Gen processor not available. Install: pip install replicate diffusers"
+                }
             output_path = os.path.join(temp_dir, "output.mp4")
             result = process_video_gen(
-                input_path, output_path, config,
-                progress_callback=progress_callback
+                input_path, output_path, config, progress_callback=progress_callback
+            )
+
+        # ==================== EDITOR ====================
+        elif tool == "editor":
+            if process_editor is None:
+                return {"error": "Editor processor not available"}
+            output_path = os.path.join(temp_dir, "output.mp4")
+            result = process_editor(
+                input_path, output_path, config, progress_callback=progress_callback
             )
 
         # ==================== VIDEO REFRAME ====================
         elif tool == "video_reframe":
             if process_video_reframe is None:
                 return {"error": "Video Reframe processor not available"}
-            print(f"[VIDEO_REFRAME] Single mode - Config received: {json.dumps({k: v for k, v in config.items() if not str(k).startswith('_')}, default=str)}")
+            print(
+                f"[VIDEO_REFRAME] Single mode - Config received: {json.dumps({k: v for k, v in config.items() if not str(k).startswith('_')}, default=str)}"
+            )
             output_path = os.path.join(temp_dir, "output.mp4")
             print(f"[VIDEO_REFRAME] Initial output_path: {output_path}")
             result = process_video_reframe(
-                input_path, output_path, config,
-                progress_callback=progress_callback
+                input_path, output_path, config, progress_callback=progress_callback
             )
             print(f"[VIDEO_REFRAME] Processor result: {result}")
             # IMPORTANT: video_reframe may change extension for images (mp4 -> jpg)
             # Use actual output path from result if available
-            if result and result.get('outputPath'):
+            if result and result.get("outputPath"):
                 old_path = output_path
-                output_path = result['outputPath']
-                print(f"[VIDEO_REFRAME] Output path updated: {old_path} -> {output_path}")
+                output_path = result["outputPath"]
+                print(
+                    f"[VIDEO_REFRAME] Output path updated: {old_path} -> {output_path}"
+                )
             else:
-                print(f"[VIDEO_REFRAME] WARNING: No outputPath in result, using original: {output_path}")
+                print(
+                    f"[VIDEO_REFRAME] WARNING: No outputPath in result, using original: {output_path}"
+                )
 
         # ==================== UNKNOWN TOOL ====================
         else:
@@ -2698,10 +3266,7 @@ def handler(job):
             return {"error": "Processing failed - output file is empty"}
 
         # Upload result with error handling
-        runpod.serverless.progress_update(job, {
-            "progress": 95,
-            "status": "uploading"
-        })
+        runpod.serverless.progress_update(job, {"progress": 95, "status": "uploading"})
 
         try:
             upload_result = upload_file(output_path, output_url)
@@ -2709,7 +3274,7 @@ def handler(job):
             return {
                 "error": f"Failed to upload output: {str(e)}",
                 "tool": tool,
-                "outputSize": output_size
+                "outputSize": output_size,
             }
 
         # Success
@@ -2718,16 +3283,13 @@ def handler(job):
             "tool": tool,
             "outputSize": output_size,
             "uploadAttempts": upload_result.get("attempts", 1),
-            **result
+            **result,
         }
 
     except Exception as e:
         import traceback
-        return {
-            "error": str(e),
-            "traceback": traceback.format_exc(),
-            "tool": tool
-        }
+
+        return {"error": str(e), "traceback": traceback.format_exc(), "tool": tool}
 
     finally:
         # Cleanup temp directory

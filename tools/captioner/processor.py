@@ -203,6 +203,56 @@ FONT_MAP = {
     "default-italic": "/usr/share/fonts/truetype/dejavu/DejaVuSans-Oblique.ttf",
 }
 
+
+def resolve_font_path(font_name: str, fallback_key: str = "default-bold") -> str:
+    """Resolve font path across RunPod and local dev environments."""
+
+    requested = str(font_name or "").strip()
+    fallback = FONT_MAP.get(fallback_key, FONT_MAP["default-bold"])
+
+    processor_dir = os.path.dirname(os.path.abspath(__file__))
+    local_tiktok = os.path.normpath(
+        os.path.join(processor_dir, "..", "..", "fonts", "TikTokBold.otf")
+    )
+    local_italic = os.path.normpath(
+        os.path.join(processor_dir, "..", "..", "fonts", "LightItalic.otf")
+    )
+
+    alias_map = {
+        "tiktok": "TikTokBold.otf",
+        "tiktok-bold": "TikTokBold.otf",
+        "tiktok-italic": "LightItalic.otf",
+    }
+    requested = alias_map.get(requested.lower(), requested)
+
+    candidates: List[str] = []
+    if requested:
+        mapped = FONT_MAP.get(requested, requested)
+        candidates.append(mapped)
+
+        if requested in {"TikTokBold.otf", "tiktokbold.otf"}:
+            candidates.extend(["/app/fonts/TikTokBold.otf", local_tiktok])
+        if requested in {"LightItalic.otf", "lightitalic.otf"}:
+            candidates.extend(["/app/fonts/LightItalic.otf", local_italic])
+
+    candidates.extend(
+        [
+            fallback,
+            FONT_MAP.get("default-bold", fallback),
+            FONT_MAP.get("default", fallback),
+        ]
+    )
+
+    for candidate in candidates:
+        if not isinstance(candidate, str) or not candidate.strip():
+            continue
+        path = os.path.normpath(candidate)
+        if os.path.exists(path):
+            return path
+
+    return fallback
+
+
 LANCZOS_RESAMPLE = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
 
 APPLE_EMOJI_CDN = os.getenv("CAPTIONER_EMOJI_CDN", "https://emojicdn.elk.sh")
@@ -1500,15 +1550,19 @@ def create_caption_overlay(
     overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    font_name = config.get("font", config.get("fontFamily", "TikTokBold.otf"))
-    font_path = FONT_MAP.get(font_name, FONT_MAP["default-bold"])
+    font_name = str(config.get("font", config.get("fontFamily", "TikTokBold.otf")))
+    font_path = resolve_font_path(font_name, fallback_key="default-bold")
     italic_font_name = font_name.replace("Bold", "Italic").replace("bold", "italic")
     if "TikTok" in font_name or "tiktok" in font_name:
-        italic_font_path = FONT_MAP.get(
-            "LightItalic.otf", FONT_MAP.get("tiktok-italic", FONT_MAP["default-italic"])
+        italic_font_path = resolve_font_path(
+            "LightItalic.otf",
+            fallback_key="default-italic",
         )
     else:
-        italic_font_path = FONT_MAP.get(italic_font_name, FONT_MAP["default-italic"])
+        italic_font_path = resolve_font_path(
+            str(italic_font_name),
+            fallback_key="default-italic",
+        )
 
     try:
         body_font = ImageFont.truetype(font_path, font_size)

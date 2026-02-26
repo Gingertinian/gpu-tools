@@ -17,11 +17,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'tools'))
 
 from video_reframe.processor_gpu import process_video_reframe, is_image_file, is_video_file
 
-# Test images
+# Test images - use environment variables or sensible defaults instead of hardcoded paths
 TEST_IMAGE_URL = "https://picsum.photos/800/600"
-TEST_IMAGE_LOCAL = r'C:\Users\erudito\Pictures\Screenshots\Screenshot 2026-01-02 144608.png'
+TEST_IMAGE_LOCAL = os.environ.get(
+    'TEST_INPUT_IMAGE',
+    os.path.join(os.path.expanduser("~"), 'Pictures', 'Screenshots', 'Screenshot 2026-01-02 144608.png')
+)
 
-OUTPUT_DIR = r'C:\Users\erudito\Downloads\reframe_tests'
+OUTPUT_DIR = os.environ.get(
+    'TEST_OUTPUT_DIR',
+    os.path.join(tempfile.gettempdir(), 'reframe_tests')
+)
 
 def download_test_image(temp_dir):
     """Download a test image from the internet"""
@@ -126,7 +132,7 @@ def test_image_reframe():
         # Cleanup temp dir
         try:
             shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
+        except (IOError, OSError):
             pass
 
 
@@ -190,7 +196,7 @@ def test_handler_simulation():
     finally:
         try:
             shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
+        except (IOError, OSError):
             pass
 
 
@@ -248,7 +254,7 @@ def test_logo_positions():
     finally:
         try:
             shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
+        except (IOError, OSError):
             pass
 
 
@@ -303,7 +309,7 @@ def test_blur_zones():
     finally:
         try:
             shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
+        except (IOError, OSError):
             pass
 
 

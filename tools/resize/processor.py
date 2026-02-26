@@ -17,6 +17,7 @@ Config structure:
 """
 
 import os
+import logging
 import subprocess
 import tempfile
 import zipfile
@@ -27,6 +28,18 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from threading import Lock
+
+logger = logging.getLogger(__name__)
+
+
+def safe_extract(zf: zipfile.ZipFile, name: str, extract_dir: str) -> str:
+    """Safely extract a zip entry, preventing path traversal attacks (ZipSlip)."""
+    target_path = os.path.realpath(os.path.join(extract_dir, name))
+    extract_dir_real = os.path.realpath(extract_dir)
+    if not target_path.startswith(extract_dir_real + os.sep) and target_path != extract_dir_real:
+        raise ValueError(f"Attempted path traversal in zip entry: {name}")
+    zf.extract(name, extract_dir)
+    return target_path
 
 
 @dataclass
@@ -99,8 +112,10 @@ def get_video_dimensions(video_path: str) -> Optional[Tuple[int, int]]:
             parts = result.stdout.strip().split(',')
             if len(parts) >= 2:
                 return int(parts[0]), int(parts[1])
-    except Exception:
-        pass
+    except subprocess.TimeoutExpired:
+        logger.warning(f"ffprobe timed out getting dimensions for {video_path}")
+    except (subprocess.SubprocessError, ValueError, OSError) as e:
+        logger.debug(f"Could not get video dimensions for {video_path}: {e}")
     return None
 
 
@@ -109,7 +124,8 @@ def get_image_dimensions(image_path: str) -> Optional[Tuple[int, int]]:
     try:
         with Image.open(image_path) as img:
             return img.size  # (width, height)
-    except Exception:
+    except (IOError, OSError) as e:
+        logger.debug(f"Could not get image dimensions for {image_path}: {e}")
         return None
 
 
@@ -438,10 +454,14 @@ def get_video_duration(path: str) -> float:
     ]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         info = json.loads(result.stdout)
         return float(info.get('format', {}).get('duration', 0))
-    except Exception:
+    except subprocess.TimeoutExpired:
+        logger.warning(f"ffprobe timed out getting duration for {path}")
+        return 0
+    except (json.JSONDecodeError, ValueError, OSError) as e:
+        logger.debug(f"Could not get video duration for {path}: {e}")
         return 0
 
 
@@ -604,94 +624,97 @@ def process_videos_parallel(
         temp_output_dir = output_dir
         os.makedirs(temp_output_dir, exist_ok=True)
 
-    # Generate output paths for each input
-    output_paths = []
-    for input_path in input_paths:
-        basename = os.path.basename(input_path)
-        name, ext = os.path.splitext(basename)
-        output_name = f"{name}_resized{ext}"
-        output_paths.append(os.path.join(temp_output_dir, output_name))
+    try:
+        # Generate output paths for each input
+        output_paths = []
+        for input_path in input_paths:
+            basename = os.path.basename(input_path)
+            name, ext = os.path.splitext(basename)
+            output_name = f"{name}_resized{ext}"
+            output_paths.append(os.path.join(temp_output_dir, output_name))
 
-    # Initialize progress tracker
-    batch_progress = BatchProgress(total_files=len(input_paths))
+        # Initialize progress tracker
+        batch_progress = BatchProgress(total_files=len(input_paths))
 
-    report_progress(0.05, f"Processing {len(input_paths)} files on {num_gpus} GPU(s)...")
+        report_progress(0.05, f"Processing {len(input_paths)} files on {num_gpus} GPU(s)...")
 
-    # Determine max workers (one per GPU to avoid memory issues)
-    max_workers = num_gpus
+        # Determine max workers (one per GPU to avoid memory issues)
+        max_workers = num_gpus
 
-    results = []
+        results = []
 
-    # Process in parallel with ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {}
+        # Process in parallel with ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {}
 
-        for idx, (input_path, output_path) in enumerate(zip(input_paths, output_paths)):
-            # Round-robin GPU assignment
-            assigned_gpu = idx % num_gpus
+            for idx, (input_path, output_path) in enumerate(zip(input_paths, output_paths)):
+                # Round-robin GPU assignment
+                assigned_gpu = idx % num_gpus
 
-            future = executor.submit(
-                process_single_video_resize_worker,
-                input_path,
-                output_path,
-                config,
-                assigned_gpu,
-                idx,
-                batch_progress
-            )
-            futures[future] = idx
+                future = executor.submit(
+                    process_single_video_resize_worker,
+                    input_path,
+                    output_path,
+                    config,
+                    assigned_gpu,
+                    idx,
+                    batch_progress
+                )
+                futures[future] = idx
 
-        # Collect results and report progress
-        for future in as_completed(futures):
-            result = future.result()
-            results.append(result)
+            # Collect results and report progress
+            for future in as_completed(futures):
+                result = future.result()
+                results.append(result)
 
-            # Update progress
-            progress = 0.05 + (batch_progress.progress * 0.90)
-            completed = batch_progress.completed
-            failed = batch_progress.failed
-            total = batch_progress.total_files
+                # Update progress
+                progress = 0.05 + (batch_progress.progress * 0.90)
+                completed = batch_progress.completed
+                failed = batch_progress.failed
+                total = batch_progress.total_files
 
-            status = f"Completed {completed}/{total}"
-            if failed > 0:
-                status += f" ({failed} failed)"
+                status = f"Completed {completed}/{total}"
+                if failed > 0:
+                    status += f" ({failed} failed)"
 
-            report_progress(progress, status)
+                report_progress(progress, status)
 
-    # Sort results by file index
-    results.sort(key=lambda r: r.get('file_index', 0))
+        # Sort results by file index
+        results.sort(key=lambda r: r.get('file_index', 0))
 
-    # If output should be ZIP, create it
-    if output_is_zip:
-        report_progress(0.96, "Creating output ZIP...")
-        with zipfile.ZipFile(output_dir, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for result in results:
-                if result.get('success', False):
-                    output_path = result['output']
-                    if os.path.exists(output_path):
-                        arcname = os.path.basename(output_path)
-                        zf.write(output_path, arcname)
+        # If output should be ZIP, create it
+        if output_is_zip:
+            report_progress(0.96, "Creating output ZIP...")
+            with zipfile.ZipFile(output_dir, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for result in results:
+                    if result.get('success', False):
+                        output_path = result['output']
+                        if os.path.exists(output_path):
+                            arcname = os.path.basename(output_path)
+                            zf.write(output_path, arcname)
 
-        # Clean up temp directory
-        shutil.rmtree(temp_output_dir, ignore_errors=True)
+        report_progress(1.0, "Batch processing complete")
 
-    report_progress(1.0, "Batch processing complete")
+        # Summary
+        successful = sum(1 for r in results if r.get('success', False))
+        failed = sum(1 for r in results if not r.get('success', False))
+        skipped = sum(1 for r in results if r.get('skipped', False))
 
-    # Summary
-    successful = sum(1 for r in results if r.get('success', False))
-    failed = sum(1 for r in results if not r.get('success', False))
-    skipped = sum(1 for r in results if r.get('skipped', False))
+        return {
+            'batch': True,
+            'total_files': len(input_paths),
+            'successful': successful,
+            'failed': failed,
+            'skipped': skipped,
+            'gpus_used': num_gpus,
+            'gpu_names': gpu_info.names,
+            'results': results
+        }
 
-    return {
-        'batch': True,
-        'total_files': len(input_paths),
-        'successful': successful,
-        'failed': failed,
-        'skipped': skipped,
-        'gpus_used': num_gpus,
-        'gpu_names': gpu_info.names,
-        'results': results
-    }
+    finally:
+        # Clean up temp directory only if we created one for ZIP output
+        if output_is_zip:
+            shutil.rmtree(temp_output_dir, ignore_errors=True)
 
 
 def _process_zip_batch(
@@ -722,9 +745,10 @@ def _process_zip_batch(
     temp_extract_dir = tempfile.mkdtemp(prefix='resize_extract_')
 
     try:
-        # Extract ZIP
+        # Extract ZIP (with path traversal protection)
         with zipfile.ZipFile(input_zip, 'r') as zf:
-            zf.extractall(temp_extract_dir)
+            for name in zf.namelist():
+                safe_extract(zf, name, temp_extract_dir)
 
         # Find video files
         video_extensions = {'.mp4', '.mov', '.avi', '.webm', '.mkv', '.m4v', '.flv', '.wmv'}

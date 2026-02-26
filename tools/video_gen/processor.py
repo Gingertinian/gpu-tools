@@ -18,6 +18,7 @@ Config options:
 """
 
 import os
+import gc
 import tempfile
 import shutil
 import subprocess
@@ -43,47 +44,72 @@ def process_video_gen_replicate(
     if progress_callback:
         progress_callback(0.1, "Uploading image...")
 
-    # Read and prepare input image
-    img = Image.open(input_path)
+    # Read and prepare input image (use with statement to avoid file handle leak)
+    with Image.open(input_path) as img:
+        # SVD expects 1024x576 or similar 16:9 aspect
+        target_w, target_h = 1024, 576
+        img_resized = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
 
-    # SVD expects 1024x576 or similar 16:9 aspect
-    target_w, target_h = 1024, 576
-    img_resized = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
-
-    # Save temp resized image
-    temp_dir = tempfile.mkdtemp()
-    temp_input = os.path.join(temp_dir, "input.png")
-    img_resized.save(temp_input)
+        # Save temp resized image
+        temp_dir = tempfile.mkdtemp()
+        temp_input = os.path.join(temp_dir, "input.png")
+        img_resized.save(temp_input)
 
     try:
         if progress_callback:
             progress_callback(0.2, "Starting generation...")
 
-        # Build input
-        replicate_input = {
-            "input_image": open(temp_input, "rb"),
-            "motion_bucket_id": motion_bucket_id,
-            "fps": fps,
-            "num_frames": num_frames,
-        }
+        # Build input (use with statement to properly close file handle)
+        input_file = open(temp_input, "rb")
+        try:
+            replicate_input = {
+                "input_image": input_file,
+                "motion_bucket_id": motion_bucket_id,
+                "fps": fps,
+                "num_frames": num_frames,
+            }
 
-        if seed is not None:
-            replicate_input["seed"] = seed
+            if seed is not None:
+                replicate_input["seed"] = seed
 
-        # Run prediction
-        output = replicate.run(model, input=replicate_input)
+            # Run prediction
+            output = replicate.run(model, input=replicate_input)
+        finally:
+            input_file.close()
 
         if progress_callback:
             progress_callback(0.8, "Downloading result...")
 
-        # Download result
+        # Download result with retry logic
         import requests
-        response = requests.get(output, stream=True)
-        response.raise_for_status()
+        import time as _time
+        import logging as _logging
+        _logger = _logging.getLogger(__name__)
 
-        with open(output_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
+        _max_retries = 3
+        _last_err = None
+        for _attempt in range(_max_retries):
+            try:
+                response = requests.get(output, stream=True, timeout=120)
+                response.raise_for_status()
+                with open(output_path, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                _last_err = None
+                break
+            except (requests.RequestException, IOError) as e:
+                _last_err = e
+                if os.path.exists(output_path):
+                    try:
+                        os.remove(output_path)
+                    except OSError:
+                        pass
+                if _attempt < _max_retries - 1:
+                    _wait = 2 ** _attempt
+                    _logger.warning(f"[VideoGen] Download attempt {_attempt + 1} failed: {e}. Retrying in {_wait}s...")
+                    _time.sleep(_wait)
+        if _last_err is not None:
+            raise RuntimeError(f"VideoGen download failed after {_max_retries} attempts: {_last_err}")
 
         if progress_callback:
             progress_callback(1.0, "Complete")
@@ -159,6 +185,13 @@ def process_video_gen_svd(
 
     # Export to video file
     export_to_video(frames, output_path, fps=fps)
+
+    # Clean up GPU memory between jobs
+    del pipe
+    del frames
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
 
     if progress_callback:
         progress_callback(1.0, "Complete")
@@ -298,13 +331,29 @@ def process_video_gen_runway(
     if progress_callback:
         progress_callback(0.9, "Downloading video...")
 
-    # Download result
-    video_response = requests.get(video_url, stream=True, timeout=120)
-    video_response.raise_for_status()
-
-    with open(output_path, 'wb') as f:
-        for chunk in video_response.iter_content(chunk_size=8192):
-            f.write(chunk)
+    # Download result with retry logic
+    _max_retries = 3
+    _last_err = None
+    for _attempt in range(_max_retries):
+        try:
+            video_response = requests.get(video_url, stream=True, timeout=120)
+            video_response.raise_for_status()
+            with open(output_path, 'wb') as f:
+                for chunk in video_response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            _last_err = None
+            break
+        except (requests.RequestException, IOError) as e:
+            _last_err = e
+            if os.path.exists(output_path):
+                try:
+                    os.remove(output_path)
+                except OSError:
+                    pass
+            if _attempt < _max_retries - 1:
+                time.sleep(2 ** _attempt)
+    if _last_err is not None:
+        raise RuntimeError(f"Runway video download failed after {_max_retries} attempts: {_last_err}")
 
     if progress_callback:
         progress_callback(1.0, "Complete")

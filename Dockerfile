@@ -23,8 +23,9 @@ COPY requirements.txt /requirements.txt
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r /requirements.txt
 
-# Copy handler and tools
+# Copy handler, utilities and tools
 COPY handler.py /handler.py
+COPY gtp_utils.py /gtp_utils.py
 COPY tools/ /workspace/tools/
 
 # Copy logo assets for VideoReframe

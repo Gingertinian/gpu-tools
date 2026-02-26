@@ -22,6 +22,7 @@ import runpod
 import os
 import sys
 import json
+import logging
 import requests
 import tempfile
 import shutil
@@ -35,6 +36,68 @@ from concurrent.futures import ThreadPoolExecutor
 from queue import Queue, Empty
 from dataclasses import dataclass
 from typing import Optional, List, Callable, Any, Tuple, Dict
+from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
+
+
+# ==================== URL Validation (SSRF Protection) ====================
+
+
+def validate_url(url: str, param_name: str = "url") -> str:
+    """
+    Validate that a URL is safe for download/upload operations.
+    Blocks localhost, private networks, and non-HTTP schemes to prevent SSRF.
+
+    Args:
+        url: The URL to validate
+        param_name: Name of the parameter (for error messages)
+
+    Returns:
+        The validated URL string
+
+    Raises:
+        ValueError: If the URL is invalid or points to a restricted target
+    """
+    if not url:
+        raise ValueError(f"{param_name} is required")
+
+    parsed = urlparse(url)
+
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"Invalid URL scheme for '{param_name}': {parsed.scheme}. "
+            "Only http:// and https:// are allowed."
+        )
+
+    if not parsed.netloc:
+        raise ValueError(f"Invalid URL for '{param_name}': missing host")
+
+    hostname = (parsed.hostname or "").lower()
+
+    # Block localhost variants
+    if hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "[::1]"):
+        raise ValueError(f"URL for '{param_name}' points to localhost")
+
+    # Block private network ranges (RFC 1918 + link-local)
+    if hostname.startswith(("10.", "192.168.", "169.254.")):
+        raise ValueError(f"URL for '{param_name}' points to a private network")
+
+    # Block 172.16.0.0/12 (172.16.x.x through 172.31.x.x)
+    if hostname.startswith("172."):
+        parts = hostname.split(".")
+        if len(parts) >= 2:
+            try:
+                second_octet = int(parts[1])
+                if 16 <= second_octet <= 31:
+                    raise ValueError(
+                        f"URL for '{param_name}' points to a private network"
+                    )
+            except ValueError:
+                pass
+
+    return url
+
 
 # ==================== Constants ====================
 
@@ -234,9 +297,44 @@ def get_zip_compression(filepath: str) -> int:
     return zipfile.ZIP_DEFLATED  # Compress uncompressed files
 
 
-def download_file(url: str, path: str) -> None:
+# Maximum download size: 10GB (generous limit for large video batches)
+MAX_DOWNLOAD_SIZE = 10 * 1024 * 1024 * 1024
+
+# Maximum file size for processing: 500MB per individual file
+MAX_PROCESSING_FILE_SIZE = 500 * 1024 * 1024  # 500MB
+
+
+def validate_file_size(filepath: str, max_size: int = MAX_PROCESSING_FILE_SIZE) -> None:
     """
-    Download file from presigned URL with optimized chunk size.
+    Validate that a downloaded file does not exceed the maximum processing size.
+
+    Args:
+        filepath: Path to the file to validate
+        max_size: Maximum allowed file size in bytes (default: 500MB)
+
+    Raises:
+        ValueError: If the file exceeds the maximum size
+    """
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(f"File not found for size validation: {filepath}")
+
+    file_size = os.path.getsize(filepath)
+    if file_size > max_size:
+        raise ValueError(
+            f"File too large for processing: {file_size / 1024 / 1024:.1f}MB "
+            f"exceeds {max_size / 1024 / 1024:.0f}MB limit"
+        )
+    if file_size == 0:
+        raise ValueError(f"File is empty: {filepath}")
+
+    logger.debug(f"File size validated: {filepath} ({file_size / 1024 / 1024:.1f}MB)")
+
+
+def download_file(url: str, path: str, max_retries: int = 3) -> None:
+    """
+    Download file from presigned URL with optimized chunk size and retry logic.
+
+    Retries with exponential backoff on transient failures (network errors, 5xx).
 
     Phase 0: Uses GTP (Global Transfer Protocol) when enabled for:
     - SHA-256 hash verification
@@ -244,6 +342,9 @@ def download_file(url: str, path: str) -> None:
     - Size verification
     - Automatic retry with exponential backoff
     """
+    # Validate URL (scheme + SSRF protection) before downloading
+    validate_url(url, "downloadUrl")
+
     if USE_GTP:
         try:
             download_file_gtp(url, path)
@@ -252,13 +353,57 @@ def download_file(url: str, path: str) -> None:
             print(f"[GTP] Download failed with GTP, falling back to standard: {e}")
             # Fall through to standard download
 
-    # Standard download (no verification)
-    response = requests.get(url, stream=True, timeout=300)
-    response.raise_for_status()
+    # Standard download with retry logic
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, stream=True, timeout=300)
+            response.raise_for_status()
 
-    with open(path, "wb") as f:
-        for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
-            f.write(chunk)
+            # Check Content-Length header for file size limit
+            content_length = response.headers.get("Content-Length")
+            if content_length and int(content_length) > MAX_DOWNLOAD_SIZE:
+                raise ValueError(
+                    f"File too large: {int(content_length) / 1024 / 1024:.0f}MB exceeds "
+                    f"{MAX_DOWNLOAD_SIZE / 1024 / 1024 / 1024:.0f}GB limit"
+                )
+
+            downloaded = 0
+            with open(path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                    downloaded += len(chunk)
+                    if downloaded > MAX_DOWNLOAD_SIZE:
+                        f.close()
+                        os.remove(path)
+                        raise ValueError(
+                            f"Download exceeded {MAX_DOWNLOAD_SIZE / 1024 / 1024 / 1024:.0f}GB size limit"
+                        )
+                    f.write(chunk)
+            return  # Success
+        except (requests.RequestException, IOError) as e:
+            last_error = e
+            # Clean up partial download
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                logger.warning(
+                    f"[Download] Attempt {attempt + 1}/{max_retries} failed: {e}. "
+                    f"Retrying in {wait_time}s..."
+                )
+                time.sleep(wait_time)
+            else:
+                logger.error(
+                    f"[Download] All {max_retries} attempts failed for {url}"
+                )
+        except ValueError:
+            # Size limit errors are not retryable
+            raise
+
+    raise RuntimeError(f"Download failed after {max_retries} attempts: {last_error}")
 
 
 def upload_file(path: str, url: str, max_retries: int = 3) -> dict:
@@ -372,12 +517,31 @@ def create_progress_callback(job):
     return callback
 
 
+ALLOWED_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif",
+    ".mp4", ".mov", ".avi", ".webm", ".mkv", ".m4v",
+    ".mp3", ".aac", ".ogg", ".flac",
+    ".zip",
+}
+
+
 def get_file_extension(url: str, config: dict) -> str:
-    """Extract file extension from URL or config"""
+    """Extract file extension from URL or config, with sanitization."""
     ext = config.get("inputExtension")
     if not ext:
         url_path = url.split("?")[0]
         ext = os.path.splitext(url_path)[1].lower() or ".jpg"
+
+    # Sanitize: ensure it starts with a dot and contains only safe characters
+    if not ext.startswith("."):
+        ext = "." + ext
+    ext = ext.lower()
+
+    # Only allow known extensions to prevent path traversal or injection
+    if ext not in ALLOWED_EXTENSIONS:
+        logger.warning(f"Unknown file extension '{ext}', defaulting to .jpg")
+        ext = ".jpg"
+
     return ext
 
 
@@ -1550,7 +1714,8 @@ def pre_distribute_work(
     for item in items:
         try:
             size = os.path.getsize(item[0]) if os.path.exists(item[0]) else 0
-        except:
+        except (IOError, OSError) as e:
+            logger.debug(f"Could not get file size for {item[0]}: {e}")
             size = 0
         file_sizes.append(size)
 
@@ -2092,6 +2257,14 @@ def process_batch_mode(job, job_input: dict) -> dict:
     if len(input_urls) != len(output_urls):
         return {"error": "inputUrls and outputUrls must have same length"}
 
+    # Validate all URLs (scheme + SSRF protection)
+    for idx, (i_url, o_url) in enumerate(zip(input_urls, output_urls)):
+        for url, name in [(i_url, "inputUrl"), (o_url, "outputUrl")]:
+            try:
+                validate_url(url, f"{name}[{idx}]")
+            except ValueError as e:
+                return {"error": str(e)}
+
     total_files = len(input_urls)
 
     # Detect GPU capabilities (cached)
@@ -2157,8 +2330,8 @@ def process_batch_mode(job, job_input: dict) -> dict:
     finally:
         try:
             shutil.rmtree(temp_dir)
-        except:
-            pass
+        except (IOError, OSError) as e:
+            logger.debug(f"Failed to cleanup temp dir: {e}")
 
 
 # ==================== Pipeline Processor ====================
@@ -2725,6 +2898,14 @@ def process_batch_pipeline(job, job_input: dict) -> dict:
     if not pipeline:
         return {"error": "Missing 'pipeline' parameter"}
 
+    # Validate all URLs (scheme + SSRF protection)
+    for idx, (i_url, o_url) in enumerate(zip(input_urls, output_urls)):
+        for url, name in [(i_url, "inputUrl"), (o_url, "outputUrl")]:
+            try:
+                validate_url(url, f"{name}[{idx}]")
+            except ValueError as e:
+                return {"error": str(e)}
+
     total_files = len(input_urls)
 
     # Detect GPU capabilities (cached)
@@ -2925,8 +3106,8 @@ def process_batch_pipeline(job, job_input: dict) -> dict:
     finally:
         try:
             shutil.rmtree(temp_dir)
-        except:
-            pass
+        except (IOError, OSError) as e:
+            logger.debug(f"Failed to cleanup batch_pipeline temp dir: {e}")
 
 
 # ==================== Main Handler ====================
@@ -3002,6 +3183,14 @@ def handler(job):
     if not output_url:
         return {"error": "Missing 'outputUrl' parameter"}
 
+    # ==================== URL VALIDATION ====================
+    # Ensure URLs use http:// or https:// and block SSRF (private IPs/localhost)
+    try:
+        validate_url(input_url, "inputUrl")
+        validate_url(output_url, "outputUrl")
+    except ValueError as e:
+        return {"error": str(e)}
+
     # ==================== PIPELINE MODE ====================
     # Process entire workflow in one job without intermediate uploads
     if tool == "pipeline":
@@ -3021,6 +3210,7 @@ def handler(job):
             input_ext = get_file_extension(input_url, config)
             input_path = os.path.join(temp_dir, f"input{input_ext}")
             download_file(input_url, input_path)
+            validate_file_size(input_path)
 
             # Process pipeline
             progress_callback = create_progress_callback(job)
@@ -3047,8 +3237,8 @@ def handler(job):
         finally:
             try:
                 shutil.rmtree(temp_dir)
-            except:
-                pass
+            except (IOError, OSError) as e:
+                logger.debug(f"Failed to cleanup pipeline temp dir: {e}")
 
     # Create temp directory for this job
     temp_dir = tempfile.mkdtemp(prefix=f"farmium_{job_id}_")
@@ -3083,6 +3273,7 @@ def handler(job):
         # Download input file
         runpod.serverless.progress_update(job, {"progress": 5, "status": "downloading"})
         download_file(input_url, input_path)
+        validate_file_size(input_path)
 
         # Process based on tool type
         runpod.serverless.progress_update(job, {"progress": 10, "status": "processing"})
@@ -3295,8 +3486,8 @@ def handler(job):
         # Cleanup temp directory
         try:
             shutil.rmtree(temp_dir)
-        except:
-            pass
+        except (IOError, OSError) as e:
+            logger.debug(f"Failed to cleanup job temp dir: {e}")
 
 
 # Start the serverless handler

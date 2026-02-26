@@ -15,6 +15,7 @@ Key features:
 9. Optional logo overlay
 """
 
+import logging
 import os
 import subprocess
 import tempfile
@@ -26,6 +27,8 @@ import cv2
 import numpy as np
 from pathlib import Path
 from typing import Optional, Callable, Dict, Any, List, Union
+
+logger = logging.getLogger(__name__)
 
 # Import GPU operations module
 try:
@@ -1222,7 +1225,8 @@ def _check_audio(video_path: str) -> bool:
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         return 'audio' in result.stdout.lower()
-    except:
+    except (subprocess.SubprocessError, OSError) as e:
+        logger.debug(f"Could not check audio in {video_path}: {e}")
         return True
 
 
@@ -1247,8 +1251,8 @@ def _get_output_dimensions(aspect_str: str) -> tuple:
             final_h = int(1080 * h / w)
             final_h = final_h - (final_h % 2)
             return (final_w, final_h)
-    except:
-        pass
+    except (ValueError, ZeroDivisionError) as e:
+        logger.debug(f"Invalid aspect ratio string '{aspect_str}': {e}")
 
     return (1080, 1920)
 
@@ -1526,7 +1530,8 @@ def _svg_to_pil(svg_path: str, video_width: int, size_percent: float):
 
     try:
         font = ImageFont.truetype("arial.ttf", logo_h // 2)
-    except:
+    except (IOError, OSError) as e:
+        logger.debug(f"Could not load arial.ttf font: {e}")
         font = ImageFont.load_default()
 
     text = "FARMIUM"

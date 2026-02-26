@@ -14,10 +14,13 @@ backend key normalization.
 """
 
 import json
+import logging
 import os
 import subprocess
 import tempfile
 from typing import Any, Callable, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 try:
     from PIL import Image, ImageDraw, ImageFilter, ImageFont
@@ -202,7 +205,13 @@ def _run_ffmpeg(command: List[str]) -> None:
                         + command_to_run[fc_idx + 2 :]
                     )
 
-        result = subprocess.run(command_to_run, capture_output=True, text=True)
+        try:
+            result = subprocess.run(
+                command_to_run, capture_output=True, text=True, timeout=300
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("FFmpeg render command timed out after 300 seconds")
+            raise RuntimeError("FFmpeg render timed out after 300 seconds")
     finally:
         if filter_script_path:
             try:
@@ -229,7 +238,13 @@ def _has_audio_stream(input_path: str) -> bool:
         "csv=p=0",
         input_path,
     ]
-    result = subprocess.run(probe_command, capture_output=True, text=True)
+    try:
+        result = subprocess.run(
+            probe_command, capture_output=True, text=True, timeout=30
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("ffprobe timed out checking audio stream")
+        return False
     if result.returncode != 0:
         return False
     return bool((result.stdout or "").strip())
@@ -254,7 +269,11 @@ def _extract_audio_mono_f32(input_path: str, sample_rate: int = 22050) -> Any:
         "f32le",
         "-",
     ]
-    result = subprocess.run(command, capture_output=True)
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=120)
+    except subprocess.TimeoutExpired:
+        logger.warning("FFmpeg audio extraction timed out after 120 seconds")
+        return None
     if result.returncode != 0 or not result.stdout:
         return None
 

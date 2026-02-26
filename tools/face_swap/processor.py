@@ -11,13 +11,17 @@ Config options:
 - similarity_threshold: float = 0.6 (minimum face similarity for detection)
 """
 
+import logging
 import os
+import gc
 import tempfile
 import shutil
 import subprocess
 from typing import Callable, Optional
 import cv2
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def download_models():
@@ -74,27 +78,41 @@ def get_face_enhancer():
         return None
 
 
-def download_source_face(url: str, temp_dir: str) -> str:
-    """Download source face image from URL"""
+def download_source_face(url: str, temp_dir: str, max_retries: int = 3) -> str:
+    """Download source face image from URL with retry logic."""
     import requests
+    import time as _time
+    import logging as _logging
+    _logger = _logging.getLogger(__name__)
 
-    response = requests.get(url, stream=True, timeout=60)
-    response.raise_for_status()
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, stream=True, timeout=60)
+            response.raise_for_status()
 
-    # Determine extension from content-type or URL
-    ext = '.jpg'
-    content_type = response.headers.get('content-type', '')
-    if 'png' in content_type:
-        ext = '.png'
-    elif 'webp' in content_type:
-        ext = '.webp'
+            # Determine extension from content-type or URL
+            ext = '.jpg'
+            content_type = response.headers.get('content-type', '')
+            if 'png' in content_type:
+                ext = '.png'
+            elif 'webp' in content_type:
+                ext = '.webp'
 
-    path = os.path.join(temp_dir, f'source_face{ext}')
-    with open(path, 'wb') as f:
-        for chunk in response.iter_content(chunk_size=8192):
-            f.write(chunk)
+            path = os.path.join(temp_dir, f'source_face{ext}')
+            with open(path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
 
-    return path
+            return path
+        except (requests.RequestException, IOError) as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                _logger.warning(f"[FaceSwap] Download attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
+                _time.sleep(wait_time)
+
+    raise RuntimeError(f"Face source download failed after {max_retries} attempts: {last_error}")
 
 
 def process_face_swap(
@@ -211,6 +229,14 @@ def process_face_swap(
         }
 
     finally:
+        # Clean up GPU memory between jobs
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+        gc.collect()
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
@@ -316,20 +342,24 @@ def process_face_swap_video(
             progress_callback(0.9, "Encoding video...")
 
         # Encode output video with NVENC
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-framerate", str(fps),
-            "-i", os.path.join(frames_dir, "frame_%06d.png"),
-            "-i", input_path,  # For audio
-            "-map", "0:v",
-            "-map", "1:a?",
-            "-c:v", "h264_nvenc",
-            "-preset", "p4",
-            "-cq", "20",
-            "-c:a", "aac",
-            "-pix_fmt", "yuv420p",
-            output_path
-        ], capture_output=True, check=True)
+        try:
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-framerate", str(fps),
+                "-i", os.path.join(frames_dir, "frame_%06d.png"),
+                "-i", input_path,  # For audio
+                "-map", "0:v",
+                "-map", "1:a?",
+                "-c:v", "h264_nvenc",
+                "-preset", "p4",
+                "-cq", "20",
+                "-c:a", "aac",
+                "-pix_fmt", "yuv420p",
+                output_path
+            ], capture_output=True, check=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            logger.error("FFmpeg video encoding timed out after 300 seconds")
+            raise RuntimeError("FFmpeg video encoding timed out after 300 seconds")
 
         if progress_callback:
             progress_callback(1.0, "Complete")
@@ -342,4 +372,12 @@ def process_face_swap_video(
         }
 
     finally:
+        # Clean up GPU memory between jobs
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+        gc.collect()
         shutil.rmtree(temp_dir, ignore_errors=True)

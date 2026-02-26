@@ -8,15 +8,19 @@ Run: python test_fast_local.py
 import os
 import sys
 import time
+import tempfile
 
 # Add tools directory
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'tools'))
 
 from spoofer.processor_fast import process_spoofer_fast
 
-# Test configuration
-INPUT_IMAGE = r'C:\Users\erudito\Pictures\Screenshots\Screenshot 2026-01-02 144608.png'
-OUTPUT_DIR = r'C:\Users\erudito\Downloads'
+# Test configuration - use environment variables or sensible defaults instead of hardcoded paths
+INPUT_IMAGE = os.environ.get(
+    'TEST_INPUT_IMAGE',
+    os.path.join(os.path.expanduser("~"), 'Pictures', 'Screenshots', 'Screenshot 2026-01-02 144608.png')
+)
+OUTPUT_DIR = os.environ.get('TEST_OUTPUT_DIR', tempfile.gettempdir())
 VARIATIONS = 1000  # Test with 1000 variations
 
 def main():

@@ -13,12 +13,16 @@ Config options:
 - fp32: bool = False (use fp32 precision instead of fp16)
 """
 
+import logging
 import os
+import gc
 import subprocess
 import tempfile
 import shutil
 from typing import Callable, Optional
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def get_realesrgan_path():
@@ -143,6 +147,14 @@ def process_upscale_python(
     cv2.imwrite(output_path, output)
 
     new_h, new_w = output.shape[:2]
+
+    # Clean up GPU memory between jobs
+    del upsampler
+    if face_enhancer is not None:
+        del face_enhancer
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
 
     if progress_callback:
         progress_callback(1.0, "Complete")
@@ -290,11 +302,15 @@ def process_upscale_video(
             progress_callback(0.1, "Extracting frames...")
 
         # Extract frames with FFmpeg
-        subprocess.run([
-            "ffmpeg", "-i", input_path,
-            "-qscale:v", "2",
-            os.path.join(frames_dir, "frame_%06d.png")
-        ], capture_output=True, check=True)
+        try:
+            subprocess.run([
+                "ffmpeg", "-i", input_path,
+                "-qscale:v", "2",
+                os.path.join(frames_dir, "frame_%06d.png")
+            ], capture_output=True, check=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            logger.error("FFmpeg frame extraction timed out after 300 seconds")
+            raise RuntimeError("FFmpeg frame extraction timed out after 300 seconds")
 
         # Get list of frames
         frames = sorted([f for f in os.listdir(frames_dir) if f.endswith('.png')])
@@ -321,16 +337,20 @@ def process_upscale_video(
         new_width = width * scale
         new_height = height * scale
 
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-framerate", str(fps),
-            "-i", os.path.join(upscaled_dir, "frame_%06d.png"),
-            "-c:v", "h264_nvenc",
-            "-preset", "p4",
-            "-cq", "20",
-            "-pix_fmt", "yuv420p",
-            output_path
-        ], capture_output=True, check=True)
+        try:
+            subprocess.run([
+                "ffmpeg", "-y",
+                "-framerate", str(fps),
+                "-i", os.path.join(upscaled_dir, "frame_%06d.png"),
+                "-c:v", "h264_nvenc",
+                "-preset", "p4",
+                "-cq", "20",
+                "-pix_fmt", "yuv420p",
+                output_path
+            ], capture_output=True, check=True, timeout=300)
+        except subprocess.TimeoutExpired:
+            logger.error("FFmpeg video encoding timed out after 300 seconds")
+            raise RuntimeError("FFmpeg video encoding timed out after 300 seconds")
 
         if progress_callback:
             progress_callback(1.0, "Complete")
@@ -344,5 +364,13 @@ def process_upscale_video(
         }
 
     finally:
-        # Cleanup
+        # Clean up GPU memory between jobs
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
+        gc.collect()
+        # Cleanup temp files
         shutil.rmtree(temp_dir, ignore_errors=True)

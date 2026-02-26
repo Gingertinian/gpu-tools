@@ -11,6 +11,7 @@ Based on original Spoofer.py with all transforms:
 - PARALLEL VIDEO PROCESSING: Multiple NVENC sessions for datacenter GPUs
 """
 
+import logging
 import os
 import io
 import random
@@ -28,6 +29,8 @@ import threading
 import cv2
 import tempfile
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 # Import gpu_utils for FFmpeg command building (optional - graceful fallback)
 try:
@@ -111,6 +114,16 @@ def get_gpu_info() -> Dict[str, Any]:
     }
 
 
+def safe_extract(zf: zipfile.ZipFile, name: str, extract_dir: str) -> str:
+    """Safely extract a zip entry, preventing path traversal attacks (ZipSlip)."""
+    target_path = os.path.realpath(os.path.join(extract_dir, name))
+    extract_dir_real = os.path.realpath(extract_dir)
+    if not target_path.startswith(extract_dir_real + os.sep) and target_path != extract_dir_real:
+        raise ValueError(f"Attempted path traversal in zip entry: {name}")
+    zf.extract(name, extract_dir)
+    return target_path
+
+
 def extract_videos_from_zip(zip_path: str, extract_dir: str) -> List[str]:
     """
     Extract video files from a ZIP archive.
@@ -122,7 +135,7 @@ def extract_videos_from_zip(zip_path: str, extract_dir: str) -> List[str]:
             ext = os.path.splitext(name)[1].lower()
             if ext in VIDEO_EXTENSIONS:
                 # Extract to temp dir
-                extracted_path = zf.extract(name, extract_dir)
+                extracted_path = safe_extract(zf, name, extract_dir)
                 video_paths.append(extracted_path)
     return video_paths
 
@@ -326,7 +339,8 @@ def _check_video_audio(video_path: str) -> bool:
                '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', video_path]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         return 'audio' in result.stdout.lower()
-    except:
+    except (subprocess.SubprocessError, OSError) as e:
+        logger.debug(f"Could not check audio in {video_path}: {e}")
         return True
 
 
@@ -567,7 +581,8 @@ def _svg_to_cv2(svg_path: str, target_width: int):
 
     try:
         font = ImageFont.truetype("arial.ttf", logo_h // 2)
-    except:
+    except (IOError, OSError) as e:
+        logger.debug(f"Could not load arial.ttf font: {e}")
         font = ImageFont.load_default()
 
     text = "FARMIUM"
@@ -717,7 +732,8 @@ def _start_spoofer_ffmpeg(
 
     try:
         return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except:
+    except (subprocess.SubprocessError, OSError) as e:
+        logger.warning(f"NVENC FFmpeg failed, falling back to CPU: {e}")
         # CPU fallback
         cmd_cpu = [
             'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',
@@ -1707,8 +1723,8 @@ def extract_images_from_zip(zip_path: str, extract_dir: str) -> List[str]:
         for name in zf.namelist():
             ext = os.path.splitext(name)[1].lower()
             if ext in IMAGE_EXTENSIONS:
-                # Extract to temp dir
-                extracted_path = zf.extract(name, extract_dir)
+                # Extract to temp dir (with path traversal protection)
+                extracted_path = safe_extract(zf, name, extract_dir)
                 image_paths.append(extracted_path)
     return image_paths
 
@@ -2699,7 +2715,6 @@ def process_spoofer(
                     )
 
                     if result.get('error'):
-                        shutil.rmtree(temp_dir, ignore_errors=True)
                         return result
 
                     # Create output ZIP with processed images
@@ -2714,8 +2729,6 @@ def process_spoofer(
 
                     report_progress(1.0, "Complete")
 
-                    shutil.rmtree(temp_dir, ignore_errors=True)
-
                     return {
                         'status': 'completed',
                         'mode': 'parallel_image_batch',
@@ -2727,12 +2740,10 @@ def process_spoofer(
                     }
 
                 # No images or videos found in ZIP
-                shutil.rmtree(temp_dir, ignore_errors=True)
                 return {'error': 'ZIP file contains no supported images or videos'}
 
-        except Exception as e:
+        finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
-            raise
 
     # Check if batch mode (variations > 1) - supports both 'variations' and legacy 'copies'
     variations = (
@@ -3095,7 +3106,7 @@ def process_video(
                     current_time = int(h) * 3600 + int(m) * 60 + float(s)
                     progress = min(0.2 + (current_time / duration) * 0.75, 0.95)
                     report_progress(progress, f"Encoding ({mode_name})... {int(current_time)}s / {int(duration)}s")
-                except:
+                except (ValueError, IndexError):
                     pass
 
         stderr_output = ''.join(stderr_lines[-30:]) if stderr_lines else 'No stderr captured'

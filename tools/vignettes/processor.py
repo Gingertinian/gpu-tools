@@ -24,6 +24,7 @@ Multi-GPU Features:
 """
 
 import os
+import logging
 import subprocess
 import tempfile
 import zipfile
@@ -34,6 +35,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 import json
+
+logger = logging.getLogger(__name__)
 
 # Video extensions
 VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.webm', '.mkv', '.m4v'}
@@ -95,6 +98,16 @@ def get_gpu_info() -> Dict[str, Any]:
     }
 
 
+def safe_extract(zf: zipfile.ZipFile, name: str, extract_dir: str) -> str:
+    """Safely extract a zip entry, preventing path traversal attacks (ZipSlip)."""
+    target_path = os.path.realpath(os.path.join(extract_dir, name))
+    extract_dir_real = os.path.realpath(extract_dir)
+    if not target_path.startswith(extract_dir_real + os.sep) and target_path != extract_dir_real:
+        raise ValueError(f"Attempted path traversal in zip entry: {name}")
+    zf.extract(name, extract_dir)
+    return target_path
+
+
 def extract_videos_from_zip(zip_path: str, extract_dir: str) -> List[str]:
     """
     Extract video files from a ZIP archive.
@@ -109,7 +122,7 @@ def extract_videos_from_zip(zip_path: str, extract_dir: str) -> List[str]:
             ext = os.path.splitext(name)[1].lower()
             if ext in VIDEO_EXTENSIONS:
                 # Extract to temp dir
-                extracted_path = zf.extract(name, extract_dir)
+                extracted_path = safe_extract(zf, name, extract_dir)
                 video_paths.append(extracted_path)
     return video_paths
 
@@ -285,7 +298,7 @@ def process_vignettes(
                             if duration > 0:
                                 progress = min(0.4 + (current_time / duration) * 0.55, 0.95)
                                 report_progress(progress, f"Encoding ({mode_name})... {int(current_time)}s / {int(duration)}s")
-                        except:
+                        except (ValueError, IndexError):
                             pass
 
                 # Wait for process to complete with timeout
@@ -330,8 +343,8 @@ def process_vignettes(
         import shutil
         try:
             shutil.rmtree(temp_dir)
-        except:
-            pass
+        except (IOError, OSError) as e:
+            logger.debug(f"Failed to cleanup vignettes temp dir: {e}")
 
 
 def get_video_info(path: str) -> Dict[str, Any]:
@@ -342,7 +355,7 @@ def get_video_info(path: str) -> Dict[str, Any]:
     ]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         info = json.loads(result.stdout)
 
         video_stream = next(
@@ -357,7 +370,7 @@ def get_video_info(path: str) -> Dict[str, Any]:
                 fps = int(num) / int(den)
             else:
                 fps = float(fps_str)
-        except:
+        except (ValueError, ZeroDivisionError):
             fps = 30
 
         return {
@@ -366,7 +379,8 @@ def get_video_info(path: str) -> Dict[str, Any]:
             'fps': fps,
             'duration': float(info.get('format', {}).get('duration', 0))
         }
-    except:
+    except (subprocess.SubprocessError, json.JSONDecodeError, ValueError, KeyError, OSError) as e:
+        logger.debug(f"Could not get video info: {e}")
         return {'width': 1920, 'height': 1080, 'fps': 30, 'duration': 0}
 
 
@@ -469,7 +483,8 @@ def hex_to_rgb(hex_color: str) -> tuple:
 
     try:
         return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
-    except:
+    except (ValueError, IndexError) as e:
+        logger.debug(f"Invalid hex color '{hex_color}': {e}")
         return (0, 0, 0)
 
 
@@ -638,8 +653,8 @@ def process_single_video_internal(
         # Cleanup temp files
         try:
             shutil.rmtree(temp_dir)
-        except:
-            pass
+        except (IOError, OSError) as e:
+            logger.debug(f"Failed to clean up temp dir {temp_dir}: {e}")
 
 
 def process_videos_parallel(
@@ -812,8 +827,8 @@ def process_vignettes_batch(
             # Cleanup temp directory
             try:
                 shutil.rmtree(temp_dir)
-            except:
-                pass
+            except (IOError, OSError) as e:
+                logger.debug(f"Failed to clean up temp dir {temp_dir}: {e}")
 
     # Single video - use standard processing
     return process_vignettes(input_path, output_path, config, progress_callback)

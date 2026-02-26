@@ -27,7 +27,17 @@ from .constants import (
 def generate_unique_seed(img_path: str, var_idx: int, base_time: int) -> int:
     """Generate unique seed for reproducible randomization."""
     hash_input = f"{img_path}_{var_idx}_{base_time}_{os.getpid()}"
-    return int(hashlib.md5(hash_input.encode()).hexdigest()[:8], 16)
+    return int(hashlib.sha256(hash_input.encode()).hexdigest()[:8], 16)
+
+
+def safe_extract(zf: zipfile.ZipFile, name: str, extract_dir: str) -> str:
+    """Safely extract a zip entry, preventing path traversal attacks (ZipSlip)."""
+    target_path = os.path.realpath(os.path.join(extract_dir, name))
+    extract_dir_real = os.path.realpath(extract_dir)
+    if not target_path.startswith(extract_dir_real + os.sep) and target_path != extract_dir_real:
+        raise ValueError(f"Attempted path traversal in zip entry: {name}")
+    zf.extract(name, extract_dir)
+    return target_path
 
 
 def extract_images_from_zip(zip_path: str, extract_dir: str) -> List[str]:
@@ -36,12 +46,12 @@ def extract_images_from_zip(zip_path: str, extract_dir: str) -> List[str]:
     Returns list of paths to extracted image files.
     """
     image_paths = []
-    with zipfile.ZipFile(zip_path, 'r') as zf:
+    with zipfile.ZipFile(zip_path, "r") as zf:
         for name in zf.namelist():
             ext = os.path.splitext(name)[1].lower()
             if ext in IMAGE_EXTENSIONS:
                 # Extract to temp dir
-                extracted_path = zf.extract(name, extract_dir)
+                extracted_path = safe_extract(zf, name, extract_dir)
                 image_paths.append(extracted_path)
     return image_paths
 
@@ -52,17 +62,19 @@ def extract_videos_from_zip(zip_path: str, extract_dir: str) -> List[str]:
     Returns list of paths to extracted video files.
     """
     video_paths = []
-    with zipfile.ZipFile(zip_path, 'r') as zf:
+    with zipfile.ZipFile(zip_path, "r") as zf:
         for name in zf.namelist():
             ext = os.path.splitext(name)[1].lower()
             if ext in VIDEO_EXTENSIONS:
                 # Extract to temp dir
-                extracted_path = zf.extract(name, extract_dir)
+                extracted_path = safe_extract(zf, name, extract_dir)
                 video_paths.append(extracted_path)
     return video_paths
 
 
-def randomize_params(base_params: Dict, py_rng: random.Random, variation: float = 0.3) -> Dict:
+def randomize_params(
+    base_params: Dict, py_rng: random.Random, variation: float = 0.3
+) -> Dict:
     """
     Randomize parameters within +/- variation of base values.
     Each copy gets slightly different transform intensities.
@@ -82,7 +94,7 @@ def randomize_params(base_params: Dict, py_rng: random.Random, variation: float 
 
 def get_mode_multipliers(mode: str) -> Dict[str, float]:
     """Get mode multipliers, defaulting to 'balanced' if unknown mode."""
-    return MODE_MULTIPLIERS.get(mode, MODE_MULTIPLIERS['balanced'])
+    return MODE_MULTIPLIERS.get(mode, MODE_MULTIPLIERS["balanced"])
 
 
 def apply_mode_to_config(config: Dict[str, Any]) -> Dict[str, Any]:
@@ -96,7 +108,7 @@ def apply_mode_to_config(config: Dict[str, Any]) -> Dict[str, Any]:
     Returns:
         Modified config with transform values scaled by mode multipliers
     """
-    mode = config.get('mode', 'balanced')
+    mode = config.get("mode", "balanced")
     multipliers = get_mode_multipliers(mode)
 
     print(f"[Spoofer] Applying mode '{mode}' multipliers: {multipliers}")
@@ -110,36 +122,45 @@ def apply_mode_to_config(config: Dict[str, Any]) -> Dict[str, Any]:
             result[key] = value
 
     # Apply spatial multiplier
-    spatial = result.get('spatial', {})
-    spatial_mult = multipliers['spatial']
-    for key in ['crop', 'microResize', 'rotation', 'subpixel', 'warp', 'barrel', 'blockShift', 'microRescale']:
+    spatial = result.get("spatial", {})
+    spatial_mult = multipliers["spatial"]
+    for key in [
+        "crop",
+        "microResize",
+        "rotation",
+        "subpixel",
+        "warp",
+        "barrel",
+        "blockShift",
+        "microRescale",
+    ]:
         if key in spatial and spatial[key] > 0:
             original = spatial[key]
             spatial[key] = spatial[key] * spatial_mult
             print(f"[Spoofer]   spatial.{key}: {original} -> {spatial[key]:.2f}")
-    result['spatial'] = spatial
+    result["spatial"] = spatial
 
     # Apply tonal multiplier
-    tonal = result.get('tonal', {})
-    tonal_mult = multipliers['tonal']
-    for key in ['brightness', 'gamma', 'contrast', 'saturation', 'vignette']:
+    tonal = result.get("tonal", {})
+    tonal_mult = multipliers["tonal"]
+    for key in ["brightness", "gamma", "contrast", "saturation", "vignette"]:
         if key in tonal and tonal[key] > 0:
             original = tonal[key]
             tonal[key] = tonal[key] * tonal_mult
             print(f"[Spoofer]   tonal.{key}: {original} -> {tonal[key]:.3f}")
-    result['tonal'] = tonal
+    result["tonal"] = tonal
 
     # Apply visual multiplier
-    visual = result.get('visual', {})
-    visual_mult = multipliers['visual']
-    for key in ['tint', 'chromatic', 'noise']:
+    visual = result.get("visual", {})
+    visual_mult = multipliers["visual"]
+    for key in ["tint", "chromatic", "noise"]:
         if key in visual and visual[key] > 0:
             original = visual[key]
             visual[key] = visual[key] * visual_mult
             print(f"[Spoofer]   visual.{key}: {original} -> {visual[key]:.2f}")
-    result['visual'] = visual
+    result["visual"] = visual
 
     # Store variation multiplier for randomize_params
-    result['_variation_mult'] = multipliers['variation']
+    result["_variation_mult"] = multipliers["variation"]
 
     return result

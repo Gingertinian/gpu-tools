@@ -17,6 +17,7 @@ FIXED Issues (2026-01-17):
 - Layout calculation supports asymmetric crop (was always 50/50)
 """
 
+import logging
 import os
 import subprocess
 import tempfile
@@ -28,13 +29,17 @@ import cv2
 import numpy as np
 import requests
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 from typing import Optional, Callable, Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+from fractions import Fraction
 
 # Try to import CuPy for image processing
 try:
     import cupy as cp
     from cupyx.scipy import ndimage as gpu_ndimage
+
     HAS_CUPY = True
 except ImportError:
     HAS_CUPY = False
@@ -45,18 +50,18 @@ except ImportError:
 # CONSTANTS
 # =============================================================================
 
-IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.tiff', '.tif'}
-VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v', '.wmv', '.flv'}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff", ".tif"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v", ".wmv", ".flv"}
 
 ASPECT_RATIOS = {
-    '9:16': (1080, 1920),
-    '16:9': (1920, 1080),
-    '4:5': (1080, 1350),
-    '1:1': (1080, 1080),
+    "9:16": (1080, 1920),
+    "16:9": (1920, 1080),
+    "4:5": (1080, 1350),
+    "1:1": (1080, 1080),
 }
 
 # Built-in logo names that should use local files
-BUILTIN_LOGOS = {'farmium_icon', 'farmium_full', 'none', ''}
+BUILTIN_LOGOS = {"farmium_icon", "farmium_full", "none", ""}
 
 
 def is_image_file(path: str) -> bool:
@@ -71,44 +76,62 @@ def is_video_file(path: str) -> bool:
 # LOGO MANAGEMENT
 # =============================================================================
 
-def _download_logo(logo_url: str, temp_dir: Path) -> Optional[Path]:
+
+def _download_logo(logo_url: str, temp_dir: Path, max_retries: int = 3) -> Optional[Path]:
     """
-    Download a logo from URL to temp directory.
+    Download a logo from URL to temp directory with retry logic.
     Returns path to downloaded logo or None on failure.
     """
     if not logo_url:
         return None
 
-    try:
-        print(f"[GPU-Reframe] Downloading logo from URL: {logo_url[:100]}...")
-        response = requests.get(logo_url, timeout=30, stream=True)
-        response.raise_for_status()
+    import time as _time
 
-        # Determine extension from content-type or URL
-        content_type = response.headers.get('content-type', '')
-        if 'png' in content_type or logo_url.lower().endswith('.png'):
-            ext = '.png'
-        elif 'gif' in content_type or logo_url.lower().endswith('.gif'):
-            ext = '.gif'
-        elif 'webp' in content_type or logo_url.lower().endswith('.webp'):
-            ext = '.webp'
-        else:
-            ext = '.png'  # Default to PNG
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            print(f"[GPU-Reframe] Downloading logo from URL: {logo_url[:100]}...")
+            response = requests.get(logo_url, timeout=30, stream=True)
+            response.raise_for_status()
 
-        logo_path = temp_dir / f"custom_logo{ext}"
-        with open(logo_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
+            # Determine extension from content-type or URL
+            content_type = response.headers.get("content-type", "")
+            if "png" in content_type or logo_url.lower().endswith(".png"):
+                ext = ".png"
+            elif "gif" in content_type or logo_url.lower().endswith(".gif"):
+                ext = ".gif"
+            elif "webp" in content_type or logo_url.lower().endswith(".webp"):
+                ext = ".webp"
+            else:
+                ext = ".png"  # Default to PNG
 
-        print(f"[GPU-Reframe] Logo downloaded successfully: {logo_path}")
-        return logo_path
+            logo_path = temp_dir / f"custom_logo{ext}"
+            with open(logo_path, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
 
-    except Exception as e:
-        print(f"[GPU-Reframe] Failed to download logo: {e}")
-        return None
+            print(f"[GPU-Reframe] Logo downloaded successfully: {logo_path}")
+            return logo_path
+
+        except (requests.RequestException, IOError) as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                print(f"[GPU-Reframe] Logo download attempt {attempt + 1} failed: {e}. Retrying in {wait_time}s...")
+                _time.sleep(wait_time)
+            else:
+                print(f"[GPU-Reframe] Failed to download logo after {max_retries} attempts: {e}")
+                return None
+        except Exception as e:
+            print(f"[GPU-Reframe] Failed to download logo: {e}")
+            return None
+
+    return None
 
 
-def _get_logo_path(logo_name: str, logo_url: Optional[str] = None, temp_dir: Optional[Path] = None) -> Optional[Path]:
+def _get_logo_path(
+    logo_name: str, logo_url: Optional[str] = None, temp_dir: Optional[Path] = None
+) -> Optional[Path]:
     """
     Get path to logo file.
 
@@ -118,7 +141,7 @@ def _get_logo_path(logo_name: str, logo_url: Optional[str] = None, temp_dir: Opt
     3. Return None if 'none' or not found
     """
     # No logo requested
-    if not logo_name or logo_name == 'none':
+    if not logo_name or logo_name == "none":
         print(f"[GPU-Reframe] No logo requested (logo_name={logo_name})")
         return None
 
@@ -128,7 +151,9 @@ def _get_logo_path(logo_name: str, logo_url: Optional[str] = None, temp_dir: Opt
         if downloaded:
             return downloaded
         # Fall back to builtin if download fails
-        print(f"[GPU-Reframe] Logo download failed, falling back to builtin: {logo_name}")
+        print(
+            f"[GPU-Reframe] Logo download failed, falling back to builtin: {logo_name}"
+        )
 
     # Builtin logo - look in local paths
     if logo_name in BUILTIN_LOGOS or not logo_url:
@@ -136,15 +161,15 @@ def _get_logo_path(logo_name: str, logo_url: Optional[str] = None, temp_dir: Opt
         # Check PNG first, then try other formats
         possible_paths = [
             # Direct logo path in processor directory
-            script_dir / 'logos' / f'{logo_name}.png',
-            script_dir / 'logos' / f'{logo_name}.jpg',
+            script_dir / "logos" / f"{logo_name}.png",
+            script_dir / "logos" / f"{logo_name}.jpg",
             # Parent directories
-            script_dir.parent / 'logos' / f'{logo_name}.png',
-            script_dir.parent.parent / 'logos' / f'{logo_name}.png',
+            script_dir.parent / "logos" / f"{logo_name}.png",
+            script_dir.parent.parent / "logos" / f"{logo_name}.png",
             # Workspace paths (RunPod)
-            Path('/workspace/tools/video_reframe/logos') / f'{logo_name}.png',
-            Path('/workspace/assets/logos') / f'{logo_name}.png',
-            Path('/app/logos') / f'{logo_name}.png',
+            Path("/workspace/tools/video_reframe/logos") / f"{logo_name}.png",
+            Path("/workspace/assets/logos") / f"{logo_name}.png",
+            Path("/app/logos") / f"{logo_name}.png",
         ]
 
         print(f"[GPU-Reframe] Looking for logo '{logo_name}' in paths:")
@@ -155,9 +180,11 @@ def _get_logo_path(logo_name: str, logo_url: Optional[str] = None, temp_dir: Opt
                 return path
 
         # Fallback: if logo_name is farmium_icon but not found, use farmium_full
-        if logo_name == 'farmium_icon':
-            print(f"[GPU-Reframe] farmium_icon not found, trying farmium_full as fallback")
-            return _get_logo_path('farmium_full', None, temp_dir)
+        if logo_name == "farmium_icon":
+            print(
+                f"[GPU-Reframe] farmium_icon not found, trying farmium_full as fallback"
+            )
+            return _get_logo_path("farmium_full", None, temp_dir)
 
         print(f"[GPU-Reframe] Builtin logo not found: {logo_name}")
 
@@ -168,12 +195,13 @@ def _get_logo_path(logo_name: str, logo_url: Optional[str] = None, temp_dir: Opt
 # MAIN ENTRY POINT
 # =============================================================================
 
+
 def process_video_reframe(
     input_path: str,
     output_path: str,
     config: dict,
     progress_callback: Optional[Callable] = None,
-    gpu_id: int = 0
+    gpu_id: int = 0,
 ) -> dict:
     """
     Process video or image with reframe - FULL GPU acceleration.
@@ -191,25 +219,30 @@ def process_video_reframe(
     if is_image_file(str(input_path)):
         # Ensure output has image extension
         if output_path.suffix.lower() not in IMAGE_EXTENSIONS:
-            output_path = output_path.with_suffix('.jpg')
-        return _process_image_gpu(input_path, output_path, config, progress_callback, gpu_id)
+            output_path = output_path.with_suffix(".jpg")
+        return _process_image_gpu(
+            input_path, output_path, config, progress_callback, gpu_id
+        )
     else:
         # Ensure output has video extension
         if output_path.suffix.lower() not in VIDEO_EXTENSIONS:
-            output_path = output_path.with_suffix('.mp4')
-        return _process_video_gpu(input_path, output_path, config, progress_callback, gpu_id)
+            output_path = output_path.with_suffix(".mp4")
+        return _process_video_gpu(
+            input_path, output_path, config, progress_callback, gpu_id
+        )
 
 
 # =============================================================================
 # VIDEO PROCESSING - FULL GPU FFMPEG PIPELINE
 # =============================================================================
 
+
 def _process_video_gpu(
     input_path: Path,
     output_path: Path,
     config: dict,
     progress_callback: Optional[Callable] = None,
-    gpu_id: int = 0
+    gpu_id: int = 0,
 ) -> dict:
     """
     Process video using 100% GPU FFmpeg pipeline.
@@ -224,14 +257,20 @@ def _process_video_gpu(
 
     # Get video info
     probe_cmd = [
-        'ffprobe', '-v', 'quiet',
-        '-print_format', 'json',
-        '-show_format', '-show_streams',
-        str(input_path)
+        "ffprobe",
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        str(input_path),
     ]
 
     try:
-        probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=30)
+        probe_result = subprocess.run(
+            probe_cmd, capture_output=True, text=True, timeout=30
+        )
         video_info = json.loads(probe_result.stdout)
     except Exception as e:
         raise ValueError(f"Failed to probe video: {e}")
@@ -239,53 +278,56 @@ def _process_video_gpu(
     # Extract video stream info
     video_stream = None
     has_audio = False
-    for stream in video_info.get('streams', []):
-        if stream.get('codec_type') == 'video' and video_stream is None:
+    for stream in video_info.get("streams", []):
+        if stream.get("codec_type") == "video" and video_stream is None:
             video_stream = stream
-        elif stream.get('codec_type') == 'audio':
+        elif stream.get("codec_type") == "audio":
             has_audio = True
 
     if not video_stream:
         raise ValueError("No video stream found")
 
-    orig_w = int(video_stream.get('width', 1920))
-    orig_h = int(video_stream.get('height', 1080))
-    fps = eval(video_stream.get('r_frame_rate', '30/1'))
-    duration = float(video_info.get('format', {}).get('duration', 0))
+    orig_w = int(video_stream.get("width", 1920))
+    orig_h = int(video_stream.get("height", 1080))
+    fps_str = video_stream.get("r_frame_rate", "30/1")
+    fps = float(Fraction(fps_str))  # Safe parsing instead of eval()
+    duration = float(video_info.get("format", {}).get("duration", 0))
 
-    print(f"[GPU-Reframe] Input: {orig_w}x{orig_h} @ {fps:.2f} fps, duration: {duration:.2f}s")
+    print(
+        f"[GPU-Reframe] Input: {orig_w}x{orig_h} @ {fps:.2f} fps, duration: {duration:.2f}s"
+    )
 
     # DEBUG: Print raw config received
-    print(f"[GPU-Reframe] Raw config received: {json.dumps({k: v for k, v in config.items() if not k.startswith('_')}, default=str)}")
+    print(
+        f"[GPU-Reframe] Raw config received: {json.dumps({k: v for k, v in config.items() if not k.startswith('_')}, default=str)}"
+    )
 
     # Parse config - all keys are camelCase as sent by the backend
     # CRITICAL FIX (2026-01-17): Use _get_config() helper to handle 0 values correctly
     # Python's `or` treats 0 as falsy, so `0 or 25 = 25` which is WRONG
-    aspect_str = _parse_aspect_ratio(
-        _get_config(config, 'aspectRatio', '9:16')
-    )
+    aspect_str = _parse_aspect_ratio(_get_config(config, "aspectRatio", "9:16"))
     final_w, final_h = ASPECT_RATIOS.get(aspect_str, (1080, 1920))
 
     # Logo config - FIXED: Use logoUrl and position from config
-    logo_name = _get_config(config, 'logoName', 'farmium_full')
-    logo_url = _get_config(config, 'logoUrl', None)
-    logo_size = _get_config(config, 'logoSize', 15)
+    logo_name = _get_config(config, "logoName", "farmium_full")
+    logo_url = _get_config(config, "logoUrl", None)
+    logo_size = _get_config(config, "logoSize", 15)
     # FIXED: Use individual position values from config (0-1 range)
-    logo_pos_x = _get_config(config, 'logoPositionX', 0.5)
-    logo_pos_y = _get_config(config, 'logoPositionY', 0.85)
+    logo_pos_x = _get_config(config, "logoPositionX", 0.5)
+    logo_pos_y = _get_config(config, "logoPositionY", 0.85)
 
-    blur_intensity = _get_config(config, 'blurIntensity', 25)
+    blur_intensity = _get_config(config, "blurIntensity", 25)
     # FIXED: Use _get_config to support both camelCase and snake_case
-    brightness_adj = _get_config(config, 'brightness', 0)
-    saturation_adj = _get_config(config, 'saturation', 0)
-    contrast_adj = _get_config(config, 'contrast', 0)
+    brightness_adj = _get_config(config, "brightness", 0)
+    saturation_adj = _get_config(config, "saturation", 0)
+    contrast_adj = _get_config(config, "contrast", 0)
 
     # FIXED: Blur zones - use independent top/bottom percentages
     # Backend sends topBlurPercent/bottomBlurPercent with values including 0
-    top_blur_pct = _get_config(config, 'topBlurPercent', 0)
-    bottom_blur_pct = _get_config(config, 'bottomBlurPercent', 0)
+    top_blur_pct = _get_config(config, "topBlurPercent", 0)
+    bottom_blur_pct = _get_config(config, "bottomBlurPercent", 0)
     # Force blur can still be used as combined fallback
-    force_blur = _get_config(config, 'forceBlur', 0)
+    force_blur = _get_config(config, "forceBlur", 0)
 
     # If force_blur is set but individual aren't, split it
     if force_blur > 0 and top_blur_pct == 0 and bottom_blur_pct == 0:
@@ -293,28 +335,54 @@ def _process_video_gpu(
         bottom_blur_pct = force_blur / 2
 
     # Additional effects from frontend
-    randomize_effects = config.get('randomize_effects', config.get('randomizeEffects', False))
-    tilt_range = config.get('tilt_range') or config.get('tiltRange', 5)
-    color_shift_range = config.get('color_shift_range') or config.get('colorShiftRange', 0)
+    randomize_effects = config.get(
+        "randomize_effects", config.get("randomizeEffects", False)
+    )
+    tilt_range = config.get("tilt_range") or config.get("tiltRange", 5)
+    color_shift_range = config.get("color_shift_range") or config.get(
+        "colorShiftRange", 0
+    )
 
     # Calculate layout with asymmetric blur support
-    layout = _calculate_layout(orig_w, orig_h, final_w, final_h, top_blur_pct, bottom_blur_pct)
+    layout = _calculate_layout(
+        orig_w, orig_h, final_w, final_h, top_blur_pct, bottom_blur_pct
+    )
 
-    print(f"[GPU-Reframe] Output: {final_w}x{final_h}, content={layout['scaled_w']}x{layout['scaled_h']}")
-    print(f"[GPU-Reframe] Blur config: top_blur_pct={top_blur_pct}%, bottom_blur_pct={bottom_blur_pct}%, intensity={blur_intensity}")
-    print(f"[GPU-Reframe] Blur zones (calculated): top={layout['blur_top']}px, bottom={layout['blur_bottom']}px")
+    print(
+        f"[GPU-Reframe] Output: {final_w}x{final_h}, content={layout['scaled_w']}x{layout['scaled_h']}"
+    )
+    print(
+        f"[GPU-Reframe] Blur config: top_blur_pct={top_blur_pct}%, bottom_blur_pct={bottom_blur_pct}%, intensity={blur_intensity}"
+    )
+    print(
+        f"[GPU-Reframe] Blur zones (calculated): top={layout['blur_top']}px, bottom={layout['blur_bottom']}px"
+    )
     # DEBUG: Log all logo-related config keys to diagnose position/size issues
-    logo_keys = ['logo_name', 'logoName', 'logo_size', 'logoSize', 'logo_position_x', 'logoPositionX',
-                 'logo_position_y', 'logoPositionY', 'logo_position', 'logoPosition', 'logo_url', 'logoUrl']
+    logo_keys = [
+        "logo_name",
+        "logoName",
+        "logo_size",
+        "logoSize",
+        "logo_position_x",
+        "logoPositionX",
+        "logo_position_y",
+        "logoPositionY",
+        "logo_position",
+        "logoPosition",
+        "logo_url",
+        "logoUrl",
+    ]
     logo_config_debug = {k: config.get(k) for k in logo_keys if k in config}
     print(f"[GPU-Reframe] DEBUG logo config keys in config: {logo_config_debug}")
-    print(f"[GPU-Reframe] Logo FINAL VALUES: name='{logo_name}', size={logo_size}%, pos=({logo_pos_x}, {logo_pos_y})")
+    print(
+        f"[GPU-Reframe] Logo FINAL VALUES: name='{logo_name}', size={logo_size}%, pos=({logo_pos_x}, {logo_pos_y})"
+    )
 
     if progress_callback:
         progress_callback(0.10, "Building GPU pipeline...")
 
     # Create temp dir for logo download if needed
-    temp_dir = Path(tempfile.mkdtemp(prefix='reframe_'))
+    temp_dir = Path(tempfile.mkdtemp(prefix="reframe_"))
 
     try:
         # Get logo path (download if URL provided)
@@ -322,73 +390,109 @@ def _process_video_gpu(
 
         # Build FFmpeg filter complex for 100% GPU processing
         filter_complex = _build_gpu_filter_complex(
-            orig_w, orig_h, final_w, final_h, layout,
-            blur_intensity, brightness_adj, saturation_adj, contrast_adj,
-            logo_path, logo_size, logo_pos_x, logo_pos_y, gpu_id
+            orig_w,
+            orig_h,
+            final_w,
+            final_h,
+            layout,
+            blur_intensity,
+            brightness_adj,
+            saturation_adj,
+            contrast_adj,
+            logo_path,
+            logo_size,
+            logo_pos_x,
+            logo_pos_y,
+            gpu_id,
         )
 
         # Build FFmpeg command helper
         def _build_ffmpeg_cmd(use_nvenc: bool, use_hw_decode: bool = False) -> list:
             """Build FFmpeg command with maximum GPU utilization."""
-            cmd = ['ffmpeg', '-y']
+            cmd = ["ffmpeg", "-y"]
 
             if use_hw_decode:
-                cmd.extend([
-                    '-hwaccel', 'cuda',
-                    '-hwaccel_device', str(gpu_id),
-                ])
+                cmd.extend(
+                    [
+                        "-hwaccel",
+                        "cuda",
+                        "-hwaccel_device",
+                        str(gpu_id),
+                    ]
+                )
 
-            cmd.extend(['-threads', '0'])
-            cmd.extend(['-i', str(input_path)])
+            cmd.extend(["-threads", "0"])
+            cmd.extend(["-i", str(input_path)])
 
             # Add logo input if needed
             if logo_path and logo_path.exists():
-                cmd.extend(['-i', str(logo_path)])
+                cmd.extend(["-i", str(logo_path)])
 
             # Add filter complex
-            cmd.extend(['-filter_complex', filter_complex])
+            cmd.extend(["-filter_complex", filter_complex])
 
             # Map video output
-            cmd.extend(['-map', '[out]'])
+            cmd.extend(["-map", "[out]"])
 
             if use_nvenc:
-                cmd.extend([
-                    '-c:v', 'h264_nvenc',
-                    '-gpu', str(gpu_id),
-                    '-preset', 'p1',
-                    '-tune', 'll',
-                    '-rc', 'vbr',
-                    '-cq', '26',
-                    '-b:v', '8000k',
-                    '-maxrate', '16000k',
-                    '-bufsize', '16000k',
-                    '-rc-lookahead', '0',
-                    '-bf', '0',
-                    '-spatial-aq', '0',
-                    '-temporal-aq', '0',
-                    '-profile:v', 'high',
-                    '-level', '4.1',
-                ])
+                cmd.extend(
+                    [
+                        "-c:v",
+                        "h264_nvenc",
+                        "-gpu",
+                        str(gpu_id),
+                        "-preset",
+                        "p1",
+                        "-tune",
+                        "ll",
+                        "-rc",
+                        "vbr",
+                        "-cq",
+                        "26",
+                        "-b:v",
+                        "8000k",
+                        "-maxrate",
+                        "16000k",
+                        "-bufsize",
+                        "16000k",
+                        "-rc-lookahead",
+                        "0",
+                        "-bf",
+                        "0",
+                        "-spatial-aq",
+                        "0",
+                        "-temporal-aq",
+                        "0",
+                        "-profile:v",
+                        "high",
+                        "-level",
+                        "4.1",
+                    ]
+                )
             else:
-                cmd.extend([
-                    '-c:v', 'libx264',
-                    '-preset', 'ultrafast',
-                    '-crf', '23',
-                    '-profile:v', 'high',
-                    '-level', '4.1',
-                ])
+                cmd.extend(
+                    [
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "ultrafast",
+                        "-crf",
+                        "23",
+                        "-profile:v",
+                        "high",
+                        "-level",
+                        "4.1",
+                    ]
+                )
 
-            cmd.extend(['-pix_fmt', 'yuv420p'])
+            cmd.extend(["-pix_fmt", "yuv420p"])
 
             if has_audio:
-                cmd.extend(['-map', '0:a?', '-c:a', 'copy'])
+                cmd.extend(["-map", "0:a?", "-c:a", "copy"])
             else:
-                cmd.append('-an')
+                cmd.append("-an")
 
-            cmd.extend([
-                '-movflags', '+faststart',
-                str(output_path)
-            ])
+            cmd.extend(["-movflags", "+faststart", str(output_path)])
 
             return cmd
 
@@ -402,29 +506,38 @@ def _process_video_gpu(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    universal_newlines=True
+                    universal_newlines=True,
                 )
 
                 stderr_lines = []
 
                 for line in process.stderr:
                     stderr_lines.append(line)
-                    if 'time=' in line:
+                    if "time=" in line:
                         try:
-                            time_str = line.split('time=')[1].split()[0]
-                            parts = time_str.split(':')
-                            current_time = float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+                            time_str = line.split("time=")[1].split()[0]
+                            parts = time_str.split(":")
+                            current_time = (
+                                float(parts[0]) * 3600
+                                + float(parts[1]) * 60
+                                + float(parts[2])
+                            )
                             if duration > 0 and progress_callback:
                                 progress = 0.15 + (current_time / duration) * 0.80
-                                progress_callback(min(progress, 0.95), f"Encoding ({encoder_name}): {current_time:.1f}s / {duration:.1f}s")
-                        except:
+                                progress_callback(
+                                    min(progress, 0.95),
+                                    f"Encoding ({encoder_name}): {current_time:.1f}s / {duration:.1f}s",
+                                )
+                        except (ValueError, IndexError):
                             pass
 
                 process.wait()
-                stderr_output = ''.join(stderr_lines[-30:])
+                stderr_output = "".join(stderr_lines[-30:])
 
                 if process.returncode != 0:
-                    print(f"[GPU-Reframe] {encoder_name} failed with code {process.returncode}")
+                    print(
+                        f"[GPU-Reframe] {encoder_name} failed with code {process.returncode}"
+                    )
                     print(f"[GPU-Reframe] stderr:\n{stderr_output}")
                     return False, stderr_output
 
@@ -456,7 +569,9 @@ def _process_video_gpu(
             success, stderr = _run_ffmpeg_with_progress(cmd_cpu, "libx264")
 
             if not success:
-                raise RuntimeError(f"FFmpeg failed with all encoders. Last error: {stderr}")
+                raise RuntimeError(
+                    f"FFmpeg failed with all encoders. Last error: {stderr}"
+                )
 
         if progress_callback:
             progress_callback(1.0, "Complete")
@@ -473,20 +588,22 @@ def _process_video_gpu(
             "processor": "GPU" if encoder_used == "NVENC" else "CPU",
             "pipeline": f"FFmpeg-{encoder_used}",
             "fps": fps,
-            "duration": duration
+            "duration": duration,
         }
 
     finally:
         # Cleanup temp directory
         try:
             shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
-            pass
+        except (IOError, OSError) as e:
+            logger.debug(f"Failed to clean up temp dir {temp_dir}: {e}")
 
 
 def _build_gpu_filter_complex(
-    orig_w: int, orig_h: int,
-    final_w: int, final_h: int,
+    orig_w: int,
+    orig_h: int,
+    final_w: int,
+    final_h: int,
     layout: dict,
     blur_intensity: int,
     brightness_adj: int,
@@ -496,7 +613,7 @@ def _build_gpu_filter_complex(
     logo_size: int,
     logo_pos_x: float,
     logo_pos_y: float,
-    gpu_id: int
+    gpu_id: int,
 ) -> str:
     """
     Build FFmpeg filter_complex for GPU-accelerated processing.
@@ -506,15 +623,15 @@ def _build_gpu_filter_complex(
     - Each blur zone has its own random zoom, rotation, and crop offset
     - This creates visual variety between top and bottom blur areas
     """
-    scaled_w = layout['scaled_w']
-    scaled_h = layout['scaled_h']
-    content_x = layout['content_x']
-    content_y = layout['content_y']
-    blur_top_h = layout['blur_top']
-    blur_bottom_h = layout['blur_bottom']
-    crop_top_px = layout.get('crop_top_px', 0)
-    crop_bottom_px = layout.get('crop_bottom_px', 0)
-    cropped_orig_h = layout.get('cropped_orig_h', orig_h)
+    scaled_w = layout["scaled_w"]
+    scaled_h = layout["scaled_h"]
+    content_x = layout["content_x"]
+    content_y = layout["content_y"]
+    blur_top_h = layout["blur_top"]
+    blur_bottom_h = layout["blur_bottom"]
+    crop_top_px = layout.get("crop_top_px", 0)
+    crop_bottom_px = layout.get("crop_bottom_px", 0)
+    cropped_orig_h = layout.get("cropped_orig_h", orig_h)
 
     # Blur sigma based on intensity (0-100 -> 8-20)
     blur_sigma = 8 + (blur_intensity / 100) * 12
@@ -527,20 +644,24 @@ def _build_gpu_filter_complex(
     # Build color adjustment string
     eq_parts = []
     if brightness_adj != 0:
-        eq_parts.append(f"brightness={brightness_adj/100:.3f}")
+        eq_parts.append(f"brightness={brightness_adj / 100:.3f}")
     if contrast_adj != 0:
-        eq_parts.append(f"contrast={1 + contrast_adj/100:.3f}")
+        eq_parts.append(f"contrast={1 + contrast_adj / 100:.3f}")
     if saturation_adj != 0:
-        eq_parts.append(f"saturation={1 + saturation_adj/100:.3f}")
+        eq_parts.append(f"saturation={1 + saturation_adj / 100:.3f}")
     eq_filter = f",eq={':'.join(eq_parts)}" if eq_parts else ""
 
     parts = []
 
     # If we need blur zones (horizontal video -> vertical output)
     if blur_top_h > 0 or blur_bottom_h > 0:
-        print(f"[GPU-Reframe] Blur zones: top={blur_top_h}px, bottom={blur_bottom_h}px, content={scaled_h}px")
+        print(
+            f"[GPU-Reframe] Blur zones: top={blur_top_h}px, bottom={blur_bottom_h}px, content={scaled_h}px"
+        )
         print(f"[GPU-Reframe] Content position: y={content_y}px")
-        print(f"[GPU-Reframe] Crop: top={crop_top_px}px, bottom={crop_bottom_px}px, remaining={cropped_orig_h}px")
+        print(
+            f"[GPU-Reframe] Crop: top={crop_top_px}px, bottom={crop_bottom_px}px, remaining={cropped_orig_h}px"
+        )
 
         # OPTIMIZED BLUR PIPELINE - 4x faster
         # Calculate low-res dimensions (1/4 size, ensure even)
@@ -549,7 +670,9 @@ def _build_gpu_filter_complex(
         # Reduce blur radius proportionally (since image is smaller)
         scaled_blur_radius = max(3, blur_radius // 4)
 
-        print(f"[GPU-Reframe] FAST blur: {blur_scale_w}x{blur_scale_h} (1/4 res), radius={scaled_blur_radius}")
+        print(
+            f"[GPU-Reframe] FAST blur: {blur_scale_w}x{blur_scale_h} (1/4 res), radius={scaled_blur_radius}"
+        )
 
         # FIXED (2026-01-18): Blur must use CROPPED content, not original video
         # The blur background should NOT show the parts that were cropped/removed
@@ -566,11 +689,15 @@ def _build_gpu_filter_complex(
         zoomed_blur_w = int(blur_scale_w * rotation_zoom)
         zoomed_blur_h = int(blur_scale_h * rotation_zoom)
 
-        print(f"[GPU-Reframe] Blur rotation: {blur_rotation:.1f}° (zoom: {rotation_zoom:.2f}x)")
+        print(
+            f"[GPU-Reframe] Blur rotation: {blur_rotation:.1f}° (zoom: {rotation_zoom:.2f}x)"
+        )
 
         if crop_top_px > 0 or crop_bottom_px > 0:
             # Step 1: Crop the video FIRST to remove top/bottom
-            parts.append(f"[0:v]crop={orig_w}:{cropped_orig_h}:0:{crop_top_px}[cropped]")
+            parts.append(
+                f"[0:v]crop={orig_w}:{cropped_orig_h}:0:{crop_top_px}[cropped]"
+            )
 
             # Step 2: Split cropped video - one for blur background, one for content
             parts.append(f"[cropped]split=2[for_blur][for_content]")
@@ -586,7 +713,9 @@ def _build_gpu_filter_complex(
             )
 
             # Step 4: Scale content to fit in content area
-            parts.append(f"[for_content]scale={scaled_w}:{scaled_h}:flags=fast_bilinear{eq_filter}[content]")
+            parts.append(
+                f"[for_content]scale={scaled_w}:{scaled_h}:flags=fast_bilinear{eq_filter}[content]"
+            )
         else:
             # No crop needed - split original and use for both blur and content
             parts.append(f"[0:v]split=2[for_blur][for_content]")
@@ -599,7 +728,9 @@ def _build_gpu_filter_complex(
                 f"scale={final_w}:{final_h}:flags=fast_bilinear[blur_bg]"
             )
 
-            parts.append(f"[for_content]scale={scaled_w}:{scaled_h}:flags=fast_bilinear{eq_filter}[content]")
+            parts.append(
+                f"[for_content]scale={scaled_w}:{scaled_h}:flags=fast_bilinear{eq_filter}[content]"
+            )
 
         # Composite: overlay content on blur background
         parts.append(f"[blur_bg][content]overlay={content_x}:{content_y}[composited]")
@@ -629,11 +760,11 @@ def _build_gpu_filter_complex(
         logo_x = max(10, min(logo_x, final_w - logo_w - 10))
         logo_y = max(10, min(logo_y, final_h - logo_h - 10))
 
-        print(f"[GPU-Reframe] Logo overlay: pos=({logo_x}, {logo_y}), width={logo_w}, normalized=({logo_pos_x}, {logo_pos_y}), path={logo_path}")
-
-        parts.append(
-            f"[1:v]scale={logo_w}:-1:flags=lanczos,format=yuva420p[logo]"
+        print(
+            f"[GPU-Reframe] Logo overlay: pos=({logo_x}, {logo_y}), width={logo_w}, normalized=({logo_pos_x}, {logo_pos_y}), path={logo_path}"
         )
+
+        parts.append(f"[1:v]scale={logo_w}:-1:flags=lanczos,format=yuva420p[logo]")
         # Use eof_action=repeat to loop logo (static image) for entire video duration
         # CRITICAL: setsar=1 forces square pixels - without this, video displays as wrong aspect ratio
         parts.append(
@@ -644,19 +775,20 @@ def _build_gpu_filter_complex(
         # CRITICAL: setsar=1 forces square pixels - without this, video displays as wrong aspect ratio
         parts.append(f"{current_output}setsar=1[out]")
 
-    return ';'.join(parts)
+    return ";".join(parts)
 
 
 # =============================================================================
 # IMAGE PROCESSING - CUPY GPU ACCELERATION
 # =============================================================================
 
+
 def _process_image_gpu(
     input_path: Path,
     output_path: Path,
     config: dict,
     progress_callback: Optional[Callable] = None,
-    gpu_id: int = 0
+    gpu_id: int = 0,
 ) -> dict:
     """
     Process image using CuPy GPU acceleration.
@@ -676,47 +808,57 @@ def _process_image_gpu(
     orig_h, orig_w = img.shape[:2]
 
     # DEBUG: Print raw config received
-    print(f"[GPU-Reframe] Raw config received: {json.dumps({k: v for k, v in config.items() if not k.startswith('_')}, default=str)}")
+    print(
+        f"[GPU-Reframe] Raw config received: {json.dumps({k: v for k, v in config.items() if not k.startswith('_')}, default=str)}"
+    )
 
     # Parse config - FIXED: Use _get_config() helper to handle 0 values correctly
-    aspect_str = _parse_aspect_ratio(_get_config(config, 'aspectRatio', '9:16'))
+    aspect_str = _parse_aspect_ratio(_get_config(config, "aspectRatio", "9:16"))
     final_w, final_h = ASPECT_RATIOS.get(aspect_str, (1080, 1920))
 
     # Logo config - FIXED: Use _get_config() to handle 0 values correctly
-    logo_name = _get_config(config, 'logoName', 'farmium_full')
-    logo_url = _get_config(config, 'logoUrl', None)
-    logo_size = _get_config(config, 'logoSize', 15)
-    logo_pos_x = _get_config(config, 'logoPositionX', 0.5)
-    logo_pos_y = _get_config(config, 'logoPositionY', 0.85)
+    logo_name = _get_config(config, "logoName", "farmium_full")
+    logo_url = _get_config(config, "logoUrl", None)
+    logo_size = _get_config(config, "logoSize", 15)
+    logo_pos_x = _get_config(config, "logoPositionX", 0.5)
+    logo_pos_y = _get_config(config, "logoPositionY", 0.85)
 
-    blur_intensity = _get_config(config, 'blurIntensity', 25)
+    blur_intensity = _get_config(config, "blurIntensity", 25)
     # FIXED: Use _get_config to support both camelCase and snake_case
-    brightness_adj = _get_config(config, 'brightness', 0)
-    saturation_adj = _get_config(config, 'saturation', 0)
-    contrast_adj = _get_config(config, 'contrast', 0)
+    brightness_adj = _get_config(config, "brightness", 0)
+    saturation_adj = _get_config(config, "saturation", 0)
+    contrast_adj = _get_config(config, "contrast", 0)
 
     # FIXED: Independent blur percentages - handle 0 correctly
-    top_blur_pct = _get_config(config, 'topBlurPercent', 0)
-    bottom_blur_pct = _get_config(config, 'bottomBlurPercent', 0)
-    force_blur = _get_config(config, 'forceBlur', 0)
+    top_blur_pct = _get_config(config, "topBlurPercent", 0)
+    bottom_blur_pct = _get_config(config, "bottomBlurPercent", 0)
+    force_blur = _get_config(config, "forceBlur", 0)
 
     if force_blur > 0 and top_blur_pct == 0 and bottom_blur_pct == 0:
         top_blur_pct = force_blur / 2
         bottom_blur_pct = force_blur / 2
 
     # Calculate layout with asymmetric blur
-    layout = _calculate_layout(orig_w, orig_h, final_w, final_h, top_blur_pct, bottom_blur_pct)
+    layout = _calculate_layout(
+        orig_w, orig_h, final_w, final_h, top_blur_pct, bottom_blur_pct
+    )
 
     print(f"[GPU-Reframe] Image: {orig_w}x{orig_h} -> {final_w}x{final_h}")
-    print(f"[GPU-Reframe] Blur config: top_blur_pct={top_blur_pct}%, bottom_blur_pct={bottom_blur_pct}%, intensity={blur_intensity}")
-    print(f"[GPU-Reframe] Blur zones (calculated): top={layout['blur_top']}px, bottom={layout['blur_bottom']}px")
-    print(f"[GPU-Reframe] Logo: name='{logo_name}', size={logo_size}%, pos=({logo_pos_x}, {logo_pos_y})")
+    print(
+        f"[GPU-Reframe] Blur config: top_blur_pct={top_blur_pct}%, bottom_blur_pct={bottom_blur_pct}%, intensity={blur_intensity}"
+    )
+    print(
+        f"[GPU-Reframe] Blur zones (calculated): top={layout['blur_top']}px, bottom={layout['blur_bottom']}px"
+    )
+    print(
+        f"[GPU-Reframe] Logo: name='{logo_name}', size={logo_size}%, pos=({logo_pos_x}, {logo_pos_y})"
+    )
 
     if progress_callback:
         progress_callback(0.20, "Processing on GPU...")
 
     # Create temp dir for logo
-    temp_dir = Path(tempfile.mkdtemp(prefix='reframe_img_'))
+    temp_dir = Path(tempfile.mkdtemp(prefix="reframe_img_"))
 
     try:
         use_gpu = False
@@ -734,31 +876,45 @@ def _process_image_gpu(
         if use_gpu:
             with cp.cuda.Device(gpu_id):
                 output = _process_image_cupy(
-                    img, layout, final_w, final_h,
-                    blur_intensity, brightness_adj, saturation_adj, contrast_adj
+                    img,
+                    layout,
+                    final_w,
+                    final_h,
+                    blur_intensity,
+                    brightness_adj,
+                    saturation_adj,
+                    contrast_adj,
                 )
         else:
             output = _process_image_cpu(
-                img, layout, final_w, final_h,
-                blur_intensity, brightness_adj, saturation_adj, contrast_adj
+                img,
+                layout,
+                final_w,
+                final_h,
+                blur_intensity,
+                brightness_adj,
+                saturation_adj,
+                contrast_adj,
             )
 
         # Apply logo - FIXED: Use position from config
         logo_path = _get_logo_path(logo_name, logo_url, temp_dir)
         if logo_path and logo_path.exists():
-            _apply_logo_to_image(output, logo_path, final_w, final_h, logo_size, logo_pos_x, logo_pos_y)
+            _apply_logo_to_image(
+                output, logo_path, final_w, final_h, logo_size, logo_pos_x, logo_pos_y
+            )
 
         if progress_callback:
             progress_callback(0.90, "Saving output...")
 
         ext = output_path.suffix.lower()
-        if ext in ['.jpg', '.jpeg']:
-            quality = config.get('quality', 92)
+        if ext in [".jpg", ".jpeg"]:
+            quality = config.get("quality", 92)
             cv2.imwrite(str(output_path), output, [cv2.IMWRITE_JPEG_QUALITY, quality])
-        elif ext == '.png':
+        elif ext == ".png":
             cv2.imwrite(str(output_path), output, [cv2.IMWRITE_PNG_COMPRESSION, 6])
-        elif ext == '.webp':
-            quality = config.get('quality', 92)
+        elif ext == ".webp":
+            quality = config.get("quality", 92)
             cv2.imwrite(str(output_path), output, [cv2.IMWRITE_WEBP_QUALITY, quality])
         else:
             cv2.imwrite(str(output_path), output)
@@ -774,20 +930,21 @@ def _process_image_gpu(
             "outputPath": str(output_path),
             "outputSize": output_size,
             "dimensions": f"{final_w}x{final_h}",
-            "processor": "GPU" if HAS_CUPY else "CPU"
+            "processor": "GPU" if HAS_CUPY else "CPU",
         }
 
     finally:
         try:
             shutil.rmtree(temp_dir, ignore_errors=True)
-        except:
-            pass
+        except (IOError, OSError) as e:
+            logger.debug(f"Failed to clean up temp dir {temp_dir}: {e}")
 
 
 def _process_image_cupy(
     img: np.ndarray,
     layout: dict,
-    final_w: int, final_h: int,
+    final_w: int,
+    final_h: int,
     blur_intensity: int,
     brightness_adj: int,
     saturation_adj: int,
@@ -798,12 +955,12 @@ def _process_image_cupy(
 
     FIXED (2026-01-17 v2): Top and bottom blur zones use DIFFERENT random sections.
     """
-    scaled_w = layout['scaled_w']
-    scaled_h = layout['scaled_h']
-    content_x = layout['content_x']
-    content_y = layout['content_y']
-    blur_top_h = layout['blur_top']
-    blur_bottom_h = layout['blur_bottom']
+    scaled_w = layout["scaled_w"]
+    scaled_h = layout["scaled_h"]
+    content_x = layout["content_x"]
+    content_y = layout["content_y"]
+    blur_top_h = layout["blur_top"]
+    blur_bottom_h = layout["blur_bottom"]
 
     gpu_img = cp.asarray(img, dtype=cp.float32)
 
@@ -845,18 +1002,39 @@ def _process_image_cupy(
             top_zoomed = gpu_ndimage.zoom(content, top_bg_zoom, order=1)
 
             if abs(top_rotation) > 0.5:
-                top_zoomed = gpu_ndimage.rotate(top_zoomed, top_rotation, axes=(1, 0), reshape=False, mode='reflect')
+                top_zoomed = gpu_ndimage.rotate(
+                    top_zoomed, top_rotation, axes=(1, 0), reshape=False, mode="reflect"
+                )
 
-            top_crop_x = max(0, min((top_zoomed.shape[1] - final_w) // 2 + top_offset_x, max(0, top_zoomed.shape[1] - final_w)))
-            top_crop_y = max(0, min((top_zoomed.shape[0] - blur_top_h) // 2 + top_offset_y, max(0, top_zoomed.shape[0] - blur_top_h)))
-            top_blur_region = top_zoomed[top_crop_y:top_crop_y + blur_top_h, top_crop_x:top_crop_x + final_w]
+            top_crop_x = max(
+                0,
+                min(
+                    (top_zoomed.shape[1] - final_w) // 2 + top_offset_x,
+                    max(0, top_zoomed.shape[1] - final_w),
+                ),
+            )
+            top_crop_y = max(
+                0,
+                min(
+                    (top_zoomed.shape[0] - blur_top_h) // 2 + top_offset_y,
+                    max(0, top_zoomed.shape[0] - blur_top_h),
+                ),
+            )
+            top_blur_region = top_zoomed[
+                top_crop_y : top_crop_y + blur_top_h, top_crop_x : top_crop_x + final_w
+            ]
 
             # Apply blur
             for c in range(3):
-                top_blur_region[:, :, c] = gpu_ndimage.gaussian_filter(top_blur_region[:, :, c], sigma=blur_sigma)
+                top_blur_region[:, :, c] = gpu_ndimage.gaussian_filter(
+                    top_blur_region[:, :, c], sigma=blur_sigma
+                )
 
             # Ensure correct size
-            if top_blur_region.shape[0] >= blur_top_h and top_blur_region.shape[1] >= final_w:
+            if (
+                top_blur_region.shape[0] >= blur_top_h
+                and top_blur_region.shape[1] >= final_w
+            ):
                 output[0:blur_top_h, 0:final_w] = top_blur_region[:blur_top_h, :final_w]
 
         if blur_bottom_h > 0:
@@ -865,27 +1043,60 @@ def _process_image_cupy(
             bottom_offset_x = random.randint(-50, 50)
             bottom_offset_y = random.randint(-150, 0)  # Use lower part of content
 
-            bottom_scale = max(final_w / content_w, blur_bottom_h / content_h) * bottom_zoom
+            bottom_scale = (
+                max(final_w / content_w, blur_bottom_h / content_h) * bottom_zoom
+            )
             bottom_bg_zoom = (bottom_scale, bottom_scale, 1)
             bottom_zoomed = gpu_ndimage.zoom(content, bottom_bg_zoom, order=1)
 
             if abs(bottom_rotation) > 0.5:
-                bottom_zoomed = gpu_ndimage.rotate(bottom_zoomed, bottom_rotation, axes=(1, 0), reshape=False, mode='reflect')
+                bottom_zoomed = gpu_ndimage.rotate(
+                    bottom_zoomed,
+                    bottom_rotation,
+                    axes=(1, 0),
+                    reshape=False,
+                    mode="reflect",
+                )
 
-            bottom_crop_x = max(0, min((bottom_zoomed.shape[1] - final_w) // 2 + bottom_offset_x, max(0, bottom_zoomed.shape[1] - final_w)))
-            bottom_crop_y = max(0, min((bottom_zoomed.shape[0] - blur_bottom_h) // 2 + abs(bottom_offset_y), max(0, bottom_zoomed.shape[0] - blur_bottom_h)))
-            bottom_blur_region = bottom_zoomed[bottom_crop_y:bottom_crop_y + blur_bottom_h, bottom_crop_x:bottom_crop_x + final_w]
+            bottom_crop_x = max(
+                0,
+                min(
+                    (bottom_zoomed.shape[1] - final_w) // 2 + bottom_offset_x,
+                    max(0, bottom_zoomed.shape[1] - final_w),
+                ),
+            )
+            bottom_crop_y = max(
+                0,
+                min(
+                    (bottom_zoomed.shape[0] - blur_bottom_h) // 2
+                    + abs(bottom_offset_y),
+                    max(0, bottom_zoomed.shape[0] - blur_bottom_h),
+                ),
+            )
+            bottom_blur_region = bottom_zoomed[
+                bottom_crop_y : bottom_crop_y + blur_bottom_h,
+                bottom_crop_x : bottom_crop_x + final_w,
+            ]
 
             # Apply blur
             for c in range(3):
-                bottom_blur_region[:, :, c] = gpu_ndimage.gaussian_filter(bottom_blur_region[:, :, c], sigma=blur_sigma)
+                bottom_blur_region[:, :, c] = gpu_ndimage.gaussian_filter(
+                    bottom_blur_region[:, :, c], sigma=blur_sigma
+                )
 
             # Ensure correct size
-            if bottom_blur_region.shape[0] >= blur_bottom_h and bottom_blur_region.shape[1] >= final_w:
-                output[final_h - blur_bottom_h:final_h, 0:final_w] = bottom_blur_region[:blur_bottom_h, :final_w]
+            if (
+                bottom_blur_region.shape[0] >= blur_bottom_h
+                and bottom_blur_region.shape[1] >= final_w
+            ):
+                output[final_h - blur_bottom_h : final_h, 0:final_w] = (
+                    bottom_blur_region[:blur_bottom_h, :final_w]
+                )
 
     # Place content in the middle
-    output[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content[:scaled_h, :scaled_w]
+    output[content_y : content_y + scaled_h, content_x : content_x + scaled_w] = (
+        content[:scaled_h, :scaled_w]
+    )
     output_cpu = cp.asnumpy(output).astype(np.uint8)
 
     return output_cpu
@@ -894,7 +1105,8 @@ def _process_image_cupy(
 def _process_image_cpu(
     img: np.ndarray,
     layout: dict,
-    final_w: int, final_h: int,
+    final_w: int,
+    final_h: int,
     blur_intensity: int,
     brightness_adj: int,
     saturation_adj: int,
@@ -905,12 +1117,12 @@ def _process_image_cpu(
 
     FIXED (2026-01-17 v2): Top and bottom blur zones use DIFFERENT random sections.
     """
-    scaled_w = layout['scaled_w']
-    scaled_h = layout['scaled_h']
-    content_x = layout['content_x']
-    content_y = layout['content_y']
-    blur_top_h = layout['blur_top']
-    blur_bottom_h = layout['blur_bottom']
+    scaled_w = layout["scaled_w"]
+    scaled_h = layout["scaled_h"]
+    content_x = layout["content_x"]
+    content_y = layout["content_y"]
+    blur_top_h = layout["blur_top"]
+    blur_bottom_h = layout["blur_bottom"]
 
     content = cv2.resize(img, (scaled_w, scaled_h), interpolation=cv2.INTER_LANCZOS4)
     content = content.astype(np.float32)
@@ -949,22 +1161,48 @@ def _process_image_cpu(
             top_scale = max(final_w / content_w, blur_top_h / content_h) * top_zoom
             top_new_w = int(content_w * top_scale)
             top_new_h = int(content_h * top_scale)
-            top_resized = cv2.resize(content, (top_new_w, top_new_h), interpolation=cv2.INTER_LINEAR)
+            top_resized = cv2.resize(
+                content, (top_new_w, top_new_h), interpolation=cv2.INTER_LINEAR
+            )
 
             if abs(top_rotation) > 0.5:
                 center = (top_new_w // 2, top_new_h // 2)
                 rot_matrix = cv2.getRotationMatrix2D(center, top_rotation, 1.0)
-                top_resized = cv2.warpAffine(top_resized, rot_matrix, (top_new_w, top_new_h), borderMode=cv2.BORDER_REFLECT)
+                top_resized = cv2.warpAffine(
+                    top_resized,
+                    rot_matrix,
+                    (top_new_w, top_new_h),
+                    borderMode=cv2.BORDER_REFLECT,
+                )
 
-            top_crop_x = max(0, min((top_new_w - final_w) // 2 + top_offset_x, max(0, top_new_w - final_w)))
-            top_crop_y = max(0, min((top_new_h - blur_top_h) // 2 + top_offset_y, max(0, top_new_h - blur_top_h)))
-            top_blur_region = top_resized[top_crop_y:top_crop_y + blur_top_h, top_crop_x:top_crop_x + final_w]
+            top_crop_x = max(
+                0,
+                min(
+                    (top_new_w - final_w) // 2 + top_offset_x,
+                    max(0, top_new_w - final_w),
+                ),
+            )
+            top_crop_y = max(
+                0,
+                min(
+                    (top_new_h - blur_top_h) // 2 + top_offset_y,
+                    max(0, top_new_h - blur_top_h),
+                ),
+            )
+            top_blur_region = top_resized[
+                top_crop_y : top_crop_y + blur_top_h, top_crop_x : top_crop_x + final_w
+            ]
 
             # Apply blur
-            top_blur_region = cv2.GaussianBlur(top_blur_region, (blur_ksize, blur_ksize), blur_sigma)
+            top_blur_region = cv2.GaussianBlur(
+                top_blur_region, (blur_ksize, blur_ksize), blur_sigma
+            )
 
             # Ensure correct size and place in output
-            if top_blur_region.shape[0] >= blur_top_h and top_blur_region.shape[1] >= final_w:
+            if (
+                top_blur_region.shape[0] >= blur_top_h
+                and top_blur_region.shape[1] >= final_w
+            ):
                 output[0:blur_top_h, 0:final_w] = top_blur_region[:blur_top_h, :final_w]
 
         if blur_bottom_h > 0:
@@ -973,28 +1211,59 @@ def _process_image_cpu(
             bottom_offset_x = random.randint(-50, 50)
             bottom_offset_y = random.randint(-150, 0)  # Use lower part of content
 
-            bottom_scale = max(final_w / content_w, blur_bottom_h / content_h) * bottom_zoom
+            bottom_scale = (
+                max(final_w / content_w, blur_bottom_h / content_h) * bottom_zoom
+            )
             bottom_new_w = int(content_w * bottom_scale)
             bottom_new_h = int(content_h * bottom_scale)
-            bottom_resized = cv2.resize(content, (bottom_new_w, bottom_new_h), interpolation=cv2.INTER_LINEAR)
+            bottom_resized = cv2.resize(
+                content, (bottom_new_w, bottom_new_h), interpolation=cv2.INTER_LINEAR
+            )
 
             if abs(bottom_rotation) > 0.5:
                 center = (bottom_new_w // 2, bottom_new_h // 2)
                 rot_matrix = cv2.getRotationMatrix2D(center, bottom_rotation, 1.0)
-                bottom_resized = cv2.warpAffine(bottom_resized, rot_matrix, (bottom_new_w, bottom_new_h), borderMode=cv2.BORDER_REFLECT)
+                bottom_resized = cv2.warpAffine(
+                    bottom_resized,
+                    rot_matrix,
+                    (bottom_new_w, bottom_new_h),
+                    borderMode=cv2.BORDER_REFLECT,
+                )
 
-            bottom_crop_x = max(0, min((bottom_new_w - final_w) // 2 + bottom_offset_x, max(0, bottom_new_w - final_w)))
-            bottom_crop_y = max(0, min((bottom_new_h - blur_bottom_h) // 2 + abs(bottom_offset_y), max(0, bottom_new_h - blur_bottom_h)))
-            bottom_blur_region = bottom_resized[bottom_crop_y:bottom_crop_y + blur_bottom_h, bottom_crop_x:bottom_crop_x + final_w]
+            bottom_crop_x = max(
+                0,
+                min(
+                    (bottom_new_w - final_w) // 2 + bottom_offset_x,
+                    max(0, bottom_new_w - final_w),
+                ),
+            )
+            bottom_crop_y = max(
+                0,
+                min(
+                    (bottom_new_h - blur_bottom_h) // 2 + abs(bottom_offset_y),
+                    max(0, bottom_new_h - blur_bottom_h),
+                ),
+            )
+            bottom_blur_region = bottom_resized[
+                bottom_crop_y : bottom_crop_y + blur_bottom_h,
+                bottom_crop_x : bottom_crop_x + final_w,
+            ]
 
             # Apply blur
-            bottom_blur_region = cv2.GaussianBlur(bottom_blur_region, (blur_ksize, blur_ksize), blur_sigma)
+            bottom_blur_region = cv2.GaussianBlur(
+                bottom_blur_region, (blur_ksize, blur_ksize), blur_sigma
+            )
 
             # Ensure correct size and place in output
-            if bottom_blur_region.shape[0] >= blur_bottom_h and bottom_blur_region.shape[1] >= final_w:
-                output[final_h - blur_bottom_h:final_h, 0:final_w] = bottom_blur_region[:blur_bottom_h, :final_w]
+            if (
+                bottom_blur_region.shape[0] >= blur_bottom_h
+                and bottom_blur_region.shape[1] >= final_w
+            ):
+                output[final_h - blur_bottom_h : final_h, 0:final_w] = (
+                    bottom_blur_region[:blur_bottom_h, :final_w]
+                )
 
-    output[content_y:content_y + scaled_h, content_x:content_x + scaled_w] = content
+    output[content_y : content_y + scaled_h, content_x : content_x + scaled_w] = content
     return output
 
 
@@ -1002,11 +1271,14 @@ def _process_image_cpu(
 # HELPER FUNCTIONS
 # =============================================================================
 
+
 def _camel_to_snake(name: str) -> str:
     """Convert camelCase to snake_case."""
     import re
-    s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
-    return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+
+    s1 = re.sub("(.)([A-Z][a-z]+)", r"\1_\2", name)
+    return re.sub("([a-z0-9])([A-Z])", r"\1_\2", s1).lower()
+
 
 def _get_config(config: dict, key: str, default=None):
     """
@@ -1031,14 +1303,16 @@ def _parse_aspect_ratio(aspect_raw) -> str:
     """Parse aspect ratio from various formats."""
     if isinstance(aspect_raw, (list, tuple)) and len(aspect_raw) == 2:
         return f"{aspect_raw[0]}:{aspect_raw[1]}"
-    return str(aspect_raw) if aspect_raw else '9:16'
+    return str(aspect_raw) if aspect_raw else "9:16"
 
 
 def _calculate_layout(
-    orig_w: int, orig_h: int,
-    final_w: int, final_h: int,
+    orig_w: int,
+    orig_h: int,
+    final_w: int,
+    final_h: int,
     top_blur_pct: float = 0,
-    bottom_blur_pct: float = 0
+    bottom_blur_pct: float = 0,
 ) -> dict:
     """
     Calculate layout for reframe.
@@ -1112,21 +1386,25 @@ def _calculate_layout(
     content_y = blur_top
 
     print(f"[GPU-Reframe] Layout: input={orig_w}x{orig_h}, output={final_w}x{final_h}")
-    print(f"[GPU-Reframe] Content scaled: {scaled_w}x{scaled_h}, total blur space: {total_blur_space}px")
-    print(f"[GPU-Reframe] Blur distribution: top={top_blur_pct}%→{blur_top}px, bottom={bottom_blur_pct}%→{blur_bottom}px")
+    print(
+        f"[GPU-Reframe] Content scaled: {scaled_w}x{scaled_h}, total blur space: {total_blur_space}px"
+    )
+    print(
+        f"[GPU-Reframe] Blur distribution: top={top_blur_pct}%→{blur_top}px, bottom={bottom_blur_pct}%→{blur_bottom}px"
+    )
     print(f"[GPU-Reframe] Content position: ({content_x}, {content_y})")
 
     return {
-        'scaled_w': scaled_w,
-        'scaled_h': scaled_h,
-        'content_x': content_x,
-        'content_y': content_y,
-        'blur_top': blur_top,
-        'blur_bottom': blur_bottom,
-        'scale': scale,
-        'crop_top_px': crop_top_px,
-        'crop_bottom_px': crop_bottom_px,
-        'cropped_orig_h': cropped_orig_h,
+        "scaled_w": scaled_w,
+        "scaled_h": scaled_h,
+        "content_x": content_x,
+        "content_y": content_y,
+        "blur_top": blur_top,
+        "blur_bottom": blur_bottom,
+        "scale": scale,
+        "crop_top_px": crop_top_px,
+        "crop_bottom_px": crop_bottom_px,
+        "cropped_orig_h": cropped_orig_h,
     }
 
 
@@ -1137,7 +1415,7 @@ def _apply_logo_to_image(
     final_h: int,
     logo_size: int,
     logo_pos_x: float = 0.5,
-    logo_pos_y: float = 0.85
+    logo_pos_y: float = 0.85,
 ):
     """
     Apply logo overlay to image.
@@ -1178,19 +1456,23 @@ def _apply_logo_to_image(
         x = max(0, min(x, final_w - logo_w))
         y = max(0, min(y, final_h - logo_h))
 
-        print(f"[GPU-Reframe] Placing logo at ({x}, {y}), size {logo_w}x{logo_h}, pos=({logo_pos_x}, {logo_pos_y})")
+        print(
+            f"[GPU-Reframe] Placing logo at ({x}, {y}), size {logo_w}x{logo_h}, pos=({logo_pos_x}, {logo_pos_y})"
+        )
 
         # Apply with alpha blending if available
         if logo.shape[-1] == 4:
             alpha = logo[:, :, 3:4] / 255.0
             logo_rgb = logo[:, :, :3]
 
-            roi = img[y:y+logo_h, x:x+logo_w]
+            roi = img[y : y + logo_h, x : x + logo_w]
             # FIXED: Add np.clip to prevent overflow artifacts
-            blended = np.clip(logo_rgb * alpha + roi * (1 - alpha), 0, 255).astype(np.uint8)
-            img[y:y+logo_h, x:x+logo_w] = blended
+            blended = np.clip(logo_rgb * alpha + roi * (1 - alpha), 0, 255).astype(
+                np.uint8
+            )
+            img[y : y + logo_h, x : x + logo_w] = blended
         else:
-            img[y:y+logo_h, x:x+logo_w] = logo
+            img[y : y + logo_h, x : x + logo_w] = logo
 
     except Exception as e:
         print(f"[GPU-Reframe] Logo overlay failed: {e}")
@@ -1200,10 +1482,9 @@ def _apply_logo_to_image(
 # BATCH PROCESSING
 # =============================================================================
 
+
 def process_video_reframe_batch(
-    items: list,
-    progress_callback: Optional[Callable] = None,
-    max_workers: int = 4
+    items: list, progress_callback: Optional[Callable] = None, max_workers: int = 4
 ) -> list:
     """
     Process multiple videos/images in parallel.
@@ -1219,11 +1500,11 @@ def process_video_reframe_batch(
             gpu_id = i % max(1, _get_gpu_count())
             future = executor.submit(
                 process_video_reframe,
-                item['input'],
-                item['output'],
-                item.get('config', {}),
+                item["input"],
+                item["output"],
+                item.get("config", {}),
                 None,
-                gpu_id
+                gpu_id,
             )
             futures[future] = item
 
@@ -1232,11 +1513,13 @@ def process_video_reframe_batch(
                 result = future.result()
                 results.append(result)
             except Exception as e:
-                results.append({
-                    'status': 'error',
-                    'error': str(e),
-                    'input': futures[future]['input']
-                })
+                results.append(
+                    {
+                        "status": "error",
+                        "error": str(e),
+                        "input": futures[future]["input"],
+                    }
+                )
 
             completed += 1
             if progress_callback:
@@ -1249,11 +1532,11 @@ def _get_gpu_count() -> int:
     """Get number of available GPUs."""
     try:
         result = subprocess.run(
-            ['nvidia-smi', '--list-gpus'],
-            capture_output=True, text=True, timeout=5
+            ["nvidia-smi", "--list-gpus"], capture_output=True, text=True, timeout=5
         )
-        return len(result.stdout.strip().split('\n'))
-    except:
+        return len(result.stdout.strip().split("\n"))
+    except (subprocess.SubprocessError, OSError) as e:
+        logger.debug(f"Could not detect GPU count: {e}")
         return 1
 
 
@@ -1261,4 +1544,4 @@ def _get_gpu_count() -> int:
 # COMPATIBILITY EXPORTS
 # =============================================================================
 
-__all__ = ['process_video_reframe', 'process_video_reframe_batch']
+__all__ = ["process_video_reframe", "process_video_reframe_batch"]

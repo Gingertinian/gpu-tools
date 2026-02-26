@@ -29,6 +29,7 @@ PARALLEL VIDEO PROCESSING: Supports processing multiple videos in parallel
 using multiple NVENC sessions (optimized for datacenter GPUs like A5000/A6000).
 """
 
+import logging
 import os
 import subprocess
 import tempfile
@@ -42,6 +43,8 @@ import textwrap
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
+
+logger = logging.getLogger(__name__)
 
 # Video extensions
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".webm", ".mkv", ".m4v"}
@@ -151,6 +154,16 @@ def get_gpu_info() -> Dict[str, Any]:
     }
 
 
+def safe_extract(zf: zipfile.ZipFile, name: str, extract_dir: str) -> str:
+    """Safely extract a zip entry, preventing path traversal attacks (ZipSlip)."""
+    target_path = os.path.realpath(os.path.join(extract_dir, name))
+    extract_dir_real = os.path.realpath(extract_dir)
+    if not target_path.startswith(extract_dir_real + os.sep) and target_path != extract_dir_real:
+        raise ValueError(f"Attempted path traversal in zip entry: {name}")
+    zf.extract(name, extract_dir)
+    return target_path
+
+
 def extract_videos_from_zip(zip_path: str, extract_dir: str) -> List[str]:
     """Extract video files from a ZIP archive."""
     video_paths = []
@@ -158,7 +171,7 @@ def extract_videos_from_zip(zip_path: str, extract_dir: str) -> List[str]:
         for name in zf.namelist():
             ext = os.path.splitext(name)[1].lower()
             if ext in VIDEO_EXTENSIONS:
-                extracted_path = zf.extract(name, extract_dir)
+                extracted_path = safe_extract(zf, name, extract_dir)
                 video_paths.append(extracted_path)
     return video_paths
 
@@ -1158,12 +1171,8 @@ def process_captioner(
                     else 0,
                 }
 
-        except Exception as e:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            raise
         finally:
-            if video_paths:
-                shutil.rmtree(temp_dir, ignore_errors=True)
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     if is_video:
         return process_video_caption(
@@ -1412,7 +1421,7 @@ def process_video_caption(
                                 progress,
                                 f"Encoding ({mode_name})... {int(current_time)}s / {int(duration)}s",
                             )
-                    except:
+                    except (ValueError, IndexError):
                         pass
 
             # Wait for process to complete with timeout
@@ -1940,7 +1949,7 @@ def get_video_info(path: str) -> Dict[str, Any]:
     ]
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         info = json.loads(result.stdout)
 
         video_stream = next(
@@ -1952,7 +1961,11 @@ def get_video_info(path: str) -> Dict[str, Any]:
             "height": int(video_stream.get("height", 1080)),
             "duration": float(info.get("format", {}).get("duration", 0)),
         }
-    except:
+    except subprocess.TimeoutExpired:
+        logger.warning(f"ffprobe timed out getting video info for {path}")
+        return {"width": 1920, "height": 1080, "duration": 0}
+    except (subprocess.SubprocessError, json.JSONDecodeError, ValueError, OSError) as e:
+        logger.debug(f"Could not get video info for {path}: {e}")
         return {"width": 1920, "height": 1080, "duration": 0}
 
 
@@ -1964,7 +1977,8 @@ def hex_to_rgb(hex_color: str) -> tuple:
 
     try:
         return tuple(int(hex_color[i : i + 2], 16) for i in (0, 2, 4))
-    except:
+    except (ValueError, IndexError) as e:
+        logger.debug(f"Invalid hex color '{hex_color}': {e}")
         return (255, 255, 255)
 
 

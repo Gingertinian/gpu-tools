@@ -20,6 +20,7 @@ Helper functions:
 - _start_spoofer_ffmpeg: Start FFmpeg for frame-by-frame writing
 """
 
+import logging
 import os
 import time
 import math
@@ -35,6 +36,8 @@ import cv2
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+logger = logging.getLogger(__name__)
 
 from .constants import NVENC_SESSION_LIMITS, VIDEO_EXTENSIONS
 from .utils import apply_mode_to_config
@@ -52,7 +55,8 @@ def _check_video_audio(video_path: str) -> bool:
                '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', video_path]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         return 'audio' in result.stdout.lower()
-    except:
+    except (subprocess.SubprocessError, OSError) as e:
+        logger.debug(f"Could not check audio in {video_path}: {e}")
         return True
 
 
@@ -293,7 +297,8 @@ def _svg_to_cv2(svg_path: str, target_width: int):
 
     try:
         font = ImageFont.truetype("arial.ttf", logo_h // 2)
-    except:
+    except (IOError, OSError) as e:
+        logger.debug(f"Could not load arial.ttf font: {e}")
         font = ImageFont.load_default()
 
     text = "FARMIUM"
@@ -443,7 +448,8 @@ def _start_spoofer_ffmpeg(
 
     try:
         return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except:
+    except (subprocess.SubprocessError, OSError) as e:
+        logger.warning(f"NVENC FFmpeg failed, falling back to CPU: {e}")
         # CPU fallback
         cmd_cpu = [
             'ffmpeg', '-y', '-hide_banner', '-loglevel', 'warning',
@@ -1162,65 +1168,70 @@ def process_batch_video(
 
     if output_mode == 'directory' and output_dir:
         out_dir = output_dir
+        _is_temp_dir = False
     elif os.path.isdir(output_path):
         out_dir = output_path
+        _is_temp_dir = False
     else:
         out_dir = tempfile.mkdtemp(prefix="video_batch_")
+        _is_temp_dir = True
 
     os.makedirs(out_dir, exist_ok=True)
 
     base_name = os.path.splitext(os.path.basename(input_path))[0]
 
-    report_progress(0.1, f"Processing {variations} video variations in parallel...")
+    try:
+        report_progress(0.1, f"Processing {variations} video variations in parallel...")
 
-    # Use process_videos_parallel for efficient multi-NVENC processing
-    result = process_videos_parallel(
-        [input_path],
-        out_dir,
-        config,
-        progress_callback=progress_callback,
-        max_parallel=None,
-        variations=variations
-    )
+        # Use process_videos_parallel for efficient multi-NVENC processing
+        result = process_videos_parallel(
+            [input_path],
+            out_dir,
+            config,
+            progress_callback=progress_callback,
+            max_parallel=None,
+            variations=variations
+        )
 
-    if result.get('error'):
-        return result
+        if result.get('error'):
+            return result
 
-    # Count successful outputs
-    completed = 0
-    failed = 0
-    output_files = []
+        # Count successful outputs
+        completed = 0
+        failed = 0
+        output_files = []
 
-    for r in result.get('results', []):
-        if r.get('status') == 'completed' and r.get('output_path'):
-            if os.path.exists(r['output_path']):
-                completed += 1
-                output_files.append(r['output_path'])
-        else:
-            failed += 1
+        for r in result.get('results', []):
+            if r.get('status') == 'completed' and r.get('output_path'):
+                if os.path.exists(r['output_path']):
+                    completed += 1
+                    output_files.append(r['output_path'])
+            else:
+                failed += 1
 
-    # If outputMode is 'file' (not directory), create ZIP
-    if output_mode != 'directory' and not os.path.isdir(output_path):
-        report_progress(0.95, "Creating output ZIP...")
-        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_STORED) as zf:
-            for f in output_files:
-                zf.write(f, os.path.basename(f))
+        # If outputMode is 'file' (not directory), create ZIP
+        if output_mode != 'directory' and not os.path.isdir(output_path):
+            report_progress(0.95, "Creating output ZIP...")
+            with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_STORED) as zf:
+                for f in output_files:
+                    zf.write(f, os.path.basename(f))
 
-        # Cleanup temp directory
-        if out_dir != output_path and out_dir.startswith(tempfile.gettempdir()):
+        report_progress(1.0, "Complete")
+
+        return {
+            'status': 'completed',
+            'mode': 'batch_video',
+            'variations_requested': variations,
+            'videos_processed': completed,
+            'videos_failed': failed,
+            'output_files': output_files,
+            'output_dir': out_dir if output_mode == 'directory' else None
+        }
+
+    finally:
+        # Cleanup temp directory only if we created it
+        if _is_temp_dir and out_dir != output_path:
             shutil.rmtree(out_dir, ignore_errors=True)
-
-    report_progress(1.0, "Complete")
-
-    return {
-        'status': 'completed',
-        'mode': 'batch_video',
-        'variations_requested': variations,
-        'videos_processed': completed,
-        'videos_failed': failed,
-        'output_files': output_files,
-        'output_dir': out_dir if output_mode == 'directory' else None
-    }
 
 
 def process_video(
@@ -1348,7 +1359,7 @@ def process_video(
                     current_time = int(h) * 3600 + int(m) * 60 + float(s)
                     progress = min(0.2 + (current_time / duration) * 0.75, 0.95)
                     report_progress(progress, f"Encoding ({mode_name})... {int(current_time)}s / {int(duration)}s")
-                except:
+                except (ValueError, IndexError):
                     pass
 
         stderr_output = ''.join(stderr_lines[-30:]) if stderr_lines else 'No stderr captured'

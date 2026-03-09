@@ -1136,13 +1136,13 @@ class NVENCSessionTracker:
         # Track total sessions for load balancing decisions
         self._total_assigned = {i: 0 for i in range(gpu_count)}
 
-    def acquire_gpu(self, blocking: bool = True, timeout: float = None) -> int:
+    def acquire_gpu(self, blocking: bool = True, timeout: float = 600) -> int:
         """
         Get GPU with capacity available. Uses semaphores for REAL enforcement.
 
         Args:
             blocking: If True, wait for GPU to become available
-            timeout: Max seconds to wait (None = infinite)
+            timeout: Max seconds to wait (default 600s = 10 min, prevents infinite hangs)
 
         Returns GPU ID (0-indexed), or -1 if non-blocking and none available.
         """
@@ -1166,10 +1166,11 @@ class NVENCSessionTracker:
 
         # Blocking mode: wait for ANY GPU to become available
         # Use round-robin starting from least-used
+        effective_timeout = timeout if timeout is not None else 600
         start_gpu = gpu_order[0]
         for i in range(self.gpu_count):
             gpu_id = (start_gpu + i) % self.gpu_count
-            acquired = self._gpu_semaphores[gpu_id].acquire(blocking=True, timeout=timeout)
+            acquired = self._gpu_semaphores[gpu_id].acquire(blocking=True, timeout=effective_timeout)
             if acquired:
                 with self._lock:
                     self.active_sessions[gpu_id] += 1
@@ -1177,6 +1178,7 @@ class NVENCSessionTracker:
                 return gpu_id
 
         # Timeout expired on all GPUs
+        print(f"[NVENCSessionTracker] WARNING: GPU acquire timed out after {effective_timeout}s")
         return -1
 
     def release_gpu(self, gpu_id: int):
@@ -1337,7 +1339,7 @@ def process_videos_parallel(
         if progress_callback:
             with results_lock:
                 progress = completed / total if total > 0 else 0
-            progress_callback(progress, msg)
+                progress_callback(progress, msg)
 
     report_progress(f"Processing {total} videos with {max_workers} workers ({max_parallel} NVENC sessions) across {gpu_count} GPU(s)...")
 
@@ -1345,8 +1347,15 @@ def process_videos_parallel(
         """Wrapper that acquires/releases GPU from session tracker."""
         video_path, output_path, cfg, video_index = work_item
 
-        # Dynamically acquire GPU with least load
-        gpu_id = session_tracker.acquire_gpu()
+        # Dynamically acquire GPU with least load (10 min timeout)
+        gpu_id = session_tracker.acquire_gpu(timeout=600)
+        if gpu_id < 0:
+            print(f"[Spoofer Worker {video_index}] GPU acquire timed out, skipping")
+            return {
+                'status': 'failed',
+                'index': video_index,
+                'error': 'GPU acquire timeout after 600s'
+            }
         try:
             # Add GPU ID to work item tuple
             full_work_item = (video_path, output_path, cfg, video_index, gpu_id)
@@ -1392,29 +1401,29 @@ def process_videos_parallel(
         'variations': variations
     }
 
-# Photo defaults (from original)
+# Photo defaults — stronger base values for visible effect at balanced mode
 PHOTO_DEFAULTS = {
-    'crop': 1.5,
-    'micro_resize': 1.2,
-    'rotation': 0.8,
-    'subpixel': 1.0,
-    'warp': 0.8,
-    'barrel': 0.6,
-    'block_shift': 0.6,
-    'scale': 98,
-    'micro_rescale': 0.4,
-    'brightness': 0.04,
-    'gamma': 0.06,
-    'contrast': 0.04,
-    'vignette': 2.0,
+    'crop': 2.5,
+    'micro_resize': 2.0,
+    'rotation': 1.5,
+    'subpixel': 1.2,
+    'warp': 1.2,
+    'barrel': 1.0,
+    'block_shift': 1.0,
+    'scale': 97,
+    'micro_rescale': 0.6,
+    'brightness': 0.08,
+    'gamma': 0.10,
+    'contrast': 0.07,
+    'vignette': 3.0,
     'freq_noise': 0,
     'invisible_watermark': 0,
     'color_space_conv': 0,
-    'saturation': 0.06,
-    'tint': 1.5,
-    'chromatic': 0.8,
-    'noise': 3.0,
-    'quality': 90,
+    'saturation': 0.10,
+    'tint': 2.5,
+    'chromatic': 1.2,
+    'noise': 4.0,
+    'quality': 88,
     'double_compress': 1,
     'flip': 1,
     'force_916': 1,
@@ -1424,9 +1433,16 @@ PHOTO_DEFAULTS = {
 # Multipliers applied to base transform values based on mode
 # Light: subtle changes (0.3-0.5x) - for content reuse
 # Balanced: default (1.0x) - good balance of uniqueness and quality
-# Aggressive: maximum variation (2.0-3.0x) - different hash each time
+# Aggressive: strong variation (2.0-2.5x) - different hash each time
+# Maximum: everything cranked up (3.5-4.0x) - highest uniqueness
 
 MODE_MULTIPLIERS = {
+    'stealth': {
+        'spatial': 0.15,     # Barely perceptible spatial changes
+        'tonal': 0.2,        # Near-invisible color shifts
+        'visual': 0.15,      # Minimal noise/tint
+        'variation': 0.1,    # Very low randomization range
+    },
     'light': {
         'spatial': 0.3,      # Very subtle spatial changes
         'tonal': 0.4,        # Minimal color shifts
@@ -1444,7 +1460,13 @@ MODE_MULTIPLIERS = {
         'tonal': 2.0,        # Noticeable color shifts
         'visual': 2.5,       # High noise/tint
         'variation': 0.5,    # Wide randomization range
-    }
+    },
+    'maximum': {
+        'spatial': 4.0,      # Maximum spatial transforms
+        'tonal': 3.0,        # Strong color shifts
+        'visual': 4.0,       # Maximum noise/tint
+        'variation': 0.7,    # Widest randomization range
+    },
 }
 
 
@@ -2451,6 +2473,9 @@ def process_batch_spoofer(
 
     report_progress(0.1, f"Generating {variations} variations...")
 
+    # Apply mode multipliers BEFORE extracting params
+    config = apply_mode_to_config(config)
+
     # Flatten config for processing
     params = {}
 
@@ -2511,9 +2536,9 @@ def process_batch_spoofer(
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
         for i in range(variations):
             try:
-                # Progress
-                progress = 0.1 + (i / variations) * 0.8
-                report_progress(progress, f"Processing variation {i+1}/{variations}...")
+                # Report start of variation
+                report_progress(0.1 + (i / variations) * 0.8,
+                                f"Processing variation {i+1}/{variations}...")
 
                 # Generate unique seed
                 seed = generate_unique_seed(input_path, i, base_time + i * 1000)
@@ -2582,10 +2607,18 @@ def process_batch_spoofer(
                 zf.writestr(filename, img_buffer.getvalue())
                 results.append(filename)
 
+                # Report completion of this variation
+                report_progress(0.1 + ((i + 1) / variations) * 0.8,
+                                f"Completed variation {i+1}/{variations}"
+                                + (f" (pHash: {distance})" if distance > 0 else ""))
+
             except Exception as e:
-                print(f"[ERROR] Exception during copy {i}: {str(e)}")
+                print(f"[ERROR] Exception during variation {i}: {str(e)}")
                 print(traceback.format_exc())
-                raise
+                # Skip failed variation instead of killing entire batch
+                report_progress(0.1 + ((i + 1) / variations) * 0.8,
+                                f"Variation {i+1}/{variations} failed, continuing...")
+                continue
 
     # Write ZIP to output
     zip_buffer.seek(0)
@@ -2906,6 +2939,9 @@ def process_single_image(
         original_img = original_img.convert('RGB')
 
     original_size = original_img.size
+
+    # Apply mode multipliers before extracting params
+    config = apply_mode_to_config(config)
 
     # Flatten config
     params = {}

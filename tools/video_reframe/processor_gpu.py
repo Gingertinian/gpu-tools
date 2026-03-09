@@ -826,6 +826,7 @@ def _process_image_gpu(
     logo_name = _get_config(config, "logoName", "farmium_full")
     logo_url = _get_config(config, "logoUrl", None)
     logo_size = _get_config(config, "logoSize", 15)
+    logo_opacity = _get_config(config, "logoOpacity", 100)
     logo_pos_x = _get_config(config, "logoPositionX", 0.5)
     logo_pos_y = _get_config(config, "logoPositionY", 0.85)
 

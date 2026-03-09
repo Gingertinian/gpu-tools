@@ -312,6 +312,7 @@ def _process_video_gpu(
     logo_name = _get_config(config, "logoName", "farmium_full")
     logo_url = _get_config(config, "logoUrl", None)
     logo_size = _get_config(config, "logoSize", 15)
+    logo_opacity = _get_config(config, "logoOpacity", 100)
     # FIXED: Use individual position values from config (0-1 range)
     logo_pos_x = _get_config(config, "logoPositionX", 0.5)
     logo_pos_y = _get_config(config, "logoPositionY", 0.85)
@@ -403,6 +404,7 @@ def _process_video_gpu(
             logo_size,
             logo_pos_x,
             logo_pos_y,
+            logo_opacity,
             gpu_id,
         )
 
@@ -613,6 +615,7 @@ def _build_gpu_filter_complex(
     logo_size: int,
     logo_pos_x: float,
     logo_pos_y: float,
+    logo_opacity: int,
     gpu_id: int,
 ) -> str:
     """
@@ -764,7 +767,10 @@ def _build_gpu_filter_complex(
             f"[GPU-Reframe] Logo overlay: pos=({logo_x}, {logo_y}), width={logo_w}, normalized=({logo_pos_x}, {logo_pos_y}), path={logo_path}"
         )
 
-        parts.append(f"[1:v]scale={logo_w}:-1:flags=lanczos,format=yuva420p[logo]")
+        # Apply opacity via colorchannelmixer alpha channel (aa = 0.0-1.0)
+        alpha_val = max(0.0, min(1.0, logo_opacity / 100.0))
+        opacity_filter = f",colorchannelmixer=aa={alpha_val:.2f}" if alpha_val < 1.0 else ""
+        parts.append(f"[1:v]scale={logo_w}:-1:flags=lanczos,format=yuva420p{opacity_filter}[logo]")
         # Use eof_action=repeat to loop logo (static image) for entire video duration
         # CRITICAL: setsar=1 forces square pixels - without this, video displays as wrong aspect ratio
         parts.append(
@@ -901,7 +907,7 @@ def _process_image_gpu(
         logo_path = _get_logo_path(logo_name, logo_url, temp_dir)
         if logo_path and logo_path.exists():
             _apply_logo_to_image(
-                output, logo_path, final_w, final_h, logo_size, logo_pos_x, logo_pos_y
+                output, logo_path, final_w, final_h, logo_size, logo_pos_x, logo_pos_y, logo_opacity
             )
 
         if progress_callback:
@@ -1416,11 +1422,10 @@ def _apply_logo_to_image(
     logo_size: int,
     logo_pos_x: float = 0.5,
     logo_pos_y: float = 0.85,
+    logo_opacity: int = 100,
 ):
     """
     Apply logo overlay to image.
-
-    FIXED: Now uses logo_pos_x and logo_pos_y from config instead of hardcoded values.
 
     Args:
         img: Image to modify (in-place)
@@ -1429,6 +1434,7 @@ def _apply_logo_to_image(
         logo_size: Logo size as percentage of width (10-100)
         logo_pos_x: Horizontal position (0-1, 0.5 = center)
         logo_pos_y: Vertical position (0-1, 0 = top, 1 = bottom)
+        logo_opacity: Logo opacity as percentage (0-100, 100 = fully opaque)
     """
     try:
         logo = cv2.imread(str(logo_path), cv2.IMREAD_UNCHANGED)
@@ -1445,9 +1451,6 @@ def _apply_logo_to_image(
 
         logo = cv2.resize(logo, (logo_w, logo_h), interpolation=cv2.INTER_LANCZOS4)
 
-        # FIXED: Calculate position from normalized coordinates
-        # logo_pos_x: 0.5 = center, 0 = left edge, 1 = right edge
-        # logo_pos_y: 0.5 = center, 0 = top, 1 = bottom (logo is centered at this position)
         # FIXED: Use round() instead of int() for more accurate positioning
         x = round(final_w * logo_pos_x - logo_w / 2)
         y = round(final_h * logo_pos_y - logo_h / 2)
@@ -1457,22 +1460,29 @@ def _apply_logo_to_image(
         y = max(0, min(y, final_h - logo_h))
 
         print(
-            f"[GPU-Reframe] Placing logo at ({x}, {y}), size {logo_w}x{logo_h}, pos=({logo_pos_x}, {logo_pos_y})"
+            f"[GPU-Reframe] Placing logo at ({x}, {y}), size {logo_w}x{logo_h}, pos=({logo_pos_x}, {logo_pos_y}), opacity={logo_opacity}%"
         )
+
+        # Apply opacity factor (0-100 scale)
+        opacity_factor = max(0.0, min(1.0, logo_opacity / 100.0))
 
         # Apply with alpha blending if available
         if logo.shape[-1] == 4:
-            alpha = logo[:, :, 3:4] / 255.0
+            alpha = (logo[:, :, 3:4] / 255.0) * opacity_factor
             logo_rgb = logo[:, :, :3]
 
             roi = img[y : y + logo_h, x : x + logo_w]
-            # FIXED: Add np.clip to prevent overflow artifacts
             blended = np.clip(logo_rgb * alpha + roi * (1 - alpha), 0, 255).astype(
                 np.uint8
             )
             img[y : y + logo_h, x : x + logo_w] = blended
         else:
-            img[y : y + logo_h, x : x + logo_w] = logo
+            if opacity_factor < 1.0:
+                roi = img[y : y + logo_h, x : x + logo_w]
+                blended = np.clip(logo * opacity_factor + roi * (1 - opacity_factor), 0, 255).astype(np.uint8)
+                img[y : y + logo_h, x : x + logo_w] = blended
+            else:
+                img[y : y + logo_h, x : x + logo_w] = logo
 
     except Exception as e:
         print(f"[GPU-Reframe] Logo overlay failed: {e}")

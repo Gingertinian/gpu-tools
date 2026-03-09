@@ -314,6 +314,7 @@ def _process_image_reframe(
     logo_name = _get_config(config, 'logoName', 'farmium_full')
     logo_url = _get_config(config, 'logoUrl')  # Custom logo URL from backend
     logo_size = _get_config(config, 'logoSize', 15)
+    logo_opacity = _get_config(config, 'logoOpacity', 100)
     logo_position = _parse_logo_position(config)
     blur_intensity = _get_config(config, 'blurIntensity', 25)
     brightness_adj = _get_config(config, 'brightness', 0)
@@ -362,8 +363,9 @@ def _process_image_reframe(
     if logo_source and logo_source != 'none':
         logo_data = _prepare_logo(logo_source, final_w, logo_size)
         if logo_data:
-            # Store logo position in logo_data for _apply_logo
+            # Store logo position and opacity in logo_data for _apply_logo
             logo_data['position'] = logo_position
+            logo_data['opacity'] = logo_opacity
 
     # Random generator
     rng = random.Random(video_index + 42)
@@ -463,6 +465,7 @@ def _process_video_reframe(
     logo_name = _get_config(config, 'logoName', 'farmium_full')
     logo_url = _get_config(config, 'logoUrl')  # Custom logo URL from backend
     logo_size = _get_config(config, 'logoSize', 15)
+    logo_opacity = _get_config(config, 'logoOpacity', 100)
     logo_position = _parse_logo_position(config)
     blur_intensity = _get_config(config, 'blurIntensity', 25)
     brightness_adj = _get_config(config, 'brightness', 0)
@@ -509,9 +512,10 @@ def _process_video_reframe(
     if logo_source and logo_source != 'none':
         logo_data = _prepare_logo(logo_source, final_w, logo_size)
         if logo_data:
-            # Store logo position in logo_data for _apply_logo
+            # Store logo position and opacity in logo_data for _apply_logo
             logo_data['position'] = logo_position
-            print(f"[VideoReframe] Logo prepared: {logo_data['image'].shape[1]}x{logo_data['image'].shape[0]} at pos ({logo_position[0]:.2f}, {logo_position[1]:.2f})")
+            logo_data['opacity'] = logo_opacity
+            print(f"[VideoReframe] Logo prepared: {logo_data['image'].shape[1]}x{logo_data['image'].shape[0]} at pos ({logo_position[0]:.2f}, {logo_position[1]:.2f}), opacity={logo_opacity}%")
 
     # Generate stable blur parameters (no color/flip changes, smooth motion)
     rng = random.Random(video_index + 42)
@@ -1668,8 +1672,11 @@ def _apply_logo(frame: np.ndarray, logo_data: dict, frame_w: int, frame_h: int):
     y = max(0, min(y, frame_h - lh))
 
     roi = frame[y:y + lh, x:x + lw]
+    # Apply opacity from config (0-100 scale, default 100 = fully opaque)
+    opacity = logo_data.get('opacity', 100)
+    effective_alpha = alpha_3d * (opacity / 100.0)
     # FIXED: Add np.clip to prevent overflow artifacts in alpha blending
-    blended = np.clip(alpha_3d * logo + (1 - alpha_3d) * roi, 0, 255).astype(np.uint8)
+    blended = np.clip(effective_alpha * logo + (1 - effective_alpha) * roi, 0, 255).astype(np.uint8)
     frame[y:y + lh, x:x + lw] = blended
 
 

@@ -41,11 +41,14 @@ TARGET_RESOLUTIONS = {
 
 # ==================== MODE PRESETS ====================
 # Multipliers applied to base transform values based on mode
-# Light: subtle changes (0.3-0.5x) - for content reuse
-# Balanced: default (1.0x) - good balance of uniqueness and quality
-# Aggressive: maximum variation (2.0-3.0x) - different hash each time
 
 MODE_MULTIPLIERS = {
+    'stealth': {
+        'spatial': 0.15,     # Barely perceptible spatial changes
+        'tonal': 0.2,        # Near-invisible color shifts
+        'visual': 0.15,      # Minimal noise/tint
+        'variation': 0.1,    # Very low randomization range
+    },
     'light': {
         'spatial': 0.3,      # Very subtle spatial changes
         'tonal': 0.4,        # Minimal color shifts
@@ -63,11 +66,18 @@ MODE_MULTIPLIERS = {
         'tonal': 2.0,        # Noticeable color shifts
         'visual': 2.5,       # High noise/tint
         'variation': 0.5,    # Wide randomization range
-    }
+    },
+    'maximum': {
+        'spatial': 4.0,      # Maximum spatial transforms
+        'tonal': 3.0,        # Strong color shifts
+        'visual': 4.0,       # Maximum noise/tint
+        'variation': 0.7,    # Widest randomization range
+    },
 }
 
 # Fast mode defaults - skip expensive transforms
 FAST_DEFAULTS = {
+    # Core spatial (fast)
     'crop': 1.5,
     'micro_resize': 1.2,
     'rotation': 0.8,
@@ -77,11 +87,15 @@ FAST_DEFAULTS = {
     'block_shift': 0,   # Skip - slow (loops)
     'scale': 100,
     'micro_rescale': 0, # Skip - double resize
+
+    # Core tonal (fast)
     'brightness': 0.04,
     'gamma': 0.06,
     'contrast': 0.04,
     'vignette': 0,      # Skip - slow (numpy)
     'saturation': 0.06,
+
+    # Core visual (fast)
     'tint': 1.5,
     'chromatic': 0,     # Skip - slow
     'noise': 3.0,
@@ -89,6 +103,46 @@ FAST_DEFAULTS = {
     'double_compress': 0,  # Disable - use single
     'flip': 1,
     'force_916': 1,
+
+    # I1-I8: New color transforms (all disabled in fast mode)
+    'hue_shift': 0,
+    'color_balance': 0,
+    'color_temperature': 0,
+    'vibrance': 0,
+    'curves_preset': 'none',
+    'color_channel_mixer': 0,
+    'levels': 0,
+    'sharpness': 0,
+
+    # I9-I15: New visual effects (all disabled in fast mode)
+    'gradient_overlay': 0,
+    'scanline': 0,
+    'film_grain': 0,
+    'color_filter_preset': 'none',
+    'dynamic_color_shift': 0,
+    'edge_enhance': 0,
+    'dither': 0,
+
+    # Tonal (internal/advanced, disabled in fast mode)
+    'freq_noise': 0,
+    'invisible_watermark': 0,
+    'color_space_conv': 0,
+
+    # I16-I20: Anti-detection (minimal in fast mode)
+    'trace_removal': 1,
+    'exif_injection': 0,
+    'device_profile': 'none',
+    'gps_injection': 0,
+    'timestamp_injection': 0,
+
+    # I21-I25: Enhancement (disabled in fast mode)
+    'denoise': 0,
+    'auto_levels': 0,
+
+    # I26-I30: Spatial advanced (disabled in fast mode)
+    'affine_shear': 0,
+    'elastic_deform': 0,
+    'border_inject': 0,
 }
 
 
@@ -492,16 +546,39 @@ def process_batch_fast(
     params['crop'] = spatial.get('crop', params['crop'])
     params['micro_resize'] = spatial.get('microResize', params['micro_resize'])
     params['rotation'] = spatial.get('rotation', params['rotation'])
+    # New spatial params (disabled by default in fast mode)
+    params['affine_shear'] = spatial.get('affineShear', params['affine_shear'])
+    params['elastic_deform'] = spatial.get('elasticDeform', params['elastic_deform'])
+    params['border_inject'] = spatial.get('borderInject', params['border_inject'])
 
     tonal = config.get('tonal', {})
     params['brightness'] = tonal.get('brightness', params['brightness'])
     params['gamma'] = tonal.get('gamma', params['gamma'])
     params['contrast'] = tonal.get('contrast', params['contrast'])
     params['saturation'] = tonal.get('saturation', params['saturation'])
+    # New tonal params
+    params['hue_shift'] = tonal.get('hueShift', params['hue_shift'])
+    params['vibrance'] = tonal.get('vibrance', params['vibrance'])
+    params['color_temperature'] = tonal.get('colorTemperature', params['color_temperature'])
+    params['color_balance'] = tonal.get('colorBalance', params['color_balance'])
+    params['color_channel_mixer'] = tonal.get('colorChannelMixer', params['color_channel_mixer'])
+    params['levels'] = tonal.get('levels', params['levels'])
+    params['auto_levels'] = tonal.get('autoLevels', params['auto_levels'])
+    params['curves_preset'] = tonal.get('curvesPreset', params['curves_preset'])
 
     visual = config.get('visual', {})
     params['tint'] = visual.get('tint', params['tint'])
     params['noise'] = visual.get('noise', params['noise'])
+    # New visual params
+    params['sharpness'] = visual.get('sharpness', params['sharpness'])
+    params['film_grain'] = visual.get('filmGrain', params['film_grain'])
+    params['gradient_overlay'] = visual.get('gradientOverlay', params['gradient_overlay'])
+    params['scanline'] = visual.get('scanline', params['scanline'])
+    params['edge_enhance'] = visual.get('edgeEnhance', params['edge_enhance'])
+    params['dither'] = visual.get('dither', params['dither'])
+    params['denoise'] = visual.get('denoise', params['denoise'])
+    params['dynamic_color_shift'] = visual.get('dynamicColorShift', params['dynamic_color_shift'])
+    params['color_filter_preset'] = visual.get('colorFilterPreset', params['color_filter_preset'])
 
     compression = config.get('compression', {})
     quality = int(compression.get('quality', 90))
@@ -510,6 +587,12 @@ def process_batch_fast(
     params['flip'] = options.get('flip', 1)
     params['force_916'] = options.get('force916', 1)
     random_names = options.get('randomNames', 0)
+    # Anti-detection options
+    params['trace_removal'] = options.get('traceRemoval', params['trace_removal'])
+    params['exif_injection'] = options.get('exifInjection', params['exif_injection'])
+    params['device_profile'] = options.get('deviceProfile', params['device_profile'])
+    params['gps_injection'] = options.get('gpsInjection', params['gps_injection'])
+    params['timestamp_injection'] = options.get('timestampInjection', params['timestamp_injection'])
 
     # Apply mode multipliers to make differences visible
     params = apply_mode_to_params(params, mode)
@@ -678,18 +761,49 @@ def process_spoofer_fast(
         options = config.get('options', {})
 
         params.update({
+            # Spatial
             'crop': spatial.get('crop', params['crop']),
             'micro_resize': spatial.get('microResize', params['micro_resize']),
             'rotation': spatial.get('rotation', params['rotation']),
+            'affine_shear': spatial.get('affineShear', params['affine_shear']),
+            'elastic_deform': spatial.get('elasticDeform', params['elastic_deform']),
+            'border_inject': spatial.get('borderInject', params['border_inject']),
+            # Tonal
             'brightness': tonal.get('brightness', params['brightness']),
             'gamma': tonal.get('gamma', params['gamma']),
             'contrast': tonal.get('contrast', params['contrast']),
             'saturation': tonal.get('saturation', params['saturation']),
+            'hue_shift': tonal.get('hueShift', params['hue_shift']),
+            'vibrance': tonal.get('vibrance', params['vibrance']),
+            'color_temperature': tonal.get('colorTemperature', params['color_temperature']),
+            'color_balance': tonal.get('colorBalance', params['color_balance']),
+            'color_channel_mixer': tonal.get('colorChannelMixer', params['color_channel_mixer']),
+            'levels': tonal.get('levels', params['levels']),
+            'curves_preset': tonal.get('curvesPreset', params['curves_preset']),
+            'auto_levels': tonal.get('autoLevels', params['auto_levels']),
+            # Visual
             'tint': visual.get('tint', params['tint']),
+            'chromatic': visual.get('chromatic', params.get('chromatic', 0)),
             'noise': visual.get('noise', params['noise']),
+            'sharpness': visual.get('sharpness', params['sharpness']),
+            'film_grain': visual.get('filmGrain', params['film_grain']),
+            'gradient_overlay': visual.get('gradientOverlay', params['gradient_overlay']),
+            'scanline': visual.get('scanline', params['scanline']),
+            'edge_enhance': visual.get('edgeEnhance', params['edge_enhance']),
+            'dither': visual.get('dither', params['dither']),
+            'denoise': visual.get('denoise', params['denoise']),
+            'dynamic_color_shift': visual.get('dynamicColorShift', params['dynamic_color_shift']),
+            'color_filter_preset': visual.get('colorFilterPreset', params['color_filter_preset']),
+            # Compression
             'quality': compression.get('quality', 90),
+            # Options
             'flip': options.get('flip', 1),
             'force_916': options.get('force916', 1),
+            'trace_removal': options.get('traceRemoval', params['trace_removal']),
+            'exif_injection': options.get('exifInjection', params['exif_injection']),
+            'device_profile': options.get('deviceProfile', params['device_profile']),
+            'gps_injection': options.get('gpsInjection', params['gps_injection']),
+            'timestamp_injection': options.get('timestampInjection', params['timestamp_injection']),
         })
 
         # Apply mode multipliers

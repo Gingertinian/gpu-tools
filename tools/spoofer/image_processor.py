@@ -22,7 +22,7 @@ from typing import Optional, Dict, Any, List, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .constants import PHASH_MIN_DISTANCE, PHOTO_DEFAULTS
-from .utils import generate_unique_seed, randomize_params
+from .utils import generate_unique_seed, randomize_params, apply_mode_to_config
 from .image_transforms import (
     apply_asymmetric_crop,
     apply_micro_resize,
@@ -45,6 +45,29 @@ from .image_transforms import (
     apply_noise,
     apply_double_compression,
     pad_to_9_16_photo,
+    # I1-I15: New color/visual transforms
+    apply_hue_shift,
+    apply_color_balance,
+    apply_color_temperature,
+    apply_vibrance,
+    apply_curves_preset,
+    apply_color_channel_mixer,
+    apply_levels_adjustment,
+    apply_sharpness,
+    apply_gradient_overlay,
+    apply_scanline_pattern,
+    apply_film_grain,
+    apply_color_filter_preset,
+    apply_dynamic_color_shift,
+    apply_edge_enhancement,
+    apply_dither_pattern,
+    # I21-I30: Enhancement, quality, spatial advanced
+    apply_denoise,
+    apply_auto_levels,
+    apply_affine_shear,
+    apply_elastic_deformation,
+    apply_border_inject,
+    apply_image_post_processing,
 )
 
 # Optional pHash support
@@ -117,6 +140,72 @@ def apply_transforms(img: Image.Image, params: Dict, py_rng: random.Random, rng:
 
     if params.get('noise', 0) > 0:
         img = apply_noise(img, params['noise'], rng)
+
+    # NEW TIER: COLOR TRANSFORMS (I1-I8)
+    if params.get('hue_shift', 0) > 0:
+        img = apply_hue_shift(img, params['hue_shift'], py_rng)
+
+    if params.get('color_balance', 0) > 0:
+        img = apply_color_balance(img, params['color_balance'], py_rng)
+
+    if params.get('color_temperature', 0) > 0:
+        img = apply_color_temperature(img, params['color_temperature'], py_rng)
+
+    if params.get('vibrance', 0) > 0:
+        img = apply_vibrance(img, params['vibrance'], py_rng)
+
+    curves = params.get('curves_preset', 'none')
+    if curves and curves != 'none':
+        img = apply_curves_preset(img, curves, py_rng)
+
+    if params.get('color_channel_mixer', 0) > 0:
+        img = apply_color_channel_mixer(img, params['color_channel_mixer'], py_rng)
+
+    if params.get('levels', 0) > 0:
+        img = apply_levels_adjustment(img, params['levels'], py_rng)
+
+    if params.get('sharpness', 0) > 0:
+        img = apply_sharpness(img, params['sharpness'], py_rng)
+
+    # NEW TIER: VISUAL EFFECTS (I9-I15)
+    if params.get('gradient_overlay', 0) > 0:
+        img = apply_gradient_overlay(img, params['gradient_overlay'], py_rng)
+
+    if params.get('scanline', 0) > 0:
+        img = apply_scanline_pattern(img, params['scanline'], py_rng)
+
+    if params.get('film_grain', 0) > 0:
+        img = apply_film_grain(img, params['film_grain'], py_rng, rng)
+
+    color_filter = params.get('color_filter_preset', 'none')
+    if color_filter and color_filter != 'none':
+        img = apply_color_filter_preset(img, color_filter, py_rng)
+
+    if params.get('dynamic_color_shift', 0) > 0:
+        img = apply_dynamic_color_shift(img, params['dynamic_color_shift'], py_rng)
+
+    if params.get('edge_enhance', 0) > 0:
+        img = apply_edge_enhancement(img, params['edge_enhance'], py_rng)
+
+    if params.get('dither', 0) > 0:
+        img = apply_dither_pattern(img, params['dither'], py_rng, rng)
+
+    # NEW TIER: ENHANCEMENT (I22-I23)
+    if params.get('denoise', 0) > 0:
+        img = apply_denoise(img, params['denoise'], py_rng)
+
+    if params.get('auto_levels', 0) > 0:
+        img = apply_auto_levels(img, params['auto_levels'], py_rng)
+
+    # NEW TIER: SPATIAL ADVANCED (I27-I28, I30)
+    if params.get('affine_shear', 0) > 0:
+        img = apply_affine_shear(img, params['affine_shear'], py_rng)
+
+    if params.get('elastic_deform', 0) > 0:
+        img = apply_elastic_deformation(img, params['elastic_deform'], py_rng, rng)
+
+    if params.get('border_inject', 0) > 0:
+        img = apply_border_inject(img, params['border_inject'], py_rng)
 
     # FINAL PROCESSING
     if params.get('micro_rescale', 0) > 0:
@@ -202,6 +291,9 @@ def process_single_image(
 
     original_size = original_img.size
 
+    # Apply mode multipliers to config
+    config = apply_mode_to_config(config)
+
     # Flatten config
     params = {}
     spatial = config.get('spatial', {})
@@ -231,10 +323,41 @@ def process_single_image(
         'tint': visual.get('tint', 0),
         'chromatic': visual.get('chromatic', 0),
         'noise': visual.get('noise', 0),
-        'quality': compression.get('quality', 92),
+        'quality': compression.get('quality', PHOTO_DEFAULTS['quality']),
         'double_compress': compression.get('doubleCompress', 0),
         'flip': options.get('flip', 0),
         'force_916': options.get('force916', 0),
+        # I1-I8: New color transforms
+        'hue_shift': tonal.get('hueShift', 0),
+        'color_balance': tonal.get('colorBalance', 0),
+        'color_temperature': tonal.get('colorTemperature', 0),
+        'vibrance': tonal.get('vibrance', 0),
+        'curves_preset': tonal.get('curvesPreset', 'none'),
+        'color_channel_mixer': tonal.get('colorChannelMixer', 0),
+        'levels': tonal.get('levels', 0),
+        'sharpness': visual.get('sharpness', 0),
+        # I9-I15: New visual effects
+        'gradient_overlay': visual.get('gradientOverlay', 0),
+        'scanline': visual.get('scanline', 0),
+        'film_grain': visual.get('filmGrain', 0),
+        'color_filter_preset': visual.get('colorFilterPreset', 'none'),
+        'dynamic_color_shift': visual.get('dynamicColorShift', 0),
+        'edge_enhance': visual.get('edgeEnhance', 0),
+        'dither': visual.get('dither', 0),
+        # I21-I25: Enhancement
+        'denoise': visual.get('denoise', 0),
+        'auto_levels': tonal.get('autoLevels', 0),
+        # I26-I30: Spatial advanced
+        'affine_shear': spatial.get('affineShear', 0),
+        'elastic_deform': spatial.get('elasticDeform', 0),
+        'border_inject': spatial.get('borderInject', 0),
+        # I16-I20: Anti-detection
+        'trace_removal': options.get('traceRemoval', 1),
+        'exif_injection': options.get('exifInjection', 0),
+        'device_profile': options.get('deviceProfile', 'none'),
+        'gps_injection': options.get('gpsInjection', 0),
+        'timestamp_injection': options.get('timestampInjection', 0),
+        '_variation_mult': config.get('_variation_mult', 0.3),
     })
 
     report_progress(0.3, "Applying transforms...")
@@ -247,7 +370,7 @@ def process_single_image(
 
     report_progress(0.8, "Saving...")
 
-    quality = int(params.get('quality', 92))
+    quality = int(params.get('quality', PHOTO_DEFAULTS['quality']))
     output_ext = os.path.splitext(output_path)[1].lower()
 
     if output_ext in ['.jpg', '.jpeg']:
@@ -257,6 +380,9 @@ def process_single_image(
     else:
         output_path = os.path.splitext(output_path)[0] + '.jpg'
         result_img.save(output_path, 'JPEG', quality=quality, optimize=True)
+
+    # I16-I20: Image anti-detection post-processing
+    apply_image_post_processing(result_img, output_path, params, py_rng)
 
     report_progress(1.0, "Complete")
 
@@ -317,6 +443,9 @@ def process_single_image_worker(args: Tuple) -> Dict[str, Any]:
             # Default to JPEG
             output_path = os.path.splitext(output_path)[0] + '.jpg'
             result_img.save(output_path, 'JPEG', quality=quality, optimize=True)
+
+        # I16-I20: Image anti-detection post-processing
+        apply_image_post_processing(result_img, output_path, params, py_rng)
 
         # Calculate pHash distance if available
         phash_distance = 0
@@ -410,6 +539,36 @@ def process_images_parallel(
         'double_compress': compression.get('doubleCompress', PHOTO_DEFAULTS['double_compress']),
         'flip': options.get('flip', PHOTO_DEFAULTS['flip']),
         'force_916': options.get('force916', PHOTO_DEFAULTS['force_916']),
+        # I1-I8: New color transforms
+        'hue_shift': tonal.get('hueShift', PHOTO_DEFAULTS['hue_shift']),
+        'color_balance': tonal.get('colorBalance', PHOTO_DEFAULTS['color_balance']),
+        'color_temperature': tonal.get('colorTemperature', PHOTO_DEFAULTS['color_temperature']),
+        'vibrance': tonal.get('vibrance', PHOTO_DEFAULTS['vibrance']),
+        'curves_preset': tonal.get('curvesPreset', PHOTO_DEFAULTS['curves_preset']),
+        'color_channel_mixer': tonal.get('colorChannelMixer', PHOTO_DEFAULTS['color_channel_mixer']),
+        'levels': tonal.get('levels', PHOTO_DEFAULTS['levels']),
+        'sharpness': visual.get('sharpness', PHOTO_DEFAULTS['sharpness']),
+        # I9-I15: New visual effects
+        'gradient_overlay': visual.get('gradientOverlay', PHOTO_DEFAULTS['gradient_overlay']),
+        'scanline': visual.get('scanline', PHOTO_DEFAULTS['scanline']),
+        'film_grain': visual.get('filmGrain', PHOTO_DEFAULTS['film_grain']),
+        'color_filter_preset': visual.get('colorFilterPreset', PHOTO_DEFAULTS['color_filter_preset']),
+        'dynamic_color_shift': visual.get('dynamicColorShift', PHOTO_DEFAULTS['dynamic_color_shift']),
+        'edge_enhance': visual.get('edgeEnhance', PHOTO_DEFAULTS['edge_enhance']),
+        'dither': visual.get('dither', PHOTO_DEFAULTS['dither']),
+        # I21-I25: Enhancement
+        'denoise': visual.get('denoise', PHOTO_DEFAULTS['denoise']),
+        'auto_levels': tonal.get('autoLevels', PHOTO_DEFAULTS['auto_levels']),
+        # I26-I30: Spatial advanced
+        'affine_shear': spatial.get('affineShear', PHOTO_DEFAULTS['affine_shear']),
+        'elastic_deform': spatial.get('elasticDeform', PHOTO_DEFAULTS['elastic_deform']),
+        'border_inject': spatial.get('borderInject', PHOTO_DEFAULTS['border_inject']),
+        # I16-I20: Anti-detection
+        'trace_removal': options.get('traceRemoval', PHOTO_DEFAULTS['trace_removal']),
+        'exif_injection': options.get('exifInjection', PHOTO_DEFAULTS['exif_injection']),
+        'device_profile': options.get('deviceProfile', PHOTO_DEFAULTS['device_profile']),
+        'gps_injection': options.get('gpsInjection', PHOTO_DEFAULTS['gps_injection']),
+        'timestamp_injection': options.get('timestampInjection', PHOTO_DEFAULTS['timestamp_injection']),
     })
 
     # Prepare work items with unique seeds
@@ -527,6 +686,9 @@ def process_batch_spoofer(
 
     report_progress(0.1, f"Generating {variations} variations...")
 
+    # Apply mode multipliers to config (scales all transforms by mode intensity)
+    config = apply_mode_to_config(config)
+
     # Flatten config for processing
     params = {}
 
@@ -569,6 +731,44 @@ def process_batch_spoofer(
     params['flip'] = options.get('flip', PHOTO_DEFAULTS['flip'])
     params['force_916'] = options.get('force916', PHOTO_DEFAULTS['force_916'])
     params['random_names'] = options.get('randomNames', 0)
+
+    # I1-I8: New color transforms
+    params['hue_shift'] = tonal.get('hueShift', PHOTO_DEFAULTS['hue_shift'])
+    params['color_balance'] = tonal.get('colorBalance', PHOTO_DEFAULTS['color_balance'])
+    params['color_temperature'] = tonal.get('colorTemperature', PHOTO_DEFAULTS['color_temperature'])
+    params['vibrance'] = tonal.get('vibrance', PHOTO_DEFAULTS['vibrance'])
+    params['curves_preset'] = tonal.get('curvesPreset', PHOTO_DEFAULTS['curves_preset'])
+    params['color_channel_mixer'] = tonal.get('colorChannelMixer', PHOTO_DEFAULTS['color_channel_mixer'])
+    params['levels'] = tonal.get('levels', PHOTO_DEFAULTS['levels'])
+    params['sharpness'] = visual.get('sharpness', PHOTO_DEFAULTS['sharpness'])
+
+    # I9-I15: New visual effects
+    params['gradient_overlay'] = visual.get('gradientOverlay', PHOTO_DEFAULTS['gradient_overlay'])
+    params['scanline'] = visual.get('scanline', PHOTO_DEFAULTS['scanline'])
+    params['film_grain'] = visual.get('filmGrain', PHOTO_DEFAULTS['film_grain'])
+    params['color_filter_preset'] = visual.get('colorFilterPreset', PHOTO_DEFAULTS['color_filter_preset'])
+    params['dynamic_color_shift'] = visual.get('dynamicColorShift', PHOTO_DEFAULTS['dynamic_color_shift'])
+    params['edge_enhance'] = visual.get('edgeEnhance', PHOTO_DEFAULTS['edge_enhance'])
+    params['dither'] = visual.get('dither', PHOTO_DEFAULTS['dither'])
+
+    # I21-I25: Enhancement
+    params['denoise'] = visual.get('denoise', PHOTO_DEFAULTS['denoise'])
+    params['auto_levels'] = tonal.get('autoLevels', PHOTO_DEFAULTS['auto_levels'])
+
+    # I26-I30: Spatial advanced
+    params['affine_shear'] = spatial.get('affineShear', PHOTO_DEFAULTS['affine_shear'])
+    params['elastic_deform'] = spatial.get('elasticDeform', PHOTO_DEFAULTS['elastic_deform'])
+    params['border_inject'] = spatial.get('borderInject', PHOTO_DEFAULTS['border_inject'])
+
+    # I16-I20: Anti-detection
+    params['trace_removal'] = options.get('traceRemoval', PHOTO_DEFAULTS['trace_removal'])
+    params['exif_injection'] = options.get('exifInjection', PHOTO_DEFAULTS['exif_injection'])
+    params['device_profile'] = options.get('deviceProfile', PHOTO_DEFAULTS['device_profile'])
+    params['gps_injection'] = options.get('gpsInjection', PHOTO_DEFAULTS['gps_injection'])
+    params['timestamp_injection'] = options.get('timestampInjection', PHOTO_DEFAULTS['timestamp_injection'])
+
+    # Store variation multiplier for per-copy randomization
+    params['_variation_mult'] = config.get('_variation_mult', 0.3)
 
     phash_min = options.get('phashMinDistance', PHASH_MIN_DISTANCE)
     verify_phash = options.get('verifyPhash', True)
@@ -649,11 +849,36 @@ def process_batch_spoofer(
                     clean_name = "".join([c for c in base_name if c.isalnum() or c in (' ', '-', '_')]).strip()[:20]
                     filename = f"{clean_name}_v{i}_{rand_id}.jpg"
 
-                # Save to ZIP
+                # Save to ZIP with encoding variation
                 img_buffer = io.BytesIO()
-                quality = int(params.get('quality', 90))
-                result_img.save(img_buffer, 'JPEG', quality=quality, optimize=True)
+                quality = int(params.get('quality', PHOTO_DEFAULTS['quality']))
+                # Vary JPEG encoding per copy for unique file fingerprint
+                save_rng = random.Random(seed + 7777)
+                jpeg_subsampling = save_rng.choice([0, 1, 2])  # 4:4:4, 4:2:2, 4:2:0
+                jpeg_progressive = save_rng.choice([True, False])
+                result_img.save(
+                    img_buffer, 'JPEG', quality=quality, optimize=True,
+                    subsampling=jpeg_subsampling, progressive=jpeg_progressive,
+                )
                 img_buffer.seek(0)
+
+                # I16-I20: Apply post-processing (EXIF injection, trace removal)
+                # For ZIP mode, we apply to a temp file then read back
+                post_params = params.copy()
+                if post_params.get('exif_injection') or post_params.get('gps_injection') or post_params.get('timestamp_injection'):
+                    import tempfile as _tmpmod
+                    tmp_path = os.path.join(_tmpmod.gettempdir(), f'spoofer_post_{i}.jpg')
+                    try:
+                        with open(tmp_path, 'wb') as tf:
+                            tf.write(img_buffer.getvalue())
+                        apply_image_post_processing(result_img, tmp_path, post_params, py_rng)
+                        with open(tmp_path, 'rb') as tf:
+                            img_buffer = io.BytesIO(tf.read())
+                    except Exception as pp_err:
+                        print(f"[WARN] Post-processing failed for variation {i}: {pp_err}")
+                    finally:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
 
                 zf.writestr(filename, img_buffer.getvalue())
                 results.append(filename)

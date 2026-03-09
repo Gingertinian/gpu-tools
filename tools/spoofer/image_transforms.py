@@ -509,6 +509,378 @@ def find_perspective_coeffs(src_coords, dst_coords):
     return res.tolist()
 
 
+# =============================================================================
+# NEW IMAGE TRANSFORMS (I1-I15, I21-I30)
+# =============================================================================
+
+def apply_hue_shift(img: Image.Image, strength: float, py_rng: random.Random) -> Image.Image:
+    """I1: Hue shift via HSV rotation."""
+    if strength <= 0:
+        return img
+    shift = py_rng.uniform(-strength, strength)
+    arr = np.array(img.convert('HSV'))
+    arr[:, :, 0] = (arr[:, :, 0].astype(np.int16) + int(shift * 255 / 360)) % 256
+    return Image.fromarray(arr, 'HSV').convert('RGB')
+
+
+def apply_color_balance(img: Image.Image, strength: float, py_rng: random.Random) -> Image.Image:
+    """I2: Color balance adjustment per shadow/mid/highlight ranges."""
+    if strength <= 0:
+        return img
+    arr = np.array(img, dtype=np.float32)
+    for ch in range(3):
+        shift = py_rng.uniform(-strength, strength) * 255
+        arr[:, :, ch] = np.clip(arr[:, :, ch] + shift, 0, 255)
+    return Image.fromarray(arr.astype(np.uint8))
+
+
+def apply_color_temperature(img: Image.Image, strength: float, py_rng: random.Random) -> Image.Image:
+    """I3: Color temperature shift (warm/cool)."""
+    if strength <= 0:
+        return img
+    temp_shift = py_rng.uniform(-strength, strength) / 500.0
+    arr = np.array(img, dtype=np.float32)
+    arr[:, :, 0] = np.clip(arr[:, :, 0] + temp_shift * 30, 0, 255)  # Red
+    arr[:, :, 2] = np.clip(arr[:, :, 2] - temp_shift * 30, 0, 255)  # Blue
+    return Image.fromarray(arr.astype(np.uint8))
+
+
+def apply_vibrance(img: Image.Image, strength: float, py_rng: random.Random) -> Image.Image:
+    """I4: Selective saturation boost (more on unsaturated areas)."""
+    if strength <= 0:
+        return img
+    amount = py_rng.uniform(0, strength)
+    hsv = np.array(img.convert('HSV'), dtype=np.float32)
+    s = hsv[:, :, 1]
+    # Boost low-saturation pixels more than high-saturation ones
+    boost = amount * (1.0 - s / 255.0)
+    hsv[:, :, 1] = np.clip(s + boost * 50, 0, 255)
+    return Image.fromarray(hsv.astype(np.uint8), 'HSV').convert('RGB')
+
+
+def apply_curves_preset(img: Image.Image, preset: str, py_rng: random.Random) -> Image.Image:
+    """I5: Pre-defined tone curve presets (matches FFmpeg curves presets for images)."""
+    if preset == 'none' or not preset:
+        return img
+    arr = np.array(img, dtype=np.float32)
+    if preset == 'lighter':
+        arr = np.clip(arr * 1.05 + 5, 0, 255)
+    elif preset == 'darker':
+        arr = np.clip(arr * 0.92 - 3, 0, 255)
+    elif preset == 'vintage':
+        arr[:, :, 0] = np.clip(arr[:, :, 0] * 1.03 + 3, 0, 255)
+        arr[:, :, 1] = np.clip(arr[:, :, 1] * 0.98, 0, 255)
+        arr[:, :, 2] = np.clip(arr[:, :, 2] * 0.95, 0, 255)
+    elif preset == 'cinema' or preset == 'cross_process':
+        arr[:, :, 0] = np.clip(arr[:, :, 0] * 0.97, 0, 255)
+        arr[:, :, 1] = np.clip(arr[:, :, 1] * 1.02, 0, 255)
+        arr[:, :, 2] = np.clip(arr[:, :, 2] * 1.05, 0, 255)
+    elif preset == 'increase_contrast' or preset == 'strong_contrast':
+        mean = arr.mean()
+        factor = 1.15 if preset == 'strong_contrast' else 1.08
+        arr = np.clip((arr - mean) * factor + mean, 0, 255)
+    elif preset == 'medium_contrast' or preset == 'linear_contrast':
+        mean = arr.mean()
+        arr = np.clip((arr - mean) * 1.04 + mean, 0, 255)
+    elif preset == 'negative' or preset == 'color_negative':
+        arr = 255.0 - arr
+        if preset == 'color_negative':
+            # Slightly shift channels for color negative effect
+            arr[:, :, 0] = np.clip(arr[:, :, 0] * 0.95, 0, 255)
+            arr[:, :, 2] = np.clip(arr[:, :, 2] * 1.05, 0, 255)
+    return Image.fromarray(arr.astype(np.uint8))
+
+
+def apply_color_channel_mixer(img: Image.Image, strength: float, py_rng: random.Random) -> Image.Image:
+    """I6: Cross-channel blending matrix."""
+    if strength <= 0:
+        return img
+    arr = np.array(img, dtype=np.float32)
+    r, g, b = arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]
+    mix = py_rng.uniform(0, strength)
+    arr[:, :, 0] = np.clip(r * (1 - mix) + g * mix * 0.5, 0, 255)
+    arr[:, :, 1] = np.clip(g * (1 - mix) + b * mix * 0.5, 0, 255)
+    arr[:, :, 2] = np.clip(b * (1 - mix) + r * mix * 0.5, 0, 255)
+    return Image.fromarray(arr.astype(np.uint8))
+
+
+def apply_levels_adjustment(img: Image.Image, strength: float, py_rng: random.Random) -> Image.Image:
+    """I7: Input/output level clipping per channel."""
+    if strength <= 0:
+        return img
+    clip = int(py_rng.uniform(0, strength))
+    if clip <= 0:
+        return img
+    arr = np.array(img, dtype=np.float32)
+    arr = np.clip((arr - clip) * (255.0 / (255.0 - 2 * clip)), 0, 255)
+    return Image.fromarray(arr.astype(np.uint8))
+
+
+def apply_sharpness(img: Image.Image, strength: float, py_rng: random.Random) -> Image.Image:
+    """I8: Unsharp mask sharpening."""
+    if strength <= 0:
+        return img
+    amount = py_rng.uniform(0.5, 1.0 + strength)
+    return img.filter(ImageFilter.UnsharpMask(radius=2, percent=int(amount * 100), threshold=3))
+
+
+def apply_gradient_overlay(img: Image.Image, strength: float, py_rng: random.Random) -> Image.Image:
+    """I9: Semi-transparent gradient overlay."""
+    if strength <= 0:
+        return img
+    w, h = img.size
+    arr = np.array(img, dtype=np.float32)
+    # Create diagonal gradient
+    gradient = np.zeros((h, w), dtype=np.float32)
+    for y in range(h):
+        for x in range(w):
+            gradient[y, x] = (x / w + y / h) / 2.0
+    # Apply as subtle brightness modulation
+    mod = 1.0 + (gradient - 0.5) * strength * 2
+    for ch in range(3):
+        arr[:, :, ch] = np.clip(arr[:, :, ch] * mod, 0, 255)
+    return Image.fromarray(arr.astype(np.uint8))
+
+
+def apply_scanline_pattern(img: Image.Image, strength: float, py_rng: random.Random) -> Image.Image:
+    """I10: Sine-wave brightness modulation per row."""
+    if strength <= 0:
+        return img
+    arr = np.array(img, dtype=np.float32)
+    h = arr.shape[0]
+    for y in range(h):
+        mod = 1.0 + strength * math.sin(y * math.pi)
+        arr[y, :, :] = np.clip(arr[y, :, :] * mod, 0, 255)
+    return Image.fromarray(arr.astype(np.uint8))
+
+
+def apply_film_grain(img: Image.Image, strength: float, py_rng: random.Random, rng: np.random.Generator = None) -> Image.Image:
+    """I11: Procedural film grain overlay."""
+    if strength <= 0:
+        return img
+    arr = np.array(img, dtype=np.float32)
+    if rng is None:
+        rng = np.random.default_rng(py_rng.randint(0, 2**31))
+    grain = rng.normal(0, strength * 3, arr.shape).astype(np.float32)
+    arr = np.clip(arr + grain, 0, 255)
+    return Image.fromarray(arr.astype(np.uint8))
+
+
+def apply_color_filter_preset(img: Image.Image, preset: str, py_rng: random.Random) -> Image.Image:
+    """I12: Named color filter application (warm/cool/vintage/cinema)."""
+    if preset == 'none' or not preset:
+        return img
+    arr = np.array(img, dtype=np.float32)
+    if preset == 'warm':
+        arr[:, :, 0] = np.clip(arr[:, :, 0] * 1.04, 0, 255)
+        arr[:, :, 2] = np.clip(arr[:, :, 2] * 0.96, 0, 255)
+    elif preset == 'cool':
+        arr[:, :, 0] = np.clip(arr[:, :, 0] * 0.96, 0, 255)
+        arr[:, :, 2] = np.clip(arr[:, :, 2] * 1.04, 0, 255)
+    elif preset == 'vintage':
+        arr[:, :, 0] = np.clip(arr[:, :, 0] * 1.02 + 3, 0, 255)
+        arr[:, :, 1] = np.clip(arr[:, :, 1] * 0.98, 0, 255)
+        arr[:, :, 2] = np.clip(arr[:, :, 2] * 0.94, 0, 255)
+    elif preset == 'cinema':
+        # Teal/orange cinematic look: boost blue shadows, warm highlights
+        arr[:, :, 0] = np.clip(arr[:, :, 0] * 1.03, 0, 255)  # Slight red boost
+        arr[:, :, 1] = np.clip(arr[:, :, 1] * 0.98, 0, 255)  # Slight green reduction
+        arr[:, :, 2] = np.clip(arr[:, :, 2] * 1.05, 0, 255)  # Blue boost
+        # Increase contrast slightly for cinematic feel
+        mean = arr.mean()
+        arr = np.clip((arr - mean) * 1.05 + mean, 0, 255)
+    return Image.fromarray(arr.astype(np.uint8))
+
+
+def apply_dynamic_color_shift(img: Image.Image, strength: float, py_rng: random.Random) -> Image.Image:
+    """I13: Per-region hue variation."""
+    if strength <= 0:
+        return img
+    arr = np.array(img.convert('HSV'), dtype=np.float32)
+    h_img, w_img = arr.shape[:2]
+    block_h = max(1, h_img // 4)
+    block_w = max(1, w_img // 4)
+    for by in range(0, h_img, block_h):
+        for bx in range(0, w_img, block_w):
+            shift = py_rng.uniform(-strength, strength) * 255 / 360
+            arr[by:by+block_h, bx:bx+block_w, 0] = (arr[by:by+block_h, bx:bx+block_w, 0] + shift) % 256
+    return Image.fromarray(arr.astype(np.uint8), 'HSV').convert('RGB')
+
+
+def apply_edge_enhancement(img: Image.Image, strength: float, py_rng: random.Random) -> Image.Image:
+    """I14: Subtle edge detect blend at low opacity."""
+    if strength <= 0:
+        return img
+    edges = img.filter(ImageFilter.FIND_EDGES)
+    return Image.blend(img, edges, strength)
+
+
+def apply_dither_pattern(img: Image.Image, strength: float, py_rng: random.Random, rng: np.random.Generator = None) -> Image.Image:
+    """I15: Ordered dither at sub-perceptual level."""
+    if strength <= 0:
+        return img
+    arr = np.array(img, dtype=np.float32)
+    if rng is None:
+        rng = np.random.default_rng(py_rng.randint(0, 2**31))
+    # Add very subtle dither noise
+    dither = rng.integers(-int(strength), int(strength) + 1, size=arr.shape, dtype=np.int8).astype(np.float32)
+    arr = np.clip(arr + dither, 0, 255)
+    return Image.fromarray(arr.astype(np.uint8))
+
+
+# --- I21-I30: Enhancement, Quality, Spatial Advanced ---
+
+def apply_denoise(img: Image.Image, strength: float, py_rng: random.Random) -> Image.Image:
+    """I22: Light denoising via median filter."""
+    if strength <= 0:
+        return img
+    size = 3  # PIL median filter only supports size 3
+    return img.filter(ImageFilter.MedianFilter(size=size))
+
+
+def apply_auto_levels(img: Image.Image, strength: float, py_rng: random.Random) -> Image.Image:
+    """I23: Histogram stretching per channel."""
+    if strength <= 0:
+        return img
+    clip_pct = strength / 100.0
+    arr = np.array(img, dtype=np.float32)
+    for ch in range(3):
+        channel = arr[:, :, ch]
+        lo = np.percentile(channel, clip_pct * 100)
+        hi = np.percentile(channel, 100 - clip_pct * 100)
+        if hi - lo > 1:
+            arr[:, :, ch] = np.clip((channel - lo) * 255.0 / (hi - lo), 0, 255)
+    return Image.fromarray(arr.astype(np.uint8))
+
+
+def apply_affine_shear(img: Image.Image, strength: float, py_rng: random.Random) -> Image.Image:
+    """I27: Slight horizontal/vertical shear."""
+    if strength <= 0:
+        return img
+    shear = py_rng.uniform(-strength, strength) * math.pi / 180.0
+    w, h = img.size
+    # Affine transform coefficients for horizontal shear
+    coeffs = (1, shear, -shear * h / 2, 0, 1, 0)
+    return img.transform((w, h), Image.AFFINE, coeffs, resample=Image.BICUBIC)
+
+
+def apply_elastic_deformation(img: Image.Image, strength: float, py_rng: random.Random, rng: np.random.Generator = None) -> Image.Image:
+    """I28: Small random displacement field."""
+    if strength <= 0:
+        return img
+    arr = np.array(img)
+    h, w = arr.shape[:2]
+    if rng is None:
+        rng = np.random.default_rng(py_rng.randint(0, 2**31))
+    # Small random displacement
+    dx = rng.normal(0, strength, (h, w)).astype(np.float32)
+    dy = rng.normal(0, strength, (h, w)).astype(np.float32)
+    # Smooth displacement field
+    from PIL import ImageFilter as IF
+    dx_img = Image.fromarray((dx * 10 + 128).clip(0, 255).astype(np.uint8))
+    dy_img = Image.fromarray((dy * 10 + 128).clip(0, 255).astype(np.uint8))
+    dx = (np.array(dx_img.filter(IF.GaussianBlur(radius=5)), dtype=np.float32) - 128) / 10
+    dy = (np.array(dy_img.filter(IF.GaussianBlur(radius=5)), dtype=np.float32) - 128) / 10
+
+    # Apply displacement
+    coords_y, coords_x = np.mgrid[0:h, 0:w]
+    map_x = np.clip(coords_x + dx, 0, w - 1).astype(np.int32)
+    map_y = np.clip(coords_y + dy, 0, h - 1).astype(np.int32)
+    result = arr[map_y, map_x]
+    return Image.fromarray(result)
+
+
+def apply_border_inject(img: Image.Image, strength: float, py_rng: random.Random) -> Image.Image:
+    """I30: 1-3px colored border injection."""
+    if strength <= 0:
+        return img
+    border_px = py_rng.randint(1, max(1, int(strength)))
+    color = (py_rng.randint(0, 255), py_rng.randint(0, 255), py_rng.randint(0, 255))
+    w, h = img.size
+    new_w = w + 2 * border_px
+    new_h = h + 2 * border_px
+    bordered = Image.new('RGB', (new_w, new_h), color)
+    bordered.paste(img, (border_px, border_px))
+    return bordered
+
+
+def apply_image_post_processing(img: Image.Image, output_path: str, params: Dict, py_rng: random.Random) -> None:
+    """
+    I16-I20: Image metadata anti-detection post-processing.
+    Applies EXIF injection, GPS injection, timestamp injection, trace removal.
+    Called after image is saved.
+    """
+    try:
+        import struct
+
+        trace_removal = int(params.get('trace_removal', 1) or 0)
+        exif_injection = int(params.get('exif_injection', 0) or 0)
+        device_profile = str(params.get('device_profile', 'none') or 'none')
+        gps_injection = int(params.get('gps_injection', 0) or 0)
+        timestamp_injection = int(params.get('timestamp_injection', 0) or 0)
+
+        if not any([trace_removal, exif_injection, gps_injection, timestamp_injection]):
+            return
+
+        # Try to use piexif for EXIF manipulation
+        try:
+            import piexif
+
+            if trace_removal:
+                # Strip all EXIF data first
+                piexif.remove(output_path)
+
+            if exif_injection or gps_injection or timestamp_injection:
+                exif_dict = {'0th': {}, 'Exif': {}, 'GPS': {}, '1st': {}}
+
+                if device_profile != 'none':
+                    from .constants import DEVICE_PROFILES
+                    profile = DEVICE_PROFILES.get(device_profile, {})
+                    if profile:
+                        exif_dict['0th'][piexif.ImageIFD.Make] = profile['make'].encode()
+                        exif_dict['0th'][piexif.ImageIFD.Model] = profile['model'].encode()
+                        exif_dict['0th'][piexif.ImageIFD.Software] = profile['software'].encode()
+
+                if gps_injection:
+                    lat = py_rng.uniform(25.0, 48.0)  # Continental US range
+                    lon = py_rng.uniform(-125.0, -70.0)
+                    # Convert to degrees/minutes/seconds
+                    lat_d = int(lat)
+                    lat_m = int((lat - lat_d) * 60)
+                    lat_s = int(((lat - lat_d) * 60 - lat_m) * 60 * 100)
+                    lon_d = int(abs(lon))
+                    lon_m = int((abs(lon) - lon_d) * 60)
+                    lon_s = int(((abs(lon) - lon_d) * 60 - lon_m) * 60 * 100)
+                    exif_dict['GPS'][piexif.GPSIFD.GPSLatitude] = ((lat_d, 1), (lat_m, 1), (lat_s, 100))
+                    exif_dict['GPS'][piexif.GPSIFD.GPSLatitudeRef] = b'N'
+                    exif_dict['GPS'][piexif.GPSIFD.GPSLongitude] = ((lon_d, 1), (lon_m, 1), (lon_s, 100))
+                    exif_dict['GPS'][piexif.GPSIFD.GPSLongitudeRef] = b'W'
+
+                if timestamp_injection:
+                    import datetime
+                    days_back = py_rng.randint(1, 30)
+                    dt = datetime.datetime.now() - datetime.timedelta(days=days_back)
+                    ts = dt.strftime('%Y:%m:%d %H:%M:%S')
+                    exif_dict['0th'][piexif.ImageIFD.DateTime] = ts.encode()
+                    exif_dict['Exif'][piexif.ExifIFD.DateTimeOriginal] = ts.encode()
+
+                exif_bytes = piexif.dump(exif_dict)
+                piexif.insert(exif_bytes, output_path)
+
+        except ImportError:
+            # piexif not available - just strip metadata by re-saving
+            if trace_removal:
+                clean_img = Image.open(output_path)
+                clean_data = clean_img.getdata()
+                clean_copy = Image.new(clean_img.mode, clean_img.size)
+                clean_copy.putdata(list(clean_data))
+                clean_copy.save(output_path, quality=95)
+
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"[Image Post-Processing] Error: {e}")
+
+
 def pad_to_9_16_photo(img: Image.Image, py_rng: random.Random) -> Image.Image:
     """Force 9:16 aspect ratio with blurred background."""
     w, h = img.size

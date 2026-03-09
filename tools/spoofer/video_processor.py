@@ -469,6 +469,573 @@ def _start_spoofer_ffmpeg(
 
 
 # =============================================================================
+# VIDEO FILTER CHAIN BUILDERS (V1-V15 + existing filters)
+# =============================================================================
+
+def build_video_filters(config: dict, py_rng: random.Random, width: int, height: int, allow_border: bool = True) -> list:
+    """
+    Build FFmpeg video filter chain from config.
+    Returns list of filter strings to be joined with ','.
+
+    Supports all V1-V15 restored features plus existing filters:
+    - Crop (asymmetric), Rotation (with zoom compensation)
+    - Brightness, Contrast, Saturation, Gamma (eq filter)
+    - Noise, Vignette, Speed variation
+    - V1: Hue Shift, V2: Sharpness, V3: Gaussian Blur
+    - V4: Chromatic Aberration, V5: Center Shift, V6: ZoomPan
+    - V7: Border/Padding, V8: Frame Jitter, V13: Horizontal Flip
+    - V14: Micro Rescale
+    """
+    filters = []
+    video_cfg = config.get('video', {})
+
+    # --- SPATIAL FILTERS ---
+
+    # V4: Chromatic Aberration (rgbashift) - early in chain
+    chromatic = float(video_cfg.get('chromatic', 0) or 0)
+    if chromatic >= 0.8:
+        shift = py_rng.randint(1, int(chromatic) + 1)
+        filters.append(f"rgbashift=rh={shift}:bh={-shift}")
+
+    # Crop (asymmetric for more hash variation)
+    crop = float(video_cfg.get('crop', 0) or 0)
+    if crop > 0:
+        left = py_rng.uniform(0, crop / 200.0)
+        right = py_rng.uniform(0, crop / 200.0)
+        top = py_rng.uniform(0, crop / 200.0)
+        bottom = py_rng.uniform(0, crop / 200.0)
+        filters.append(f"crop=iw*{1-left-right:.4f}:ih*{1-top-bottom:.4f}:iw*{left:.4f}:ih*{top:.4f}")
+
+    # Rotation (existing, with zoom compensation)
+    rotation = float(video_cfg.get('rotation', 0) or 0)
+    if rotation > 0:
+        angle_deg = py_rng.uniform(-rotation, rotation)
+        angle_rad = angle_deg * math.pi / 180
+        abs_angle = abs(angle_rad)
+        cos_a = math.cos(abs_angle)
+        sin_a = math.sin(abs_angle)
+        if sin_a > 0.001:
+            zoom_w = cos_a + sin_a * (height / width)
+            zoom_h = cos_a + sin_a * (width / height)
+            zoom_factor = max(zoom_w, zoom_h)
+            zoom_factor = max(1.0, min(zoom_factor, 2.0))
+            scaled_w = int(width * zoom_factor)
+            scaled_h = int(height * zoom_factor)
+            scaled_w += scaled_w % 2
+            scaled_h += scaled_h % 2
+            filters.append(f"scale={scaled_w}:{scaled_h}:flags=lanczos")
+            filters.append(f"rotate={angle_rad}:fillcolor=black")
+            filters.append(f"crop={width}:{height}")
+
+    # V5: Center Shift (pad+crop translation)
+    center_shift = float(video_cfg.get('centerShift', 0) or 0)
+    if center_shift > 0:
+        sx = py_rng.uniform(-center_shift, center_shift) / 100.0
+        sy = py_rng.uniform(-center_shift, center_shift) / 100.0
+        pad_x = abs(sx) * 2
+        pad_y = abs(sy) * 2
+        crop_x_off = pad_x + sx
+        crop_y_off = pad_y + sy
+        filters.append(f"pad=iw+iw*{pad_x:.4f}:ih+ih*{pad_y:.4f}:iw*{pad_x/2:.4f}:ih*{pad_y/2:.4f}:color=black@0")
+        filters.append(f"crop=iw:ih:iw*{crop_x_off/2:.4f}:ih*{crop_y_off/2:.4f}")
+
+    # V6: ZoomPan (scale+crop with offset)
+    zoompan = float(video_cfg.get('zoompan', 0) or 0)
+    if zoompan > 0:
+        zoom = 1.0 + py_rng.uniform(0.01, zoompan / 100.0 + 0.01)
+        dx = py_rng.uniform(-0.02, 0.02)
+        dy = py_rng.uniform(-0.02, 0.02)
+        filters.append(f"scale=iw*{zoom:.4f}:ih*{zoom:.4f}")
+        filters.append(f"crop=iw:ih:iw*{(zoom-1)/2 + dx:.4f}:ih*{(zoom-1)/2 + dy:.4f}")
+
+    # V14: Micro Rescale (down/up to shift DCT grid)
+    micro_rescale = float(video_cfg.get('microRescale', 0) or 0)
+    if micro_rescale > 0:
+        factor = 1.0 - micro_rescale / 100.0
+        filters.append(f"scale=iw*{factor:.4f}:ih*{factor:.4f}")
+        filters.append(f"scale=iw/{factor:.4f}:ih/{factor:.4f}")
+
+    # V13: Horizontal Flip (50% chance)
+    flip = int(video_cfg.get('flip', 0) or 0)
+    if flip and py_rng.random() > 0.5:
+        filters.append("hflip")
+
+    # --- TONAL FILTERS ---
+
+    # EQ filter (brightness, contrast, saturation, gamma)
+    eq_params = []
+    brightness = float(video_cfg.get('brightness', 0) or 0)
+    if brightness > 0:
+        b = py_rng.uniform(-brightness, brightness) * 0.4
+        eq_params.append(f"brightness={b:.3f}")
+    contrast = float(video_cfg.get('contrast', 0) or 0)
+    if contrast > 0:
+        c = 1 + py_rng.uniform(-contrast, contrast)
+        eq_params.append(f"contrast={c:.3f}")
+    saturation = float(video_cfg.get('saturation', 0) or 0)
+    if saturation > 0:
+        s = 1 + py_rng.uniform(-saturation, saturation)
+        eq_params.append(f"saturation={s:.3f}")
+    gamma = float(video_cfg.get('gamma', 0) or 0)
+    if gamma > 0:
+        g = 1 + py_rng.uniform(-gamma, gamma)
+        eq_params.append(f"gamma={g:.3f}")
+    if eq_params:
+        filters.append(f"eq={':'.join(eq_params)}")
+
+    # V1: Hue Shift
+    hue_shift = float(video_cfg.get('hueShift', 0) or 0)
+    if hue_shift > 0:
+        hue_rad = py_rng.uniform(-hue_shift, hue_shift) * (math.pi / 180.0)
+        filters.append(f"hue=h={hue_rad:.4f}")
+
+    # --- VISUAL FILTERS ---
+
+    # V2: Sharpness/Unsharp Mask
+    sharpness = float(video_cfg.get('sharpness', 0) or 0)
+    if sharpness > 0:
+        luma = min(1.5, 0.5 + sharpness / 6.0)
+        filters.append(f"unsharp=5:5:{luma:.2f}:5:5:0.0")
+
+    # V3: Gaussian Blur
+    blur_sigma = float(video_cfg.get('blurSigma', 0) or 0)
+    if blur_sigma > 0:
+        filters.append(f"gblur=sigma={blur_sigma:.2f}")
+
+    # Noise (existing)
+    noise = float(video_cfg.get('noise', 0) or 0)
+    if noise > 0:
+        filters.append(f"noise=alls={int(noise * 2)}:allf=t+u")
+
+    # Vignette (existing)
+    vignette = float(video_cfg.get('vignette', 0) or 0)
+    if vignette > 0:
+        filters.append(f"vignette=PI/{py_rng.randint(4, 6)}")
+
+    # V16: Color Balance
+    color_balance = float(video_cfg.get('colorBalance', 0) or 0)
+    if color_balance > 0:
+        rs = py_rng.uniform(-color_balance, color_balance)
+        gm = py_rng.uniform(-color_balance, color_balance)
+        bh = py_rng.uniform(-color_balance, color_balance)
+        filters.append(f"colorbalance=rs={rs:.4f}:gm={gm:.4f}:bh={bh:.4f}")
+
+    # V17: Color Channel Mixer
+    color_mixer = float(video_cfg.get('colorChannelMixer', 0) or 0)
+    if color_mixer > 0:
+        rr = 1.0 + py_rng.uniform(-color_mixer, color_mixer)
+        gg = 1.0 + py_rng.uniform(-color_mixer, color_mixer)
+        bb = 1.0 + py_rng.uniform(-color_mixer, color_mixer)
+        filters.append(f"colorchannelmixer=rr={rr:.4f}:gg={gg:.4f}:bb={bb:.4f}")
+
+    # V18: Vibrance
+    vibrance = float(video_cfg.get('vibrance', 0) or 0)
+    if vibrance > 0:
+        v = py_rng.uniform(0, vibrance)
+        filters.append(f"vibrance=intensity={v:.3f}")
+
+    # V19: Color Temperature
+    color_temp = float(video_cfg.get('colorTemperature', 0) or 0)
+    if color_temp > 0:
+        temp = 6500 + py_rng.uniform(-color_temp, color_temp)
+        filters.append(f"colortemperature=temperature={temp:.0f}")
+
+    # V20: Color Levels
+    color_levels = float(video_cfg.get('colorLevels', 0) or 0)
+    if color_levels > 0:
+        rimin = py_rng.uniform(0, color_levels)
+        rimax = 1.0 - py_rng.uniform(0, color_levels)
+        filters.append(f"colorlevels=rimin={rimin:.4f}:rimax={rimax:.4f}")
+
+    # V21: Curves Presets
+    curves_preset = str(video_cfg.get('curvesPreset', 'none') or 'none')
+    if curves_preset != 'none':
+        filters.append(f"curves=preset={curves_preset}")
+
+    # V22: Dynamic Hue Shift (time-varying)
+    dynamic_hue = float(video_cfg.get('dynamicHue', 0) or 0)
+    if dynamic_hue > 0:
+        speed = py_rng.uniform(0.5, 2.0)
+        amp = dynamic_hue * (math.pi / 180.0)
+        filters.append(f"hue=h=sin(t*{speed:.2f})*{amp:.4f}")
+
+    # V23: Film Grain (via noise with temporal variation)
+    film_grain = float(video_cfg.get('filmGrain', 0) or 0)
+    if film_grain > 0:
+        grain_amt = int(film_grain * 2)
+        filters.append(f"noise=alls={grain_amt}:allf=t+u:all_seed={py_rng.randint(0, 9999)}")
+
+    # V24: Scanline Effect
+    scanline = float(video_cfg.get('scanline', 0) or 0)
+    if scanline > 0:
+        filters.append(f"geq=lum='clip(lum(X,Y)*(0.98+{scanline:.4f}*sin(Y*3.14159)),0,255)':cb='cb(X,Y)':cr='cr(X,Y)'")
+
+    # V25: Gradient Overlay (subtle vignette-like color wash)
+    gradient_overlay = float(video_cfg.get('gradientOverlay', 0) or 0)
+    if gradient_overlay > 0:
+        # Use a subtle color tint via colorbalance as a gradient approximation
+        tint_r = py_rng.uniform(-gradient_overlay, gradient_overlay)
+        tint_b = py_rng.uniform(-gradient_overlay, gradient_overlay)
+        filters.append(f"colorbalance=rh={tint_r:.4f}:bh={tint_b:.4f}")
+
+    # V7: Border/Padding
+    border = float(video_cfg.get('border', 0) or 0)
+    if allow_border and border > 0:
+        b = py_rng.randint(2, int(border) + 2)
+        c = "0x{:06x}".format(py_rng.randint(0, 0xFFFFFF))
+        filters.append(f"pad=iw+{2*b}:ih+{2*b}:{b}:{b}:color={c}")
+
+    # V8: Frame Jitter (PTS manipulation)
+    frame_jitter = float(video_cfg.get('frameJitter', 0) or 0)
+    if frame_jitter > 0:
+        pts_mult = py_rng.uniform(1 - frame_jitter / 100, 1 + frame_jitter / 100)
+        filters.append(f"setpts={pts_mult:.5f}*PTS")
+
+    # Speed variation (existing)
+    speed_var = float(video_cfg.get('speedVariation', 0) or 0)
+    if speed_var > 0:
+        speed = 1 + py_rng.uniform(-speed_var / 100, speed_var / 100)
+        speed = max(0.9, min(1.1, speed))
+        filters.append(f"setpts={1/speed}*PTS")
+
+    return filters
+
+
+def build_video_filter_complex(config: dict, py_rng: random.Random, width: int, height: int) -> tuple:
+    """
+    Build complete FFmpeg filter_complex graph.
+    Handles V9 (time stretch), V10 (frame drop/dup), V15 (9:16 split),
+    V26-V29 (frame trimming/adding).
+
+    Returns: (filter_string, output_label, needs_filter_complex)
+    - If needs_filter_complex is False: filter_string is a simple comma-separated
+      chain for -vf, output_label is None
+    - If needs_filter_complex is True: filter_string is a full filter_complex graph
+      for -filter_complex, output_label is the output stream label (e.g. "[yuv_out]")
+    """
+    video_cfg = config.get('video', {})
+
+    force_916 = int(video_cfg.get('force916', 0) or 0)
+    frame_drop_dup = float(video_cfg.get('frameDropDup', 0) or 0)
+    time_stretch = float(video_cfg.get('timeStretch', 0) or 0)
+    trim_start = int(video_cfg.get('trimStartFrames', 0) or 0)
+    trim_end = int(video_cfg.get('trimEndFrames', 0) or 0)
+
+    # If no complex graph features needed, return simple filter chain
+    if not force_916 and frame_drop_dup <= 0 and time_stretch <= 0 and trim_start <= 0 and trim_end <= 0:
+        video_filters = build_video_filters(config, py_rng, width, height)
+        filter_str = ','.join(video_filters) if video_filters else None
+        return filter_str, None, False
+
+    # Need filter_complex graph
+    segments = []
+    last_label = "[0:v]"
+
+    # V28: Trim Start (remove N frames from beginning)
+    if trim_start > 0:
+        segments.append(f"{last_label}trim=start_frame={trim_start},setpts=PTS-STARTPTS[trimS]")
+        last_label = "[trimS]"
+
+    # V29: Trim End (remove N frames from end)
+    # NOTE: FFmpeg trim filter doesn't support expressions for end_frame.
+    # We use reverse+trim+reverse as a workaround to trim from the end.
+    if trim_end > 0:
+        segments.append(f"{last_label}reverse[rev]")
+        segments.append(f"[rev]trim=start_frame={trim_end},setpts=PTS-STARTPTS[trimRev]")
+        segments.append(f"[trimRev]reverse[trimE]")
+        last_label = "[trimE]"
+
+    # V10: Frame Drop/Dup (randomly drop or duplicate frames via fps filter)
+    if frame_drop_dup > 0:
+        drop_rate = min(0.15, frame_drop_dup / 100.0)
+        if py_rng.random() < 0.5:
+            fps_factor = 1.0 - drop_rate
+        else:
+            fps_factor = 1.0 + drop_rate
+        segments.append(f"{last_label}fps={30 * fps_factor:.2f}[fd]")
+        last_label = "[fd]"
+
+    # V9: Time Stretch (duration variation)
+    if time_stretch > 0:
+        stretch = 1.0 + py_rng.uniform(-time_stretch / 100, time_stretch / 100)
+        segments.append(f"{last_label}setpts={stretch:.5f}*PTS[ts]")
+        last_label = "[ts]"
+
+    if not force_916:
+        # Apply regular video filters
+        video_filters = build_video_filters(config, py_rng, width, height)
+        if video_filters:
+            segments.append(f"{last_label}{','.join(video_filters)}[vf]")
+            last_label = "[vf]"
+        segments.append(f"{last_label}format=yuv420p[yuv_out]")
+        return ";".join(segments), "[yuv_out]", True
+
+    # V15: 9:16 Full Background Split mode
+    segments.append(f"{last_label}split=2[fg_in][bg_src]")
+
+    fg_y_shift = py_rng.uniform(-0.10, 0.10)
+    bg_flip = "hflip," if py_rng.random() > 0.5 else ""
+    bg_blur = py_rng.uniform(2.5, 5.5)
+    bg_bright = py_rng.uniform(-0.40, 0.05)
+    bg_sat = py_rng.uniform(0.85, 1.6)
+    bg_hue = py_rng.uniform(-18, 18)
+    bg_tilt = py_rng.uniform(-5, 5) * (math.pi / 180.0)
+    overscan = 1.32
+
+    # Foreground: apply all video transforms + scale to 9:16
+    fg_filters_list = build_video_filters(config, py_rng, width, height, allow_border=False)
+    fg_filters = []
+    if fg_filters_list:
+        fg_filters.append(",".join(fg_filters_list))
+    fg_scale = py_rng.uniform(0.88, 0.93)
+    fg_filters.append("scale=1080:1920:force_original_aspect_ratio=decrease")
+    fg_filters.append(f"scale=iw*{fg_scale:.2f}:ih*{fg_scale:.2f}")
+    fg_filters.append("setsar=1")
+    segments.append("[fg_in]" + ",".join(fg_filters) + "[fg]")
+
+    # Background: downscale, blur, color shift, upscale, rotate, crop
+    bg_filters = []
+    tiny_w, tiny_h = int(54 * overscan), int(96 * overscan)
+    bg_filters.append(f"{bg_flip}scale={tiny_w}:{tiny_h}:force_original_aspect_ratio=increase")
+    bg_filters.append(f"crop={tiny_w}:{tiny_h}")
+    bg_filters.append(f"gblur=sigma={bg_blur:.2f}")
+    bg_filters.append(f"eq=brightness={bg_bright:.2f}:saturation={bg_sat:.2f}")
+    bg_filters.append(f"hue=h={bg_hue:.2f}")
+    giant_w, giant_h = int(1080 * overscan), int(1920 * overscan)
+    bg_filters.append(f"scale={giant_w}:{giant_h}:flags=bicubic")
+    bg_filters.append(f"rotate={bg_tilt:.4f}:fillcolor=black@0")
+    bg_filters.append("crop=1080:1920:(iw-ow)/2:(ih-oh)/2")
+    bg_filters.append("setsar=1")
+    segments.append("[bg_src]" + ",".join(bg_filters) + "[bg]")
+
+    # Overlay foreground on background
+    segments.append(f"[bg][fg]overlay=(W-w)/2:((H-h)/2)+(H*{fg_y_shift:.3f})[final]")
+    segments.append("[final]format=yuv420p[yuv_out]")
+
+    return ";".join(segments), "[yuv_out]", True
+
+
+def build_audio_filters(config: dict, py_rng: random.Random) -> Optional[str]:
+    """
+    Build audio filter chain for V11-V12 (pitch/tempo) and V32-V40 (full audio suite).
+    Returns audio filter string or None.
+    """
+    video_cfg = config.get('video', {})
+    audio_filters = []
+
+    # V11: Audio Pitch Shift (subtle, in semitones)
+    audio_pitch = float(video_cfg.get('audioPitch', 0) or 0)
+    if audio_pitch > 0:
+        pitch_semitones = py_rng.uniform(-audio_pitch / 20, audio_pitch / 20)
+        pitch_semitones = max(-0.5, min(0.5, pitch_semitones))
+        if abs(pitch_semitones) > 0.02:
+            audio_filters.append(f'asetrate=44100*2^({pitch_semitones:.3f}/12),aresample=44100')
+
+    # V12: Audio Tempo (time stretch compensation)
+    audio_tempo = float(video_cfg.get('audioTempo', 0) or 0)
+    if audio_tempo > 0:
+        tempo = 1.0 / (1.0 + py_rng.uniform(-audio_tempo / 100, audio_tempo / 100))
+        tempo = max(0.95, min(1.05, tempo))
+        if abs(tempo - 1.0) > 0.005:
+            audio_filters.append(f'atempo={tempo:.4f}')
+
+    # V32: Audio EQ (subtle per-band gain)
+    audio_eq = float(video_cfg.get('audioEq', 0) or 0)
+    if audio_eq > 0:
+        # Apply subtle EQ at a few frequency bands
+        for freq in [200, 1000, 4000]:
+            gain = py_rng.uniform(-audio_eq, audio_eq)
+            if abs(gain) > 0.1:
+                audio_filters.append(f'equalizer=f={freq}:t=h:w=200:g={gain:.2f}')
+
+    # V33: Audio Noise Injection (very subtle white noise mix)
+    # NOTE: anoisesrc requires filter_complex graph syntax (semicolons + labels)
+    # which is incompatible with comma-joined -af chains. We use a volume-based
+    # approach instead that works with simple -af chains.
+    audio_noise = float(video_cfg.get('audioNoise', 0) or 0)
+    if audio_noise > 0:
+        vol = max(0.001, min(0.01, audio_noise))
+        # Use dynaudnorm with subtle parameters to add perceptible variation
+        # instead of anoisesrc which requires filter_complex
+        audio_filters.append(f'volume={1.0 + vol:.4f},dynaudnorm=p=0.9:m={vol * 10:.2f}')
+
+    # V34: Audio High/Low Pass (subtle frequency limiting)
+    audio_hlpass = int(video_cfg.get('audioHighLowPass', 0) or 0)
+    if audio_hlpass:
+        audio_filters.append('highpass=f=25,lowpass=f=18000')
+
+    # V35: Audio Stereo Width
+    audio_stereo = float(video_cfg.get('audioStereoWidth', 0) or 0)
+    if audio_stereo > 0:
+        m = 1.0 + py_rng.uniform(0, audio_stereo)
+        audio_filters.append(f'extrastereo=m={m:.3f}')
+
+    # V36: Audio Micro Echo (imperceptible delay)
+    audio_echo = float(video_cfg.get('audioEcho', 0) or 0)
+    if audio_echo > 0:
+        delay_ms = py_rng.uniform(1, audio_echo)
+        decay = py_rng.uniform(0.1, 0.3)
+        audio_filters.append(f'aecho=0.8:0.88:{delay_ms:.1f}:{decay:.2f}')
+
+    # V37: Audio Sample Rate Cycle (44100→48000→44100)
+    audio_sr_cycle = int(video_cfg.get('audioSrCycle', 0) or 0)
+    if audio_sr_cycle:
+        audio_filters.append('aresample=48000,aresample=44100')
+
+    # V38: Audio Channel Pan (subtle cross-blend)
+    audio_pan = float(video_cfg.get('audioPan', 0) or 0)
+    if audio_pan > 0:
+        cross = py_rng.uniform(0, audio_pan)
+        l = 1.0 - cross
+        r = cross
+        audio_filters.append(f"pan=stereo|FL={l:.3f}*FL+{r:.3f}*FR|FR={r:.3f}*FL+{l:.3f}*FR")
+
+    # V39: Audio Compressor (subtle dynamic range compression)
+    audio_comp = int(video_cfg.get('audioCompressor', 0) or 0)
+    if audio_comp:
+        audio_filters.append('acompressor=threshold=-20dB:ratio=2:attack=20:release=250')
+
+    return ','.join(audio_filters) if audio_filters else None
+
+
+def build_encoding_params(config: dict, py_rng: random.Random) -> Dict[str, Any]:
+    """
+    Build encoding parameter overrides for V43 (mobile encoding) and V48-V53 (encoding variation).
+    Returns dict of FFmpeg encoder parameter overrides.
+    """
+    from .constants import DEVICE_PROFILES
+
+    video_cfg = config.get('video', {})
+    params = {}
+
+    # V43: Mobile Encoding Simulation - override encoding with device-specific params
+    mobile_encoding = int(video_cfg.get('mobileEncoding', 0) or 0)
+    device_profile_name = str(video_cfg.get('deviceProfile', 'none') or 'none')
+    if mobile_encoding and device_profile_name != 'none':
+        device = DEVICE_PROFILES.get(device_profile_name)
+        if device:
+            params['g'] = device.get('gop', 60)
+            params['bf'] = device.get('bf', 0)
+            params['refs'] = device.get('refs', 1)
+            params['profile'] = device.get('profile', 'high')
+            # Mobile devices typically use lower CRF
+            params['crf_offset'] = py_rng.uniform(-1, 1)
+            logger.info(f"[V43] Mobile encoding: {device_profile_name} → "
+                       f"gop={params['g']}, bf={params['bf']}, profile={params['profile']}")
+
+    # V48: GOP Length Variation (skip if already set by mobile encoding)
+    if 'g' not in params and int(video_cfg.get('gopVariation', 0) or 0):
+        params['g'] = py_rng.randint(48, 240)
+
+    # V49: B-Frame Count Variation
+    if 'bf' not in params and int(video_cfg.get('bframeVariation', 0) or 0):
+        params['bf'] = py_rng.randint(0, 4)
+
+    # V50: Reference Frames Variation
+    if 'refs' not in params and int(video_cfg.get('refVariation', 0) or 0):
+        params['refs'] = py_rng.randint(1, 6)
+
+    # V51: CRF Randomization
+    if 'crf_offset' not in params:
+        crf_var = float(video_cfg.get('crfVariation', 0) or 0)
+        if crf_var > 0:
+            params['crf_offset'] = py_rng.uniform(-crf_var, crf_var)
+
+    # V52: Profile Variation
+    if 'profile' not in params and int(video_cfg.get('profileVariation', 0) or 0):
+        params['profile'] = py_rng.choice(['baseline', 'main', 'high'])
+
+    # V53: Deblock Filter Variation
+    if int(video_cfg.get('deblockVariation', 0) or 0):
+        a = py_rng.randint(-3, 3)
+        b = py_rng.randint(-3, 3)
+        params['deblock'] = f'{a}:{b}'
+
+    return params
+
+
+def apply_post_processing(output_path: str, config: dict, py_rng: random.Random) -> None:
+    """
+    Apply post-processing for V41-V47 (anti-detection suite).
+    Modifies the output file in-place via FFmpeg metadata manipulation.
+    """
+    from .constants import DEVICE_PROFILES
+
+    video_cfg = config.get('video', {})
+
+    # V41: FFmpeg Trace Removal (strip all metadata)
+    trace_removal = int(video_cfg.get('traceRemoval', 1) or 0)
+
+    # V42-V44: Metadata/Device Profile Injection
+    metadata_injection = int(video_cfg.get('metadataInjection', 0) or 0)
+    device_profile_name = str(video_cfg.get('deviceProfile', 'none') or 'none')
+    device_profile = DEVICE_PROFILES.get(device_profile_name) if device_profile_name != 'none' else None
+
+    # V45: GPS Injection
+    gps_injection = int(video_cfg.get('gpsInjection', 0) or 0)
+
+    # V46: Timestamp Randomization
+    timestamp_randomize = int(video_cfg.get('timestampRandomize', 0) or 0)
+
+    if not (trace_removal or metadata_injection or gps_injection or timestamp_randomize):
+        return
+
+    # Build FFmpeg metadata command for in-place modification
+    import tempfile
+    temp_path = output_path + '.tmp.mp4'
+
+    cmd = ['ffmpeg', '-y', '-i', output_path]
+
+    if trace_removal:
+        cmd.extend(['-map_metadata', '-1'])
+
+    # Add metadata entries
+    metadata_entries = []
+
+    if device_profile:
+        metadata_entries.extend([
+            f'make={device_profile["make"]}',
+            f'model={device_profile["model"]}',
+            f'software={device_profile["software"]}',
+            f'encoder={device_profile["encoder"]}',
+        ])
+    elif metadata_injection:
+        metadata_entries.append('encoder=Lavf60.16.100')
+
+    if gps_injection:
+        lat = py_rng.uniform(-90, 90)
+        lon = py_rng.uniform(-180, 180)
+        metadata_entries.append(f'location={lat:.6f}{lon:+.6f}/')
+
+    if timestamp_randomize:
+        import datetime
+        days_back = py_rng.randint(1, 30)
+        hours = py_rng.randint(0, 23)
+        minutes = py_rng.randint(0, 59)
+        dt = datetime.datetime.now() - datetime.timedelta(days=days_back, hours=hours, minutes=minutes)
+        metadata_entries.append(f'creation_time={dt.strftime("%Y-%m-%dT%H:%M:%S.000000Z")}')
+
+    for entry in metadata_entries:
+        cmd.extend(['-metadata', entry])
+
+    cmd.extend(['-c', 'copy', '-movflags', '+faststart', temp_path])
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0 and os.path.exists(temp_path):
+            os.replace(temp_path, output_path)
+            logger.info(f"[Anti-Detection] Post-processing applied to {output_path}")
+        else:
+            logger.warning(f"[Anti-Detection] Post-processing failed: {result.stderr[-200:]}")
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+    except Exception as e:
+        logger.warning(f"[Anti-Detection] Post-processing error: {e}")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+# =============================================================================
 # FRAME-BY-FRAME VIDEO PROCESSING WITH BLUR + LOGO
 # =============================================================================
 
@@ -509,9 +1076,6 @@ def process_video_with_blur_logo(
     print(f"[Spoofer+Blur] Input: {orig_w}x{orig_h} @ {fps:.2f} fps, {total_frames} frames")
 
     # Parse config
-    spatial = config.get('spatial', {})
-    tonal = config.get('tonal', {})
-    visual = config.get('visual', {})
     video_cfg = config.get('video', {})
 
     # Blur config
@@ -558,24 +1122,24 @@ def process_video_with_blur_logo(
 
     # Get spoofer transforms
     rotation_angle = 0
-    if spatial.get('rotation', 0) > 0:
-        rotation_angle = py_rng.uniform(-spatial['rotation'], spatial['rotation'])
+    if video_cfg.get('rotation', 0) > 0:
+        rotation_angle = py_rng.uniform(-video_cfg['rotation'], video_cfg['rotation'])
 
     # Color adjustments - scale config values (0-100) to proper ranges
     brightness_adj = 0
-    if tonal.get('brightness', 0) > 0:
+    if video_cfg.get('brightness', 0) > 0:
         # Scale: config 5 -> +/-0.05 brightness adjustment
-        brightness_adj = py_rng.uniform(-tonal['brightness'], tonal['brightness']) * 0.01
+        brightness_adj = py_rng.uniform(-video_cfg['brightness'], video_cfg['brightness']) * 0.01
 
     contrast_adj = 1.0
-    if tonal.get('contrast', 0) > 0:
+    if video_cfg.get('contrast', 0) > 0:
         # Scale: config 5 -> +/-0.05 contrast variation (0.95 to 1.05)
-        contrast_adj = 1 + py_rng.uniform(-tonal['contrast'], tonal['contrast']) * 0.01
+        contrast_adj = 1 + py_rng.uniform(-video_cfg['contrast'], video_cfg['contrast']) * 0.01
 
     saturation_adj = 1.0
-    if tonal.get('saturation', 0) > 0:
+    if video_cfg.get('saturation', 0) > 0:
         # Scale: config 5 -> +/-0.05 saturation variation (0.95 to 1.05)
-        saturation_adj = 1 + py_rng.uniform(-tonal['saturation'], tonal['saturation']) * 0.01
+        saturation_adj = 1 + py_rng.uniform(-video_cfg['saturation'], video_cfg['saturation']) * 0.01
 
     # Start FFmpeg writer
     ffmpeg_process = _start_spoofer_ffmpeg(
@@ -704,6 +1268,12 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
                     py_rng=py_rng,
                     gpu_id=gpu_id
                 )
+                # Apply post-processing (V41-V47) - also needed for blur/logo path
+                try:
+                    apply_post_processing(output_path, config, py_rng)
+                except Exception as pp_err:
+                    logger.warning(f"[Spoofer Worker {video_index}] Post-processing failed (non-fatal): {pp_err}")
+
                 elapsed = time.time() - start_time
                 return {
                     'status': 'completed',
@@ -738,199 +1308,137 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
         # Apply mode multipliers to config before building filters
         config = apply_mode_to_config(config)
 
-        # Build filter chain
-        filters = []
-        spatial = config.get('spatial', {})
-        tonal = config.get('tonal', {})
-        visual = config.get('visual', {})
+        # Build filter chain using unified builder (V1-V15 + existing)
         video_cfg = config.get('video', {})
-
-        # Spatial filters
-        if spatial.get('crop', 0) > 0:
-            crop_pct = spatial['crop'] / 100
-            crop_w = int(original_width * (1 - crop_pct * 2))
-            crop_h = int(original_height * (1 - crop_pct * 2))
-            filters.append(f"crop={crop_w}:{crop_h}")
-
-        if spatial.get('rotation', 0) > 0:
-            angle_deg = py_rng.uniform(-spatial['rotation'], spatial['rotation'])
-            angle_rad = angle_deg * math.pi / 180
-
-            # Calculate zoom factor to eliminate black borders after rotation
-            # Uses the inscribed rectangle formula based on aspect ratio
-            abs_angle = abs(angle_rad)
-            cos_a = math.cos(abs_angle)
-            sin_a = math.sin(abs_angle)
-
-            if sin_a > 0.001:
-                # Zoom factor = inverse of inscribed rectangle scale
-                # This ensures we scale up enough to crop away black corners
-                zoom_w = cos_a + sin_a * (original_height / original_width)
-                zoom_h = cos_a + sin_a * (original_width / original_height)
-                zoom_factor = max(zoom_w, zoom_h)
-                zoom_factor = max(1.0, min(zoom_factor, 2.0))
-
-                # Scale up first, rotate, then crop to original dimensions
-                # This removes black corners completely
-                scaled_w = int(original_width * zoom_factor)
-                scaled_h = int(original_height * zoom_factor)
-                # Ensure even dimensions for video encoding
-                scaled_w = scaled_w + (scaled_w % 2)
-                scaled_h = scaled_h + (scaled_h % 2)
-
-                # Pipeline: scale up -> rotate -> crop center
-                filters.append(f"scale={scaled_w}:{scaled_h}:flags=lanczos")
-                filters.append(f"rotate={angle_rad}:fillcolor=black")
-                filters.append(f"crop={original_width}:{original_height}")
-
-        # Tonal filters
-        eq_params = []
-        if tonal.get('brightness', 0) > 0:
-            b = py_rng.uniform(-tonal['brightness'], tonal['brightness']) * 0.4
-            eq_params.append(f"brightness={b:.3f}")
-        if tonal.get('contrast', 0) > 0:
-            c = 1 + py_rng.uniform(-tonal['contrast'], tonal['contrast'])
-            eq_params.append(f"contrast={c:.3f}")
-        if tonal.get('saturation', 0) > 0:
-            s = 1 + py_rng.uniform(-tonal['saturation'], tonal['saturation'])
-            eq_params.append(f"saturation={s:.3f}")
-        if tonal.get('gamma', 0) > 0:
-            g = 1 + py_rng.uniform(-tonal['gamma'], tonal['gamma'])
-            eq_params.append(f"gamma={g:.3f}")
-
-        if eq_params:
-            filters.append(f"eq={':'.join(eq_params)}")
-
-        # Visual filters
-        if visual.get('noise', 0) > 0:
-            filters.append(f"noise=alls={visual['noise']*2}:allf=t")
-
-        if tonal.get('vignette', 0) > 0:
-            filters.append(f"vignette=PI/{3 + (1 - tonal['vignette']/100) * 4}")
-
-        # Speed variation
-        if video_cfg.get('speedVariation', 0) > 0:
-            speed = 1 + py_rng.uniform(-video_cfg['speedVariation']/100, video_cfg['speedVariation']/100)
-            speed = max(0.9, min(1.1, speed))
-            filters.append(f"setpts={1/speed}*PTS")
+        filter_str, output_label, needs_filter_complex = build_video_filter_complex(
+            config, py_rng, original_width, original_height
+        )
+        audio_filter_str = build_audio_filters(config, py_rng)
+        encoding_params = build_encoding_params(config, py_rng)
 
         # FPS
         fps = 30
         if video_cfg.get('fpsVar', 0) > 0:
             fps = 30 + py_rng.uniform(-video_cfg['fpsVar'], video_cfg['fpsVar'])
 
-        # Build filter string
-        filter_str = ','.join(filters) if filters else None
         bitrate = int(5000 * video_cfg.get('bitrate', 90) / 100)
         keep_audio = video_cfg.get('keepAudio', True)
 
         # Build FFmpeg commands optimized for maximum GPU throughput
+        def _apply_video_filters(cmd: list, mode: str = 'simple') -> list:
+            """Apply video filters to command based on filter_complex or -vf mode."""
+            if needs_filter_complex:
+                cmd.extend(['-filter_complex', filter_str, '-map', output_label])
+                if keep_audio:
+                    cmd.extend(['-map', '0:a?'])
+            elif filter_str:
+                if mode == 'hwaccel':
+                    cmd.extend(['-vf', f'hwdownload,format=nv12,{filter_str},hwupload_cuda'])
+                else:
+                    cmd.extend(['-vf', filter_str])
+            return cmd
+
+        def _apply_audio_opts(cmd: list) -> list:
+            """Apply audio encoding options with optional audio filters."""
+            if keep_audio:
+                if audio_filter_str:
+                    cmd.extend(['-c:a', 'aac', '-b:a', '128k', '-af', audio_filter_str])
+                else:
+                    cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
+            else:
+                cmd.append('-an')
+            return cmd
+
+        def _apply_encoding_overrides(cmd: list, is_nvenc: bool = True) -> list:
+            """Apply V48-V53 encoding parameter overrides."""
+            if not encoding_params:
+                return cmd
+            if 'g' in encoding_params:
+                cmd.extend(['-g', str(encoding_params['g'])])
+            if 'bf' in encoding_params:
+                cmd.extend(['-bf', str(encoding_params['bf'])])
+            if 'refs' in encoding_params:
+                cmd.extend(['-refs', str(encoding_params['refs'])])
+            if 'crf_offset' in encoding_params and not is_nvenc:
+                # CRF offset only for libx264 (NVENC uses -cq)
+                pass  # Handled by adjusting base CRF below
+            if 'profile' in encoding_params:
+                cmd.extend(['-profile:v', encoding_params['profile']])
+            if 'deblock' in encoding_params and not is_nvenc:
+                cmd.extend(['-deblock', encoding_params['deblock']])
+            return cmd
+
         def _build_ffmpeg_cmd_max_throughput(use_nvenc: bool = True, target_gpu: int = 0) -> list:
             """Build FFmpeg command optimized for maximum GPU throughput."""
-            cmd = ['ffmpeg', '-y']
+            # Skip full hw pipeline when filter_complex is used (incompatible)
+            if needs_filter_complex:
+                return _build_ffmpeg_cmd_nvenc_simple(target_gpu)
 
+            cmd = ['ffmpeg', '-y']
             if use_nvenc:
-                # FULL hardware acceleration pipeline - keeps frames in GPU memory
                 cmd.extend([
                     '-hwaccel', 'cuda',
                     '-hwaccel_device', str(target_gpu),
-                    '-hwaccel_output_format', 'cuda',  # Keep decoded frames in GPU memory
-                    '-c:v', 'h264_cuvid',  # Hardware H264 decoder (if input is H264)
+                    '-hwaccel_output_format', 'cuda',
+                    '-c:v', 'h264_cuvid',
                 ])
-
             cmd.extend(['-i', input_path])
-
-            if filter_str:
-                # For hardware pipeline, need to download to CPU for filters, then upload back
-                cmd.extend(['-vf', f'hwdownload,format=nv12,{filter_str},hwupload_cuda'])
+            _apply_video_filters(cmd, mode='hwaccel')
 
             if use_nvenc:
-                # NVENC encoding with MAXIMUM THROUGHPUT settings
                 cmd.extend([
                     '-c:v', 'h264_nvenc',
                     '-gpu', str(target_gpu),
-                    '-preset', 'p1',
-                    '-tune', 'll',
-                    '-rc', 'vbr',
-                    '-cq', '26',
+                    '-preset', 'p1', '-tune', 'll',
+                    '-rc', 'vbr', '-cq', '26',
                     '-b:v', f'{bitrate}k',
                     '-maxrate', f'{int(bitrate * 2)}k',
                     '-bufsize', f'{bitrate * 2}k',
-                    '-rc-lookahead', '0',
-                    '-bf', '0',
-                    '-spatial-aq', '0',
-                    '-temporal-aq', '0',
+                    '-rc-lookahead', '0', '-bf', '0',
+                    '-spatial-aq', '0', '-temporal-aq', '0',
                 ])
+                _apply_encoding_overrides(cmd, is_nvenc=True)
             else:
-                # CPU fallback with libx264 ultrafast
                 cmd.extend([
-                    '-c:v', 'libx264',
-                    '-preset', 'ultrafast',
-                    '-crf', '23',
-                    '-pix_fmt', 'yuv420p',
+                    '-c:v', 'libx264', '-preset', 'ultrafast',
+                    '-crf', '23', '-pix_fmt', 'yuv420p',
                 ])
-
-            if keep_audio:
-                cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
-            else:
-                cmd.append('-an')
-
+                _apply_encoding_overrides(cmd, is_nvenc=False)
+            _apply_audio_opts(cmd)
             cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
             return cmd
 
         def _build_ffmpeg_cmd_nvenc_simple(target_gpu: int = 0) -> list:
             """Build simpler NVENC command without hardware decode (fallback)."""
             cmd = ['ffmpeg', '-y']
-            cmd.extend([
-                '-hwaccel', 'cuda',
-                '-hwaccel_device', str(target_gpu),
-            ])
+            cmd.extend(['-hwaccel', 'cuda', '-hwaccel_device', str(target_gpu)])
             cmd.extend(['-i', input_path])
-
-            if filter_str:
-                cmd.extend(['-vf', filter_str])
-
+            _apply_video_filters(cmd, mode='simple')
             cmd.extend([
                 '-c:v', 'h264_nvenc',
                 '-gpu', str(target_gpu),
-                '-preset', 'p1',
-                '-tune', 'll',
-                '-rc', 'vbr',
-                '-cq', '26',
+                '-preset', 'p1', '-tune', 'll',
+                '-rc', 'vbr', '-cq', '26',
                 '-b:v', f'{bitrate}k',
                 '-maxrate', f'{int(bitrate * 2)}k',
                 '-bufsize', f'{bitrate * 2}k',
-                '-rc-lookahead', '0',
-                '-bf', '0',
+                '-rc-lookahead', '0', '-bf', '0',
             ])
-
-            if keep_audio:
-                cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
-            else:
-                cmd.append('-an')
-
+            _apply_encoding_overrides(cmd, is_nvenc=True)
+            _apply_audio_opts(cmd)
             cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
             return cmd
 
         def _build_ffmpeg_cmd_cpu() -> list:
             """Build CPU fallback command."""
             cmd = ['ffmpeg', '-y', '-i', input_path]
-
-            if filter_str:
-                cmd.extend(['-vf', filter_str])
-
+            _apply_video_filters(cmd, mode='simple')
             cmd.extend([
-                '-c:v', 'libx264',
-                '-preset', 'ultrafast',
-                '-crf', '23',
-                '-pix_fmt', 'yuv420p',
+                '-c:v', 'libx264', '-preset', 'ultrafast',
+                '-crf', '23', '-pix_fmt', 'yuv420p',
             ])
-
-            if keep_audio:
-                cmd.extend(['-c:a', 'aac', '-b:a', '128k'])
-            else:
-                cmd.append('-an')
-
+            _apply_encoding_overrides(cmd, is_nvenc=False)
+            _apply_audio_opts(cmd)
             cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
             return cmd
 
@@ -962,6 +1470,12 @@ def process_single_video_worker(args: Tuple) -> Dict[str, Any]:
                         'index': video_index,
                         'error': f"All encoders failed: {process.stderr[-500:] if process.stderr else 'Unknown error'}"
                     }
+
+        # Apply post-processing (V41-V47: anti-detection suite)
+        try:
+            apply_post_processing(output_path, config, py_rng)
+        except Exception as pp_err:
+            logger.warning(f"[NVENC Worker {video_index}] Post-processing failed (non-fatal): {pp_err}")
 
         elapsed = time.time() - start_time
         print(f"[NVENC Worker {video_index}] Done in {elapsed:.2f}s on GPU {gpu_id}")
@@ -1262,82 +1776,21 @@ def process_video(
     except Exception:
         original_width, original_height, duration = 1920, 1080, 0
 
-    # Build filter chain
-    filters = []
+    # Build filter chain using unified builder (V1-V15 + existing)
     py_rng = random.Random(int(time.time() * 1000))
-
-    spatial = config.get('spatial', {})
-    tonal = config.get('tonal', {})
-    visual = config.get('visual', {})
     video_cfg = config.get('video', {})
 
-    # Spatial filters
-    if spatial.get('crop', 0) > 0:
-        crop_pct = spatial['crop'] / 100
-        crop_w = int(original_width * (1 - crop_pct * 2))
-        crop_h = int(original_height * (1 - crop_pct * 2))
-        filters.append(f"crop={crop_w}:{crop_h}")
-
-    if spatial.get('rotation', 0) > 0:
-        angle_deg = py_rng.uniform(-spatial['rotation'], spatial['rotation'])
-        angle_rad = angle_deg * math.pi / 180
-
-        abs_angle = abs(angle_rad)
-        cos_a = math.cos(abs_angle)
-        sin_a = math.sin(abs_angle)
-
-        if sin_a > 0.001:
-            zoom_w = cos_a + sin_a * (original_height / original_width)
-            zoom_h = cos_a + sin_a * (original_width / original_height)
-            zoom_factor = max(zoom_w, zoom_h)
-            zoom_factor = max(1.0, min(zoom_factor, 2.0))
-
-            scaled_w = int(original_width * zoom_factor)
-            scaled_h = int(original_height * zoom_factor)
-            scaled_w = scaled_w + (scaled_w % 2)
-            scaled_h = scaled_h + (scaled_h % 2)
-
-            filters.append(f"scale={scaled_w}:{scaled_h}:flags=lanczos")
-            filters.append(f"rotate={angle_rad}:fillcolor=black")
-            filters.append(f"crop={original_width}:{original_height}")
-
-    # Tonal filters (eq filter)
-    eq_params = []
-    if tonal.get('brightness', 0) > 0:
-        b = py_rng.uniform(-tonal['brightness'], tonal['brightness']) * 0.4
-        eq_params.append(f"brightness={b:.3f}")
-    if tonal.get('contrast', 0) > 0:
-        c = 1 + py_rng.uniform(-tonal['contrast'], tonal['contrast'])
-        eq_params.append(f"contrast={c:.3f}")
-    if tonal.get('saturation', 0) > 0:
-        s = 1 + py_rng.uniform(-tonal['saturation'], tonal['saturation'])
-        eq_params.append(f"saturation={s:.3f}")
-    if tonal.get('gamma', 0) > 0:
-        g = 1 + py_rng.uniform(-tonal['gamma'], tonal['gamma'])
-        eq_params.append(f"gamma={g:.3f}")
-
-    if eq_params:
-        filters.append(f"eq={':'.join(eq_params)}")
-
-    # Visual filters
-    if visual.get('noise', 0) > 0:
-        filters.append(f"noise=alls={visual['noise']*2}:allf=t")
-
-    if tonal.get('vignette', 0) > 0:
-        filters.append(f"vignette=PI/{3 + (1 - tonal['vignette']/100) * 4}")
-
-    # Speed variation
-    if video_cfg.get('speedVariation', 0) > 0:
-        speed = 1 + py_rng.uniform(-video_cfg['speedVariation']/100, video_cfg['speedVariation']/100)
-        speed = max(0.9, min(1.1, speed))
-        filters.append(f"setpts={1/speed}*PTS")
+    filter_str, output_label, needs_filter_complex = build_video_filter_complex(
+        config, py_rng, original_width, original_height
+    )
+    audio_filter_str = build_audio_filters(config, py_rng)
+    encoding_params = build_encoding_params(config, py_rng)
 
     # FPS variation
     fps = 30
     if video_cfg.get('fpsVar', 0) > 0:
         fps = 30 + py_rng.uniform(-video_cfg['fpsVar'], video_cfg['fpsVar'])
 
-    filter_str = ','.join(filters) if filters else None
     bitrate = int(5000 * video_cfg.get('bitrate', 90) / 100)
     keep_audio = video_cfg.get('keepAudio', True)
 
@@ -1383,8 +1836,34 @@ def process_video(
     if gpu_id > 0:
         print(f"[Video Processing] Using GPU {gpu_id} for NVENC encoding")
 
+    def _apply_video_filters_pv(cmd: list, mode: str = 'simple') -> list:
+        """Apply video filters to command based on filter_complex or -vf mode."""
+        if needs_filter_complex:
+            cmd.extend(['-filter_complex', filter_str, '-map', output_label])
+            if keep_audio and has_audio:
+                cmd.extend(['-map', '0:a?'])
+        elif filter_str:
+            if mode == 'hwaccel':
+                cmd.extend(['-vf', f'hwdownload,format=nv12,{filter_str},hwupload_cuda'])
+            else:
+                cmd.extend(['-vf', filter_str])
+        return cmd
+
+    def _apply_audio_opts_pv(cmd: list) -> list:
+        """Apply audio encoding options with optional audio filters."""
+        if keep_audio and has_audio:
+            if audio_filter_str:
+                cmd.extend(['-c:a', 'aac', '-b:a', '128k', '-af', audio_filter_str])
+            else:
+                cmd.extend(['-c:a', 'aac', '-b:a', '128k', '-strict', 'experimental'])
+        else:
+            cmd.append('-an')
+        return cmd
+
     def build_ffmpeg_cmd_full_hw(encoder_opts: list) -> list:
         """Build FFmpeg command with FULL hardware pipeline."""
+        if needs_filter_complex:
+            return build_ffmpeg_cmd_simple_nvenc(encoder_opts)
         cmd = ['ffmpeg', '-y']
         cmd.extend([
             '-hwaccel', 'cuda',
@@ -1393,87 +1872,71 @@ def process_video(
             '-c:v', 'h264_cuvid',
         ])
         cmd.extend(['-i', input_path])
-
-        if filter_str:
-            cmd.extend(['-vf', f'hwdownload,format=nv12,{filter_str},hwupload_cuda'])
-
+        _apply_video_filters_pv(cmd, mode='hwaccel')
         cmd.extend(['-c:v', 'h264_nvenc'])
         cmd.extend(encoder_opts)
-
-        if keep_audio and has_audio:
-            cmd.extend(['-c:a', 'aac', '-b:a', '128k', '-strict', 'experimental'])
-        else:
-            cmd.append('-an')
-
+        _apply_audio_opts_pv(cmd)
         cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
         return cmd
 
     def build_ffmpeg_cmd_simple_nvenc(encoder_opts: list) -> list:
         """Build FFmpeg command with software decode + NVENC encode."""
         cmd = ['ffmpeg', '-y']
-        cmd.extend([
-            '-hwaccel', 'cuda',
-            '-hwaccel_device', str(gpu_id),
-        ])
+        cmd.extend(['-hwaccel', 'cuda', '-hwaccel_device', str(gpu_id)])
         cmd.extend(['-i', input_path])
-
-        if filter_str:
-            cmd.extend(['-vf', filter_str])
-
+        _apply_video_filters_pv(cmd, mode='simple')
         cmd.extend(['-c:v', 'h264_nvenc'])
         cmd.extend(encoder_opts)
-
-        if keep_audio and has_audio:
-            cmd.extend(['-c:a', 'aac', '-b:a', '128k', '-strict', 'experimental'])
-        else:
-            cmd.append('-an')
-
+        _apply_audio_opts_pv(cmd)
         cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
         return cmd
 
     def build_ffmpeg_cmd_cpu(encoder_opts: list) -> list:
         """Build FFmpeg command with CPU encoding (fallback)."""
         cmd = ['ffmpeg', '-y', '-i', input_path]
-
-        if filter_str:
-            cmd.extend(['-vf', filter_str])
-
+        _apply_video_filters_pv(cmd, mode='simple')
         cmd.extend(['-c:v', 'libx264'])
         cmd.extend(encoder_opts)
-
-        if keep_audio and has_audio:
-            cmd.extend(['-c:a', 'aac', '-b:a', '128k', '-strict', 'experimental'])
-        else:
-            cmd.append('-an')
-
+        _apply_audio_opts_pv(cmd)
         cmd.extend(['-r', f'{fps:.1f}', '-movflags', '+faststart', output_path])
         return cmd
 
     # NVENC encoder options
     nvenc_opts = [
         '-gpu', str(gpu_id),
-        '-preset', 'p1',
-        '-tune', 'll',
-        '-rc', 'vbr',
-        '-cq', '26',
+        '-preset', 'p1', '-tune', 'll',
+        '-rc', 'vbr', '-cq', '26',
         '-b:v', f'{bitrate}k',
         '-maxrate', f'{int(bitrate * 2)}k',
         '-bufsize', f'{bitrate * 2}k',
-        '-rc-lookahead', '0',
-        '-bf', '0',
-        '-spatial-aq', '0',
-        '-temporal-aq', '0',
+        '-rc-lookahead', '0', '-bf', '0',
+        '-spatial-aq', '0', '-temporal-aq', '0',
     ]
 
     # libx264 (CPU) encoder options
+    crf_base = 23
+    if encoding_params.get('crf_offset'):
+        crf_base = max(18, min(28, crf_base + encoding_params['crf_offset']))
     libx264_opts = [
-        '-preset', 'ultrafast',
-        '-crf', '23',
+        '-preset', 'ultrafast', '-crf', str(int(crf_base)),
         '-b:v', f'{bitrate}k',
         '-maxrate', f'{int(bitrate * 2)}k',
         '-bufsize', f'{bitrate * 2}k',
         '-pix_fmt', 'yuv420p',
     ]
+
+    # V48-V53: Apply encoding parameter overrides
+    for opts, is_nvenc in [(nvenc_opts, True), (libx264_opts, False)]:
+        if 'g' in encoding_params:
+            opts.extend(['-g', str(encoding_params['g'])])
+        if 'bf' in encoding_params:
+            opts.extend(['-bf', str(encoding_params['bf'])])
+        if 'refs' in encoding_params:
+            opts.extend(['-refs', str(encoding_params['refs'])])
+        if 'profile' in encoding_params:
+            opts.extend(['-profile:v', encoding_params['profile']])
+        if 'deblock' in encoding_params and not is_nvenc:
+            opts.extend(['-deblock', encoding_params['deblock']])
 
     # Tier 1: Try FULL hardware pipeline
     report_progress(0.2, "Encoding with full GPU pipeline...")
@@ -1499,23 +1962,23 @@ def process_video(
                 if keep_audio and has_audio:
                     report_progress(0.35, "Trying without audio...")
                     cmd = ['ffmpeg', '-y', '-i', input_path]
-                    if filter_str:
-                        cmd.extend(['-vf', filter_str])
+                    _apply_video_filters_pv(cmd, mode='simple')
                     cmd.extend([
-                        '-c:v', 'libx264',
-                        '-preset', 'ultrafast',
-                        '-crf', '23',
-                        '-pix_fmt', 'yuv420p',
-                        '-an',
-                        '-r', f'{fps:.1f}',
-                        '-movflags', '+faststart',
+                        '-c:v', 'libx264', '-preset', 'ultrafast',
+                        '-crf', '23', '-pix_fmt', 'yuv420p', '-an',
+                        '-r', f'{fps:.1f}', '-movflags', '+faststart',
                         output_path
                     ])
-
                     success, stderr_output, returncode = run_ffmpeg(cmd, "libx264-no-audio")
 
                 if not success:
                     raise RuntimeError(f"FFmpeg failed with all encoders (code {returncode}): {stderr_output}")
+
+    # Apply post-processing (V41-V47: anti-detection suite)
+    try:
+        apply_post_processing(output_path, config, py_rng)
+    except Exception as pp_err:
+        logger.warning(f"[Video Processing] Post-processing failed (non-fatal): {pp_err}")
 
     report_progress(1.0, "Complete")
 

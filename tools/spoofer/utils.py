@@ -77,10 +77,16 @@ def randomize_params(
 ) -> Dict:
     """
     Randomize parameters within +/- variation of base values.
-    Each copy gets slightly different transform intensities.
+    Uses _variation_mult from base if available (set by mode preset).
+    Skips internal keys starting with '_'.
     """
+    # Use mode-specific variation if available
+    variation = base_params.get('_variation_mult', variation)
+
     result = {}
     for key, value in base_params.items():
+        if key.startswith('_'):  # Skip internal keys
+            continue
         if isinstance(value, (int, float)) and value > 0:
             # Vary by +/- variation percentage
             factor = 1.0 + py_rng.uniform(-variation, variation)
@@ -125,16 +131,12 @@ def apply_mode_to_config(config: Dict[str, Any]) -> Dict[str, Any]:
     spatial = result.get("spatial", {})
     spatial_mult = multipliers["spatial"]
     for key in [
-        "crop",
-        "microResize",
-        "rotation",
-        "subpixel",
-        "warp",
-        "barrel",
-        "blockShift",
-        "microRescale",
+        "crop", "microResize", "rotation", "subpixel", "warp",
+        "barrel", "blockShift", "microRescale",
+        # V5-V7: New spatial transforms
+        "centerShift", "zoompan", "border",
     ]:
-        if key in spatial and spatial[key] > 0:
+        if key in spatial and isinstance(spatial[key], (int, float)) and spatial[key] > 0:
             original = spatial[key]
             spatial[key] = spatial[key] * spatial_mult
             print(f"[Spoofer]   spatial.{key}: {original} -> {spatial[key]:.2f}")
@@ -143,8 +145,14 @@ def apply_mode_to_config(config: Dict[str, Any]) -> Dict[str, Any]:
     # Apply tonal multiplier
     tonal = result.get("tonal", {})
     tonal_mult = multipliers["tonal"]
-    for key in ["brightness", "gamma", "contrast", "saturation", "vignette"]:
-        if key in tonal and tonal[key] > 0:
+    for key in [
+        "brightness", "gamma", "contrast", "saturation", "vignette",
+        "hueShift",
+        # V16-V20: New tonal transforms
+        "colorBalance", "colorChannelMixer", "vibrance",
+        "colorTemperature", "colorLevels",
+    ]:
+        if key in tonal and isinstance(tonal[key], (int, float)) and tonal[key] > 0:
             original = tonal[key]
             tonal[key] = tonal[key] * tonal_mult
             print(f"[Spoofer]   tonal.{key}: {original} -> {tonal[key]:.3f}")
@@ -153,14 +161,105 @@ def apply_mode_to_config(config: Dict[str, Any]) -> Dict[str, Any]:
     # Apply visual multiplier
     visual = result.get("visual", {})
     visual_mult = multipliers["visual"]
-    for key in ["tint", "chromatic", "noise"]:
-        if key in visual and visual[key] > 0:
+    for key in [
+        "tint", "chromatic", "noise",
+        "sharpness", "blurSigma",
+        # V22-V25: New visual transforms
+        "dynamicHue", "filmGrain", "scanline", "gradientOverlay",
+        "dynamicColorShift", "edgeEnhance", "dither",
+    ]:
+        if key in visual and isinstance(visual[key], (int, float)) and visual[key] > 0:
             original = visual[key]
             visual[key] = visual[key] * visual_mult
             print(f"[Spoofer]   visual.{key}: {original} -> {visual[key]:.2f}")
     result["visual"] = visual
 
+    # Apply video multiplier
+    video = result.get("video", {})
+    video_mult = multipliers.get("variation", 0.3)
+    # Scale video spatial/tonal/visual params with their category multipliers
+    for key in [
+        # Video spatial (use spatial multiplier)
+        "crop", "rotation", "centerShift", "zoompan", "microRescale", "border",
+    ]:
+        if key in video and isinstance(video[key], (int, float)) and video[key] > 0:
+            original = video[key]
+            video[key] = video[key] * multipliers["spatial"]
+            print(f"[Spoofer]   video.{key}: {original} -> {video[key]:.3f}")
+    for key in [
+        # Video tonal (use tonal multiplier)
+        "brightness", "contrast", "saturation", "gamma", "vignette",
+        "hueShift", "colorBalance", "colorChannelMixer", "vibrance",
+        "colorTemperature", "colorLevels",
+    ]:
+        if key in video and isinstance(video[key], (int, float)) and video[key] > 0:
+            original = video[key]
+            video[key] = video[key] * multipliers["tonal"]
+            print(f"[Spoofer]   video.{key}: {original} -> {video[key]:.3f}")
+    for key in [
+        # Video visual (use visual multiplier)
+        "chromatic", "sharpness", "blurSigma", "noise",
+        "dynamicHue", "filmGrain", "scanline", "gradientOverlay",
+    ]:
+        if key in video and isinstance(video[key], (int, float)) and video[key] > 0:
+            original = video[key]
+            video[key] = video[key] * multipliers["visual"]
+            print(f"[Spoofer]   video.{key}: {original} -> {video[key]:.3f}")
+    for key in [
+        # Video timing/audio (use variation multiplier)
+        "frameJitter", "timeStretch", "frameDropDup",
+        "audioPitch", "audioTempo",
+        # V32-V40: Audio transforms
+        "audioEq", "audioNoise", "audioStereoWidth",
+        "audioEcho", "audioPan",
+    ]:
+        if key in video and isinstance(video[key], (int, float)) and video[key] > 0:
+            original = video[key]
+            video[key] = video[key] * (1 + video_mult)
+            print(f"[Spoofer]   video.{key}: {original} -> {video[key]:.3f}")
+    result["video"] = video
+
     # Store variation multiplier for randomize_params
     result["_variation_mult"] = multipliers["variation"]
+
+    # Auto-enable advanced transforms for aggressive/maximum modes
+    if mode in ('aggressive', 'maximum'):
+        # Enable encoding variation for video
+        video = result.get("video", {})
+        if not video.get("gopVariation"):
+            video["gopVariation"] = 1
+        if not video.get("bframeVariation"):
+            video["bframeVariation"] = 1
+        if not video.get("refVariation"):
+            video["refVariation"] = 1
+        if not video.get("profileVariation"):
+            video["profileVariation"] = 1
+        result["video"] = video
+
+        # Enable color space round-trip for images (adds rounding errors)
+        tonal = result.get("tonal", {})
+        if not tonal.get("colorSpaceConv"):
+            tonal["colorSpaceConv"] = 1
+        result["tonal"] = tonal
+
+        # Enable frequency noise for images
+        if not tonal.get("freqNoise"):
+            tonal["freqNoise"] = 1
+        result["tonal"] = tonal
+
+    if mode == 'maximum':
+        # Enable all remaining encoding variations
+        video = result.get("video", {})
+        if not video.get("deblockVariation"):
+            video["deblockVariation"] = 1
+        if not video.get("crfVariation"):
+            video["crfVariation"] = 2
+        result["video"] = video
+
+        # Enable invisible watermark for images
+        tonal = result.get("tonal", {})
+        if not tonal.get("invisibleWatermark"):
+            tonal["invisibleWatermark"] = 1
+        result["tonal"] = tonal
 
     return result

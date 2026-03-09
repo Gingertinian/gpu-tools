@@ -1738,10 +1738,16 @@ def generate_unique_seed(img_path: str, var_idx: int, base_time: int) -> int:
 def randomize_params(base_params: Dict, py_rng: random.Random, variation: float = 0.3) -> Dict:
     """
     Randomize parameters within ±variation of base values.
-    Each copy gets slightly different transform intensities.
+    Uses _variation_mult from base if available (set by mode preset).
+    Skips internal keys starting with '_'.
     """
+    # Use mode-specific variation if available
+    variation = base_params.get('_variation_mult', variation)
+
     result = {}
     for key, value in base_params.items():
+        if key.startswith('_'):  # Skip internal keys
+            continue
         if isinstance(value, (int, float)) and value > 0:
             # Vary by ±variation percentage
             factor = 1.0 + py_rng.uniform(-variation, variation)
@@ -2565,7 +2571,7 @@ def process_batch_spoofer(
                     rand_id = py_rng.randint(1000, 9999)
                     base_name = os.path.splitext(os.path.basename(input_path))[0]
                     clean_name = "".join([c for c in base_name if c.isalnum() or c in (' ', '-', '_')]).strip()[:20]
-                    filename = f"{clean_name}_v{i}_{rand_id}.jpg"
+                    filename = f"{clean_name}_v{i:04d}_{rand_id}.jpg"
 
                 # Save to ZIP
                 img_buffer = io.BytesIO()

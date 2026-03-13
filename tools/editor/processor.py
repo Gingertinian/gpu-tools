@@ -156,6 +156,60 @@ def _is_audio(path: str) -> bool:
     return os.path.splitext(path)[1].lower() in AUDIO_EXTENSIONS
 
 
+def _mix_external_audio_post(
+    video_path: str,
+    audio_paths: List[str],
+    volume: float = 1.0,
+) -> None:
+    """Post-process: replace/add audio track from external audio file into rendered video."""
+    if not audio_paths:
+        return
+    tmp_out = video_path + ".tmp_mixed.mp4"
+    audio_path = audio_paths[0]
+    command = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", audio_path,
+        "-map", "0:v",
+        "-map", "1:a",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        "-shortest",
+        "-movflags", "+faststart",
+    ]
+    if abs(volume - 1.0) > 1e-6:
+        command.extend(["-af", f"volume={volume:.3f}"])
+    command.append(tmp_out)
+    try:
+        result = subprocess.run(
+            command, capture_output=True, timeout=120,
+        )
+        if result.returncode == 0 and os.path.exists(tmp_out) and os.path.getsize(tmp_out) > 100:
+            os.replace(tmp_out, video_path)
+            logger.info(f"External audio mixed into video: {os.path.getsize(video_path)} bytes")
+        else:
+            logger.warning(f"Audio mixing failed (rc={result.returncode}), keeping original video")
+            if result.stderr:
+                logger.warning(f"ffmpeg stderr: {result.stderr.decode('utf-8', errors='replace')[:300]}")
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+    except subprocess.TimeoutExpired:
+        logger.warning("Audio mixing timed out, keeping original video")
+        if os.path.exists(tmp_out):
+            os.remove(tmp_out)
+    except Exception as exc:
+        logger.warning(f"Audio mixing error: {exc}, keeping original video")
+        if os.path.exists(tmp_out):
+            os.remove(tmp_out)
+    finally:
+        for ap in audio_paths:
+            try:
+                os.remove(ap)
+            except OSError:
+                pass
+
+
 def _build_atempo_filters(rate: float) -> List[str]:
     # FFmpeg atempo supports [0.5, 2.0] per filter instance.
     filters: List[str] = []
@@ -3311,6 +3365,29 @@ def process_editor(
             adjusted_lowpass if adjusted_lowpass > audio_highpass_hz else 0
         )
 
+    # External audio tracks (from Music Gen / TTS workflow nodes)
+    audio_urls_raw = _cfg(config, "audioUrls", "audio_urls", default=[])
+    external_audio_paths: List[str] = []
+    if isinstance(audio_urls_raw, list) and audio_urls_raw:
+        import requests as _req
+        for idx, audio_url in enumerate(audio_urls_raw):
+            if not isinstance(audio_url, str) or not audio_url.strip():
+                continue
+            try:
+                ext = ".mp3" if ".mp3" in audio_url else ".wav"
+                audio_tmp = os.path.join(tempfile.gettempdir(), f"editor_audio_{idx}_{os.getpid()}{ext}")
+                logger.info(f"Downloading external audio track: {audio_url[:80]}...")
+                resp = _req.get(audio_url, timeout=60, stream=True)
+                resp.raise_for_status()
+                with open(audio_tmp, "wb") as af:
+                    for chunk in resp.iter_content(8192):
+                        af.write(chunk)
+                if os.path.getsize(audio_tmp) > 100:
+                    external_audio_paths.append(audio_tmp)
+                    logger.info(f"External audio downloaded: {os.path.getsize(audio_tmp)} bytes")
+            except Exception as exc:
+                logger.warning(f"Failed to download external audio: {exc}")
+
     fit = str(_cfg(config, "fit", default="cover")).lower()
     if fit not in {"cover", "contain", "stretch"}:
         fit = "cover"
@@ -3653,6 +3730,11 @@ def process_editor(
         if os.path.getsize(output_path) <= 0:
             raise RuntimeError("Editor timeline render produced an empty output file")
 
+        # Post-process: mix external audio into timeline render
+        if external_audio_paths and not mute:
+            report(0.95, "Mixing external audio into timeline render...")
+            _mix_external_audio_post(output_path, external_audio_paths, volume)
+
         report(1.0, "Editor timeline render complete")
         return {
             "mode": mode,
@@ -3795,6 +3877,20 @@ def process_editor(
 
         if mute:
             command.extend(["-an"])
+        elif external_audio_paths:
+            # External audio from Music Gen / TTS nodes
+            for ext_audio in external_audio_paths:
+                command.extend(["-i", ext_audio])
+            command.extend([
+                "-map", "0:v",
+                "-map", "1:a",
+                "-c:a", "aac", "-b:a", "192k",
+                "-shortest",
+            ])
+            audio_filters = _build_audio_filters()
+            if audio_filters:
+                command.extend(["-af", ",".join(audio_filters)])
+            logger.info("Mixing external audio track into simple mode output")
         else:
             has_audio_stream = _has_audio_stream(input_path)
             audio_filters = _build_audio_filters() if has_audio_stream else []
@@ -3806,6 +3902,13 @@ def process_editor(
         command.append(output_path)
 
     _run_ffmpeg(command)
+
+    # Cleanup external audio temp files (for simple mode they were used in-command)
+    for ext_audio in external_audio_paths:
+        try:
+            os.remove(ext_audio)
+        except OSError:
+            pass
 
     if not os.path.exists(output_path):
         raise RuntimeError("Editor render finished without an output file")
